@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.util.Size
+import android.util.LruCache
 import android.widget.MediaController
 import android.widget.VideoView
 import androidx.compose.foundation.Image
@@ -75,6 +76,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
 import kotlin.math.roundToInt
+import kotlin.math.max
 
 @Composable
 internal fun FileThumbnail(
@@ -290,16 +292,39 @@ private fun MediaPreview(entry: FileEntry, modifier: Modifier, audioOnly: Boolea
 }
 
 private fun loadThumbnail(context: Context, entry: FileEntry, edge: Int): Bitmap? {
+    val cacheKey = "${entry.uri}|${entry.modifiedAt}|$edge"
+    THUMBNAIL_CACHE.get(cacheKey)?.let { return it }
+    val bitmap = loadThumbnailUncached(context, entry, edge) ?: return null
+    THUMBNAIL_CACHE.put(cacheKey, bitmap)
+    return bitmap
+}
+
+private fun loadThumbnailUncached(context: Context, entry: FileEntry, edge: Int): Bitmap? {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && entry.uri.scheme == "content") {
         return context.contentResolver.loadThumbnail(entry.uri, Size(edge, edge), CancellationSignal())
     }
     return if (isImage(entry)) {
-        context.contentResolver.openInputStream(entry.uri)?.use(BitmapFactory::decodeStream)
+        decodeSampledImage(context, entry, edge)
     } else {
         MediaMetadataRetriever().let { retriever ->
             try {
                 retriever.setDataSource(context, entry.uri)
-                retriever.frameAtTime
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                    retriever.getScaledFrameAtTime(-1L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, edge, edge)
+                } else {
+                    retriever.frameAtTime?.let { raw ->
+                        val largest = max(raw.width, raw.height)
+                        if (largest <= edge) raw else {
+                            val scale = edge.toFloat() / largest
+                            Bitmap.createScaledBitmap(
+                                raw,
+                                (raw.width * scale).roundToInt().coerceAtLeast(1),
+                                (raw.height * scale).roundToInt().coerceAtLeast(1),
+                                true,
+                            ).also { raw.recycle() }
+                        }
+                    }
+                }
             } finally {
                 retriever.release()
             }
@@ -308,6 +333,11 @@ private fun loadThumbnail(context: Context, entry: FileEntry, edge: Int): Bitmap
 }
 
 private fun loadImage(context: Context, entry: FileEntry): Bitmap {
+    return decodeSampledImage(context, entry, MAX_IMAGE_EDGE)
+        ?: throw IOException("Не удалось декодировать изображение")
+}
+
+private fun decodeSampledImage(context: Context, entry: FileEntry, maxEdge: Int): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     if (entry.uri.scheme == "file") {
         BitmapFactory.decodeFile(entry.uri.path, bounds)
@@ -315,7 +345,7 @@ private fun loadImage(context: Context, entry: FileEntry): Bitmap {
         context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
     }
     var sample = 1
-    while (bounds.outWidth / sample > MAX_IMAGE_EDGE || bounds.outHeight / sample > MAX_IMAGE_EDGE) {
+    while (bounds.outWidth / sample > maxEdge || bounds.outHeight / sample > maxEdge) {
         sample *= 2
     }
     val options = BitmapFactory.Options().apply { inSampleSize = sample }
@@ -324,7 +354,7 @@ private fun loadImage(context: Context, entry: FileEntry): Bitmap {
     } else {
         context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, options) }
     }
-    return bitmap ?: throw IOException("Не удалось декодировать изображение")
+    return bitmap
 }
 
 private fun renderPdfPage(context: Context, entry: FileEntry, requestedPage: Int): PdfPage {
@@ -367,3 +397,7 @@ private fun isText(entry: FileEntry) = entry.mimeType?.startsWith("text/") == tr
 private data class PdfPage(val bitmap: Bitmap, val count: Int)
 private const val MAX_TEXT_PREVIEW_CHARS = 300_000
 private const val MAX_IMAGE_EDGE = 2_048
+private const val THUMBNAIL_CACHE_BYTES = 24 * 1024 * 1024
+private val THUMBNAIL_CACHE = object : LruCache<String, Bitmap>(THUMBNAIL_CACHE_BYTES) {
+    override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+}

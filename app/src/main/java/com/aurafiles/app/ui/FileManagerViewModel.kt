@@ -89,6 +89,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     val state: StateFlow<FileManagerUiState> = _state.asStateFlow()
     private var operationJob: Job? = null
     private var ftpKeepAliveJob: Job? = null
+    private var categoryToOpenAfterAnalysis: FileCategory? = null
 
     init {
         _state.update { it.copy(ftpProfile = ftpRepository.loadProfile()) }
@@ -308,6 +309,9 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun rename(entry: FileEntry, name: String) = runFileOperation {
         repository.rename(entry, name)
+        _state.update { current ->
+            current.copy(recentItems = current.recentItems.map { if (it.uri == entry.uri) it.copy(name = name.trim()) else it })
+        }
         "Название изменено"
     }
 
@@ -333,12 +337,14 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                     _state.update { it.copy(operationProgress = (index + 1f) / entries.size) }
                 }
                 _state.update {
+                    val removedUris = entries.map(FileEntry::uri).toSet()
                     it.copy(
                         operationInProgress = false,
                         operationLabel = null,
                         operationCancelable = false,
                         operationProgress = 1f,
                         undoTrash = moved,
+                        recentItems = it.recentItems.filterNot { recent -> recent.uri in removedUris },
                         analysis = null,
                         message = if (moved.size == 1) "${moved.first().originalName} перемещён в корзину"
                         else "В корзину перемещено: ${moved.size}",
@@ -348,11 +354,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 refreshMetadata()
             } catch (_: CancellationException) {
                 _state.update {
+                    val removedUris = entries.take(moved.size).map(FileEntry::uri).toSet()
                     it.copy(
                         operationInProgress = false,
                         operationLabel = null,
                         operationCancelable = false,
                         undoTrash = moved,
+                        recentItems = it.recentItems.filterNot { recent -> recent.uri in removedUris },
                         message = "Операция остановлена после ${moved.size} объектов",
                     )
                 }
@@ -434,6 +442,12 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun batchRename(entries: List<FileEntry>, names: List<String>) = runFileOperation("Пакетное переименование") {
         repository.batchRename(entries, names)
+        val replacements = entries.map(FileEntry::uri).zip(names.map(String::trim)).toMap()
+        _state.update { current ->
+            current.copy(recentItems = current.recentItems.map { recent ->
+                replacements[recent.uri]?.let { recent.copy(name = it) } ?: recent
+            })
+        }
         "Переименовано объектов: ${entries.size}"
     }
 
@@ -460,6 +474,12 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     fun setLastModified(entries: List<FileEntry>, timestampMillis: Long) = runFileOperation {
         require(entries.isNotEmpty()) { "Выберите хотя бы один файл" }
         entries.forEach { repository.setLastModified(it, timestampMillis) }
+        val changedUris = entries.map(FileEntry::uri).toSet()
+        _state.update { current ->
+            current.copy(recentItems = current.recentItems.map {
+                if (it.uri in changedUris) it.copy(modifiedAt = timestampMillis) else it
+            })
+        }
         if (entries.size == 1) "Дата файла изменена" else "Дата изменена у ${entries.size} файлов"
     }
 
@@ -482,6 +502,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun analyzeStorage() {
+        if (_state.value.analyzing) return
         val root = _state.value.folderStack.firstOrNull()?.document
         if (root == null) {
             _state.update { it.copy(message = "Сначала подключите папку") }
@@ -491,6 +512,8 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             _state.update { it.copy(analyzing = true) }
             runCatching { withContext(Dispatchers.IO) { repository.analyze(root) } }
                 .onSuccess { analysis ->
+                    val pendingCategory = categoryToOpenAfterAnalysis
+                    categoryToOpenAfterAnalysis = null
                     _state.update {
                         it.copy(
                             analyzing = false,
@@ -505,8 +528,10 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                             },
                         )
                     }
+                    if (pendingCategory != null) openCategory(pendingCategory)
                 }
                 .onFailure { error ->
+                    categoryToOpenAfterAnalysis = null
                     _state.update { it.copy(analyzing = false) }
                     showFailure(error)
                 }
@@ -516,6 +541,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     fun openCategory(category: FileCategory) {
         val analysis = _state.value.analysis
         if (analysis == null) {
+            categoryToOpenAfterAnalysis = category
             analyzeStorage()
             return
         }

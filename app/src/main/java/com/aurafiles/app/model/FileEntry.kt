@@ -118,6 +118,26 @@ data class FtpEntry(
     val modifiedAt: Long,
 )
 
+data class FtpServerConfig(
+    val port: Int = 2121,
+    val username: String = "aura",
+    val password: String,
+    val readOnly: Boolean = true,
+)
+
+data class FtpServerStatus(
+    val running: Boolean = false,
+    val starting: Boolean = false,
+    val endpoints: List<String> = emptyList(),
+    val port: Int = 0,
+    val username: String = "",
+    val password: String = "",
+    val rootLabel: String = "",
+    val readOnly: Boolean = true,
+    val clients: Int = 0,
+    val error: String? = null,
+)
+
 enum class StorageAccessMode {
     Folder,
     Full,

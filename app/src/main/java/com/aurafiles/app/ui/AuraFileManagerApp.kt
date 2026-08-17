@@ -4,6 +4,9 @@ import android.content.ActivityNotFoundException
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.pm.PackageManager
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.net.Uri
@@ -23,6 +26,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Box
@@ -41,6 +45,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -142,6 +147,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.withTimeoutOrNull
 import com.aurafiles.app.model.ClipboardMode
 import com.aurafiles.app.model.FileEntry
@@ -150,6 +156,9 @@ import com.aurafiles.app.model.FileSortMode
 import com.aurafiles.app.model.FileViewMode
 import com.aurafiles.app.model.FtpEntry
 import com.aurafiles.app.model.FtpProfile
+import com.aurafiles.app.model.FtpServerConfig
+import com.aurafiles.app.model.FtpServerStatus
+import com.aurafiles.app.data.FtpServerService
 import com.aurafiles.app.model.MainSection
 import com.aurafiles.app.model.StorageSnapshot
 import com.aurafiles.app.model.StorageAnalysis
@@ -165,13 +174,16 @@ import com.aurafiles.app.ui.theme.AuraRed
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
+import java.security.SecureRandom
 
 @Composable
 fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val uiState by viewModel.state.collectAsState()
+    val ftpServerStatus by FtpServerService.status.collectAsState()
     val context = LocalContext.current
     val snackbarHostState = remember { SnackbarHostState() }
     var previewEntry by remember { mutableStateOf<FileEntry?>(null) }
+    var pendingServerConfig by remember { mutableStateOf<FtpServerConfig?>(null) }
     val treeLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
         onResult = { uri -> if (uri != null) viewModel.attachRoot(uri) },
@@ -187,6 +199,13 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val ftpUploadLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = viewModel::uploadToFtp,
+    )
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = {
+            pendingServerConfig?.let { config -> startFtpServer(context, uiState, config) }
+            pendingServerConfig = null
+        },
     )
     val requestFullAccess = {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -296,11 +315,24 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         },
                     )
                     MainSection.Recent -> RecentScreen(
-                        items = uiState.recentItems,
+                        state = uiState,
                         onOpenFile = { previewEntry = it },
+                        onRename = viewModel::rename,
+                        onDeleteMany = viewModel::delete,
+                        onClipboardMany = viewModel::putOnClipboard,
+                        onSetLastModified = viewModel::setLastModified,
+                        onCreateArchive = viewModel::createArchive,
+                        onExtractArchive = viewModel::extractArchive,
+                        onToggleFavorites = viewModel::toggleFavorites,
+                        onBatchRename = viewModel::batchRename,
+                        onCalculateHash = viewModel::calculateHash,
+                        onShare = { entries ->
+                            viewModel.prepareShare(entries) { intent -> shareFiles(context, intent) }
+                        },
                     )
                     MainSection.Network -> FtpScreen(
                         state = uiState,
+                        serverStatus = ftpServerStatus,
                         onConnect = viewModel::connectFtp,
                         onDisconnect = viewModel::disconnectFtp,
                         onRefresh = viewModel::refreshFtp,
@@ -311,6 +343,18 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onCreateFolder = viewModel::createFtpFolder,
                         onRename = viewModel::renameFtp,
                         onDelete = viewModel::deleteFtp,
+                        onStartServer = { config ->
+                            if (
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                pendingServerConfig = config
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                startFtpServer(context, uiState, config)
+                            }
+                        },
+                        onStopServer = { FtpServerService.stop(context) },
                     )
                     MainSection.Cleanup -> CleanupScreen(
                         state = uiState,
@@ -407,7 +451,17 @@ private fun HomeScreen(
                 )
             }
         }
-        item { SectionHeader(title = "Категории", action = if (state.analysis == null) "Проанализировать" else null) }
+        item {
+            SectionHeader(
+                title = "Категории",
+                action = when {
+                    state.analyzing -> "Анализ…"
+                    state.analysis == null -> "Проанализировать"
+                    else -> null
+                },
+                onAction = if (!state.analyzing && state.analysis == null) onAnalyze else null,
+            )
+        }
         item {
             CategoryGrid(
                 state = state,
@@ -460,6 +514,7 @@ private fun HomeScreen(
 @Composable
 private fun FtpScreen(
     state: FileManagerUiState,
+    serverStatus: FtpServerStatus,
     onConnect: (FtpProfile) -> Unit,
     onDisconnect: () -> Unit,
     onRefresh: () -> Unit,
@@ -470,9 +525,12 @@ private fun FtpScreen(
     onCreateFolder: (String) -> Unit,
     onRename: (FtpEntry, String) -> Unit,
     onDelete: (FtpEntry) -> Unit,
+    onStartServer: (FtpServerConfig) -> Unit,
+    onStopServer: () -> Unit,
 ) {
     var settingsOpen by remember { mutableStateOf(false) }
     var createFolderOpen by remember { mutableStateOf(false) }
+    var serverSettingsOpen by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -524,6 +582,14 @@ private fun FtpScreen(
                     }
                 }
             }
+        }
+        item {
+            FtpServerCard(
+                status = serverStatus,
+                rootConnected = state.rootConnected,
+                onConfigure = { serverSettingsOpen = true },
+                onStop = onStopServer,
+            )
         }
 
         if (state.ftpConnected) {
@@ -635,6 +701,199 @@ private fun FtpScreen(
             onConfirm = { name -> createFolderOpen = false; onCreateFolder(name) },
         )
     }
+    if (serverSettingsOpen) {
+        FtpServerConfigDialog(
+            onDismiss = { serverSettingsOpen = false },
+            onConfirm = { config ->
+                serverSettingsOpen = false
+                onStartServer(config)
+            },
+        )
+    }
+}
+
+@Composable
+private fun FtpServerCard(
+    status: FtpServerStatus,
+    rootConnected: Boolean,
+    onConfigure: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val context = LocalContext.current
+    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(Icons.Rounded.Smartphone, if (status.running) AuraGreen else AuraBlue)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Сервер на телефоне", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        when {
+                            status.starting -> "Запуск…"
+                            status.running -> "Работает · подключений: ${status.clients}"
+                            status.error != null -> "Не запущен"
+                            else -> "Доступ к файлам с компьютера"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+            status.error?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+            }
+            if (status.running) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text("Адрес", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+                    SelectionContainer {
+                        Column {
+                            status.endpoints.forEach { endpoint -> Text(endpoint, fontWeight = FontWeight.SemiBold) }
+                        }
+                    }
+                    PropertyRow("Логин", status.username)
+                    PropertyRow("Пароль", status.password)
+                    PropertyRow("Папка", status.rootLabel)
+                    Text(
+                        if (status.readOnly) "Режим: только чтение" else "Режим: чтение и запись",
+                        color = if (status.readOnly) AuraBlue else AuraOrange,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            val details = buildString {
+                                appendLine(status.endpoints.firstOrNull().orEmpty())
+                                appendLine("Логин: ${status.username}")
+                                append("Пароль: ${status.password}")
+                            }
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Aura FTP", details))
+                            Toast.makeText(context, "Реквизиты скопированы", Toast.LENGTH_SHORT).show()
+                        },
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = null)
+                        Spacer(Modifier.width(5.dp))
+                        Text("Копировать")
+                    }
+                    Button(modifier = Modifier.weight(1f), onClick = onStop) { Text("Остановить") }
+                }
+                Text(
+                    "Обычный FTP не шифрует трафик — используйте только в доверенной локальной сети.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+            } else {
+                Button(
+                    onClick = onConfigure,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = rootConnected && !status.starting,
+                ) { Text(if (rootConnected) "Запустить сервер" else "Сначала подключите папку") }
+                Text(
+                    "Сервер публикует только подключённую в Aura папку и работает до нажатия «Остановить».",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FtpServerConfigDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (FtpServerConfig) -> Unit,
+) {
+    var port by remember { mutableStateOf("2121") }
+    var username by remember { mutableStateOf("aura") }
+    var password by remember { mutableStateOf(generateFtpPassword()) }
+    var readOnly by remember { mutableStateOf(true) }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Rounded.Smartphone, contentDescription = null) },
+        title = { Text("FTP-сервер на телефоне") },
+        text = {
+            Column(
+                modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "Корнем станет подключённая в Aura папка. Адрес появится после запуска.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 12.sp,
+                )
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter(Char::isDigit).take(5) },
+                    label = { Text("Порт") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it.take(64) },
+                    label = { Text("Логин") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it.take(64) },
+                    label = { Text("Пароль") },
+                    singleLine = true,
+                    supportingText = { Text("Показывается открыто, чтобы ввести на компьютере") },
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Lock, contentDescription = null, tint = if (readOnly) AuraGreen else AuraOrange)
+                    Spacer(Modifier.width(9.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Только чтение", fontWeight = FontWeight.Medium)
+                        Text(
+                            if (readOnly) "С компьютера нельзя изменять файлы" else "Разрешены загрузка, удаление и переименование",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Switch(checked = readOnly, onCheckedChange = { readOnly = it })
+                }
+                Text(
+                    "Сервер принимает подключения только из локальной сети. Foreground-служба и Wi‑Fi lock увеличивают расход батареи.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+                localError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val parsedPort = port.toIntOrNull()
+                when {
+                    parsedPort == null || parsedPort !in 1024..65535 -> localError = "Порт должен быть от 1024 до 65535"
+                    username.length !in 3..64 || username.any(Char::isWhitespace) -> localError = "Логин: 3–64 символа без пробелов"
+                    password.length < 8 -> localError = "Пароль должен содержать не менее 8 символов"
+                    password.any { it == '\r' || it == '\n' || it == '\u0000' } -> localError = "Некорректный пароль"
+                    else -> onConfirm(FtpServerConfig(parsedPort, username, password, readOnly))
+                }
+            }) { Text("Запустить") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+}
+
+private fun generateFtpPassword(): String {
+    val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+    val random = SecureRandom()
+    return buildString(12) { repeat(12) { append(alphabet[random.nextInt(alphabet.length)]) } }
 }
 
 @Composable
@@ -1248,15 +1507,58 @@ private fun BrowserScreen(
 }
 
 @Composable
-private fun RecentScreen(items: List<FileEntry>, onOpenFile: (FileEntry) -> Unit) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp, 20.dp, 16.dp, 24.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        item { LargeTitleRow("Недавние") }
+private fun RecentScreen(
+    state: FileManagerUiState,
+    onOpenFile: (FileEntry) -> Unit,
+    onRename: (FileEntry, String) -> Unit,
+    onDeleteMany: (List<FileEntry>) -> Unit,
+    onClipboardMany: (List<FileEntry>, ClipboardMode) -> Unit,
+    onSetLastModified: (List<FileEntry>, Long) -> Unit,
+    onCreateArchive: (List<FileEntry>, String) -> Unit,
+    onExtractArchive: (FileEntry) -> Unit,
+    onToggleFavorites: (List<FileEntry>) -> Unit,
+    onBatchRename: (List<FileEntry>, List<String>) -> Unit,
+    onCalculateHash: (FileEntry) -> Unit,
+    onShare: (List<FileEntry>) -> Unit,
+) {
+    val items = state.recentItems
+    var selectedUris by remember { mutableStateOf<Set<Uri>>(emptySet()) }
+    var propertiesEntry by remember { mutableStateOf<FileEntry?>(null) }
+    var deleteEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    var dateEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    var archiveEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    var batchRenameEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    val selectedEntries = items.filter { it.uri in selectedUris }
+
+    BackHandler(enabled = selectedEntries.isNotEmpty()) { selectedUris = emptySet() }
+
+    Column(Modifier.fillMaxSize()) {
+        if (selectedEntries.isEmpty()) {
+            Box(Modifier.padding(start = 16.dp, top = 20.dp, end = 16.dp, bottom = 12.dp)) {
+                LargeTitleRow("Недавние")
+            }
+        } else {
+            SelectionHeader(
+                count = selectedEntries.size,
+                shareEnabled = true,
+                dateEnabled = true,
+                extractEnabled = selectedEntries.size == 1 && selectedEntries.first().name.endsWith(".zip", true),
+                allFavorited = selectedEntries.all { it.uri in state.favoriteUris },
+                batchRenameEnabled = selectedEntries.size > 1,
+                onClear = { selectedUris = emptySet() },
+                onChangeDate = { dateEntries = selectedEntries },
+                onCopy = { onClipboardMany(selectedEntries, ClipboardMode.Copy); selectedUris = emptySet() },
+                onMove = { onClipboardMany(selectedEntries, ClipboardMode.Move); selectedUris = emptySet() },
+                onArchive = { archiveEntries = selectedEntries },
+                onExtract = { onExtractArchive(selectedEntries.first()); selectedUris = emptySet() },
+                onFavorite = { onToggleFavorites(selectedEntries); selectedUris = emptySet() },
+                onBatchRename = { batchRenameEntries = selectedEntries },
+                onShare = { onShare(selectedEntries); selectedUris = emptySet() },
+                onDelete = { deleteEntries = selectedEntries },
+            )
+        }
         if (items.isEmpty()) {
-            item {
+            Box(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.TopCenter) {
                 EmptyStateCard(
                     icon = Icons.Rounded.Description,
                     title = "Здесь пока пусто",
@@ -1264,8 +1566,97 @@ private fun RecentScreen(items: List<FileEntry>, onOpenFile: (FileEntry) -> Unit
                 )
             }
         } else {
-            item { FileListCard(entries = items, onClick = onOpenFile) }
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
+            ) {
+                item {
+                    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+                        Column {
+                            items.forEachIndexed { index, entry ->
+                                BrowserFileRow(
+                                    entry = entry,
+                                    selected = entry.uri in selectedUris,
+                                    selectionMode = selectedEntries.isNotEmpty(),
+                                    onClick = { onOpenFile(entry) },
+                                    onToggleSelection = { selectedUris = toggleSelection(selectedUris, entry.uri) },
+                                    onRename = { onRename(entry, it) },
+                                    onDelete = { deleteEntries = listOf(entry) },
+                                    onCopy = { onClipboardMany(listOf(entry), ClipboardMode.Copy) },
+                                    onMove = { onClipboardMany(listOf(entry), ClipboardMode.Move) },
+                                    onShare = { onShare(listOf(entry)) },
+                                    onProperties = { propertiesEntry = entry },
+                                )
+                                if (index != items.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(start = 64.dp),
+                                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    if (dateEntries.isNotEmpty()) {
+        DateTimeEditorDialog(
+            entries = dateEntries,
+            onDismiss = { dateEntries = emptyList() },
+            onConfirm = { timestamp ->
+                onSetLastModified(dateEntries, timestamp)
+                dateEntries = emptyList()
+                selectedUris = emptySet()
+            },
+        )
+    }
+    if (archiveEntries.isNotEmpty()) {
+        NameDialog(
+            title = "Создать ZIP",
+            initialValue = if (archiveEntries.size == 1) archiveEntries.first().name.substringBeforeLast('.') else "Архив",
+            confirmLabel = "Создать",
+            onDismiss = { archiveEntries = emptyList() },
+            onConfirm = { name ->
+                onCreateArchive(archiveEntries, name)
+                archiveEntries = emptyList()
+                selectedUris = emptySet()
+            },
+        )
+    }
+    if (batchRenameEntries.isNotEmpty()) {
+        BatchRenameDialog(
+            entries = batchRenameEntries,
+            onDismiss = { batchRenameEntries = emptyList() },
+            onConfirm = { names ->
+                onBatchRename(batchRenameEntries, names)
+                batchRenameEntries = emptyList()
+                selectedUris = emptySet()
+            },
+        )
+    }
+    propertiesEntry?.let { entry ->
+        FilePropertiesDialog(
+            entry = entry,
+            hash = state.fileHashes[entry.uri],
+            hashing = entry.uri in state.hashingUris,
+            favorite = entry.uri in state.favoriteUris,
+            onCalculateHash = { onCalculateHash(entry) },
+            onToggleFavorite = { onToggleFavorites(listOf(entry)) },
+            onDismiss = { propertiesEntry = null },
+        )
+    }
+    if (deleteEntries.isNotEmpty()) {
+        DeleteEntriesDialog(
+            entries = deleteEntries,
+            onDismiss = { deleteEntries = emptyList() },
+            onConfirm = {
+                onDeleteMany(deleteEntries)
+                deleteEntries = emptyList()
+                selectedUris = emptySet()
+            },
+        )
     }
 }
 
@@ -1469,7 +1860,7 @@ private fun LargeTitleRow(title: String) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Быстрый и аккуратный файловый менеджер для Android.")
                     PropertyRow("Разработчик", "Привалов Олег")
-                    PropertyRow("Версия", "0.6.0")
+                    PropertyRow("Версия", "0.7.0")
                 }
             },
             confirmButton = {
@@ -1634,14 +2025,21 @@ private fun categoryLabel(category: FileCategory): String = when (category) {
 }
 
 @Composable
-private fun SectionHeader(title: String, action: String? = null) {
+private fun SectionHeader(title: String, action: String? = null, onAction: (() -> Unit)? = null) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(title, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
-        action?.let { Text(it, color = MaterialTheme.colorScheme.primary, fontSize = 14.sp) }
+        action?.let {
+            Text(
+                it,
+                modifier = if (onAction != null) Modifier.clickable(onClick = onAction).padding(6.dp) else Modifier,
+                color = if (onAction != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 14.sp,
+            )
+        }
     }
 }
 
@@ -1774,29 +2172,33 @@ private fun BrowserListContent(
     LazyColumn(
         contentPadding = PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 24.dp),
     ) {
-        item {
-            Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+        itemsIndexed(entries, key = { _, entry -> entry.uri.toString() }) { index, entry ->
+            val shape = when {
+                entries.size == 1 -> RoundedCornerShape(22.dp)
+                index == 0 -> RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+                index == entries.lastIndex -> RoundedCornerShape(bottomStart = 22.dp, bottomEnd = 22.dp)
+                else -> RoundedCornerShape(0.dp)
+            }
+            Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
                 Column {
-                    entries.forEachIndexed { index, entry ->
-                        BrowserFileRow(
-                            entry = entry,
-                            selected = entry.uri in selectedUris,
-                            selectionMode = selectionMode,
-                            onClick = { onOpen(entry) },
-                            onToggleSelection = { onToggleSelection(entry) },
-                            onRename = { onRename(entry, it) },
-                            onDelete = { onDelete(entry) },
-                            onCopy = { onCopy(entry) },
-                            onMove = { onMove(entry) },
-                            onShare = { onShare(entry) },
-                            onProperties = { onProperties(entry) },
+                    BrowserFileRow(
+                        entry = entry,
+                        selected = entry.uri in selectedUris,
+                        selectionMode = selectionMode,
+                        onClick = { onOpen(entry) },
+                        onToggleSelection = { onToggleSelection(entry) },
+                        onRename = { onRename(entry, it) },
+                        onDelete = { onDelete(entry) },
+                        onCopy = { onCopy(entry) },
+                        onMove = { onMove(entry) },
+                        onShare = { onShare(entry) },
+                        onProperties = { onProperties(entry) },
+                    )
+                    if (index != entries.lastIndex) {
+                        HorizontalDivider(
+                            modifier = Modifier.padding(start = 64.dp),
+                            color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f),
                         )
-                        if (index != entries.lastIndex) {
-                            HorizontalDivider(
-                                modifier = Modifier.padding(start = 64.dp),
-                                color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f),
-                            )
-                        }
                     }
                 }
             }
@@ -1875,7 +2277,7 @@ private fun GridFileTile(
                 modifier = Modifier.align(Alignment.Center).padding(14.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                FileIcon(entry)
+                FileIcon(entry, showThumbnail = true)
                 Spacer(Modifier.height(10.dp))
                 Text(
                     entry.name,
@@ -2326,7 +2728,7 @@ private fun DeleteEntriesDialog(
 }
 
 @Composable
-private fun FileIcon(entry: FileEntry) {
+private fun FileIcon(entry: FileEntry, showThumbnail: Boolean = false) {
     if (entry.isDirectory) {
         AppleFolderGlyph()
         return
@@ -2348,11 +2750,15 @@ private fun FileIcon(entry: FileEntry) {
             Icons.Rounded.Description to AuraBlue
         else -> Icons.AutoMirrored.Rounded.InsertDriveFile to MaterialTheme.colorScheme.onSurfaceVariant
     }
-    FileThumbnail(
-        entry = entry,
-        modifier = Modifier.size(width = 44.dp, height = 40.dp),
-        fallback = { AppleFileGlyph(icon = icon, tint = tint) },
-    )
+    if (showThumbnail) {
+        FileThumbnail(
+            entry = entry,
+            modifier = Modifier.size(width = 44.dp, height = 40.dp),
+            fallback = { AppleFileGlyph(icon = icon, tint = tint) },
+        )
+    } else {
+        AppleFileGlyph(icon = icon, tint = tint)
+    }
 }
 
 @Composable
@@ -2973,6 +3379,19 @@ private fun NameDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
+}
+
+private fun startFtpServer(context: Context, state: FileManagerUiState, config: FtpServerConfig) {
+    val root = state.folderStack.firstOrNull()
+    if (root == null) {
+        Toast.makeText(context, "Сначала подключите локальную папку", Toast.LENGTH_LONG).show()
+        return
+    }
+    runCatching {
+        FtpServerService.start(context, root.document.uri, root.label, config)
+    }.onFailure {
+        Toast.makeText(context, it.message ?: "Не удалось запустить FTP-сервер", Toast.LENGTH_LONG).show()
+    }
 }
 
 private fun openFile(context: Context, entry: FileEntry) {
