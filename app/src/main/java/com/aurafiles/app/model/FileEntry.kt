@@ -1,6 +1,7 @@
 package com.aurafiles.app.model
 
 import android.net.Uri
+import android.os.storage.StorageVolume
 import androidx.documentfile.provider.DocumentFile
 
 data class FileEntry(
@@ -49,14 +50,37 @@ enum class FileViewMode {
     Grid,
 }
 
+enum class SystemSoundType {
+    Ringtone,
+    Alarm,
+}
+
 enum class FileCategory {
     Images,
     Video,
     Audio,
     Documents,
     Archives,
+    Books,
+    Apk,
+    Downloads,
+    Camera,
     Other,
 }
+
+data class FileCollectionGroup(
+    val title: String,
+    val entries: List<FileEntry>,
+)
+
+data class StorageVolumeInfo(
+    val id: String,
+    val label: String,
+    val volume: StorageVolume?,
+    val removable: Boolean,
+    val state: String,
+    val hardwareDetected: Boolean = false,
+)
 
 data class CategorySummary(
     val category: FileCategory,
@@ -86,12 +110,93 @@ fun FileEntry.category(): FileCategory {
         mimeType?.startsWith("image/") == true -> FileCategory.Images
         mimeType?.startsWith("video/") == true -> FileCategory.Video
         mimeType?.startsWith("audio/") == true -> FileCategory.Audio
+        isBookFormat() -> FileCategory.Books
         mimeType == "application/pdf" || mimeType?.startsWith("text/") == true ||
-            extension in setOf("doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "rtf", "txt", "md", "csv") -> FileCategory.Documents
+            extension in setOf("pdf", "djvu", "djv", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "rtf", "txt", "md", "csv") -> FileCategory.Documents
         extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz") ||
             mimeType?.contains("zip") == true || mimeType?.contains("archive") == true -> FileCategory.Archives
+        extension == "apk" || mimeType == "application/vnd.android.package-archive" -> FileCategory.Apk
         else -> FileCategory.Other
     }
+}
+
+fun FileEntry.isBookFormat(): Boolean {
+    val lower = name.lowercase()
+    return lower.endsWith(".fb2.zip") || name.substringAfterLast('.', "").lowercase() in setOf(
+        "epub", "fb2", "mobi", "azw", "azw3", "prc", "cbz", "cbr"
+    )
+}
+
+fun FileEntry.isReaderSupported(): Boolean {
+    val lower = name.lowercase()
+    return lower.endsWith(".fb2.zip") || name.substringAfterLast('.', "").lowercase() in setOf(
+        "epub", "fb2", "mobi", "azw", "azw3", "prc", "docx", "rtf", "md", "markdown",
+        "txt", "html", "htm", "pdf", "djvu", "djv", "cbz", "cbr"
+    )
+}
+
+fun FileEntry.isAudioFile(): Boolean {
+    val extension = name.substringAfterLast('.', "").lowercase()
+    return mimeType?.startsWith("audio/") == true || extension in setOf(
+        "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "3gp", "mid", "midi"
+    )
+}
+
+fun FileEntry.matchesCategory(category: FileCategory): Boolean = when (category) {
+    FileCategory.Books -> isReaderSupported()
+    FileCategory.Downloads -> searchablePath().containsPathPart("download") || searchablePath().containsPathPart("downloads")
+    FileCategory.Camera -> searchablePath().contains("dcim/camera") || searchablePath().contains("dcim\\camera")
+    else -> category() == category
+}
+
+fun FileEntry.isThumbnailCache(): Boolean {
+    val path = searchablePath()
+    return path.contains(".thumbnails") || path.containsPathPart("thumbnails") || path.containsPathPart("thumbnail")
+}
+
+fun FileEntry.isTemporaryCandidate(): Boolean {
+    val path = searchablePath()
+    val extension = name.substringAfterLast('.', "").lowercase()
+    return isThumbnailCache() ||
+        path.containsPathPart("cache") ||
+        path.containsPathPart("temp") ||
+        path.containsPathPart("tmp") ||
+        extension in setOf("tmp", "temp", "log", "bak")
+}
+
+fun FileEntry.sourceLabel(): String {
+    val path = searchablePath()
+    return when {
+        isThumbnailCache() -> "Миниатюры и кэш"
+        path.contains("whatsapp") || path.contains("com.whatsapp") -> "WhatsApp"
+        path.contains("telegram") || path.contains("org.telegram") -> "Telegram"
+        path.contains("dcim/camera") || path.contains("dcim\\camera") -> "Камера"
+        path.containsPathPart("screenshots") || path.containsPathPart("screenshot") -> "Снимки экрана"
+        path.containsPathPart("download") || path.containsPathPart("downloads") -> "Загрузки"
+        path.containsPathPart("bluetooth") -> "Bluetooth"
+        path.containsPathPart("documents") -> "Документы"
+        else -> "Другие папки"
+    }
+}
+
+fun FileEntry.displayLocation(): String {
+    val decoded = Uri.decode((parentUri ?: uri).toString())
+    val documentPath = decoded.substringAfter("primary:", decoded)
+        .substringAfter("document/")
+        .substringBefore('?')
+        .trimEnd('/')
+    val parent = documentPath.substringBeforeLast('/', documentPath)
+    return parent.takeLast(80).ifBlank { sourceLabel() }
+}
+
+private fun FileEntry.searchablePath(): String = Uri.decode("${parentUri?.toString().orEmpty()}|$uri|$name")
+    .replace('\\', '/')
+    .lowercase()
+
+private fun String.containsPathPart(part: String): Boolean {
+    val normalized = replace('\\', '/')
+    return normalized.contains("/$part/") || normalized.contains(":$part/") ||
+        normalized.endsWith("/$part") || normalized.contains("/$part|")
 }
 
 enum class MainSection {
@@ -136,6 +241,37 @@ data class FtpServerStatus(
     val readOnly: Boolean = true,
     val clients: Int = 0,
     val error: String? = null,
+)
+
+enum class LanService {
+    Smb,
+    Ftp,
+    Web,
+    Ssh,
+    Media,
+}
+
+data class LanDevice(
+    val address: String,
+    val name: String = address,
+    val services: Set<LanService>,
+)
+
+data class SmbProfile(
+    val name: String = "Сетевой диск",
+    val host: String,
+    val share: String,
+    val username: String,
+    val password: String,
+    val domain: String = "",
+)
+
+data class SmbEntry(
+    val name: String,
+    val path: String,
+    val isDirectory: Boolean,
+    val size: Long,
+    val modifiedAt: Long,
 )
 
 enum class StorageAccessMode {

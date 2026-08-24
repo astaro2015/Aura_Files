@@ -1,6 +1,7 @@
 package com.aurafiles.app.ui
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
@@ -11,8 +12,6 @@ import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.util.Size
 import android.util.LruCache
-import android.widget.MediaController
-import android.widget.VideoView
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
@@ -35,6 +34,7 @@ import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Description
+import androidx.compose.material.icons.rounded.Fullscreen
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -71,6 +71,11 @@ import androidx.compose.ui.window.DialogProperties
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.ui.theme.AuraBlue
 import com.aurafiles.app.ui.theme.AuraGreen
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -106,6 +111,7 @@ internal fun FilePreviewDialog(
     onOpenExternal: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(
             modifier = Modifier.fillMaxSize().padding(10.dp),
@@ -130,6 +136,16 @@ internal fun FilePreviewDialog(
                     IconButton(onClick = onOpenExternal) {
                         Icon(Icons.AutoMirrored.Rounded.Launch, contentDescription = "Открыть в другом приложении")
                     }
+                    if (isVideo(entry)) {
+                        IconButton(onClick = {
+                            context.startActivity(
+                                Intent(context, FullscreenVideoActivity::class.java)
+                                    .putExtra(FullscreenVideoActivity.EXTRA_URI, entry.uri.toString())
+                            )
+                        }) {
+                            Icon(Icons.Rounded.Fullscreen, contentDescription = "На весь экран")
+                        }
+                    }
                 }
                 PreviewBody(entry = entry, onOpenExternal = onOpenExternal, modifier = Modifier.weight(1f))
             }
@@ -143,8 +159,8 @@ private fun PreviewBody(entry: FileEntry, onOpenExternal: () -> Unit, modifier: 
         isImage(entry) -> BitmapPreview(entry, modifier)
         isPdf(entry) -> PdfPreview(entry, modifier)
         isText(entry) -> TextPreview(entry, modifier)
-        isVideo(entry) -> MediaPreview(entry, modifier, audioOnly = false)
-        isAudio(entry) -> MediaPreview(entry, modifier, audioOnly = true)
+        isVideo(entry) -> MediaPreview(entry, modifier, audioOnly = false, onOpenExternal = onOpenExternal)
+        isAudio(entry) -> MediaPreview(entry, modifier, audioOnly = true, onOpenExternal = onOpenExternal)
         else -> Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Icon(Icons.Rounded.Description, contentDescription = null, tint = AuraBlue, modifier = Modifier.size(72.dp))
@@ -259,11 +275,32 @@ private fun TextPreview(entry: FileEntry, modifier: Modifier) {
 }
 
 @Composable
-private fun MediaPreview(entry: FileEntry, modifier: Modifier, audioOnly: Boolean) {
+private fun MediaPreview(
+    entry: FileEntry,
+    modifier: Modifier,
+    audioOnly: Boolean,
+    onOpenExternal: () -> Unit,
+) {
     val context = LocalContext.current
-    var videoView by remember(entry.uri) { mutableStateOf<VideoView?>(null) }
-    DisposableEffect(entry.uri) {
-        onDispose { videoView?.stopPlayback() }
+    val player = remember(entry.uri) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(entry.uri))
+            prepare()
+            playWhenReady = true
+        }
+    }
+    var playbackError by remember(entry.uri) { mutableStateOf<String?>(null) }
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                playbackError = "Этот видеокодек не поддерживается устройством"
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
     Column(modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally) {
         if (audioOnly) {
@@ -273,21 +310,27 @@ private fun MediaPreview(entry: FileEntry, modifier: Modifier, audioOnly: Boolea
         }
         AndroidView(
             factory = {
-                VideoView(context).apply {
-                    val controls = MediaController(context)
-                    controls.setAnchorView(this)
-                    setMediaController(controls)
-                    setVideoURI(entry.uri)
-                    setOnPreparedListener { player ->
-                        player.isLooping = false
-                        start()
-                        controls.show(0)
-                    }
-                    videoView = this
+                PlayerView(context).apply {
+                    useController = true
+                    keepScreenOn = true
+                    this.player = player
                 }
             },
-            modifier = if (audioOnly) Modifier.fillMaxWidth().height(120.dp) else Modifier.fillMaxSize(),
+            update = { it.player = player },
+            modifier = if (audioOnly) {
+                Modifier.fillMaxWidth().height(120.dp)
+            } else {
+                Modifier.weight(1f).fillMaxWidth()
+            },
         )
+        playbackError?.let { error ->
+            Surface(color = MaterialTheme.colorScheme.errorContainer, shape = RoundedCornerShape(14.dp)) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(error, modifier = Modifier.weight(1f), color = MaterialTheme.colorScheme.onErrorContainer)
+                    TextButton(onClick = onOpenExternal) { Text("Открыть в…") }
+                }
+            }
+        }
     }
 }
 

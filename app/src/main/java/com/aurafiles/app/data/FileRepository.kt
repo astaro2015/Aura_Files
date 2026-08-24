@@ -10,6 +10,9 @@ import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.StatFs
+import android.os.storage.StorageManager
+import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbManager
 import android.provider.DocumentsContract
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
@@ -18,9 +21,10 @@ import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.CategorySummary
 import com.aurafiles.app.model.StorageSnapshot
 import com.aurafiles.app.model.StorageAnalysis
+import com.aurafiles.app.model.StorageVolumeInfo
 import com.aurafiles.app.model.StorageAccessMode
 import com.aurafiles.app.model.TrashRecord
-import com.aurafiles.app.model.category
+import com.aurafiles.app.model.matchesCategory
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -111,10 +115,13 @@ class FileRepository(private val context: Context) {
         return requireNotNull(parent.createDirectory(name)) { "Не удалось создать папку" }
     }
 
-    fun rename(entry: FileEntry, requestedName: String) {
+    fun rename(entry: FileEntry, requestedName: String): Uri {
         val name = requestedName.trim()
         require(name.isNotEmpty()) { "Введите новое название" }
+        val oldUri = entry.uri
         require(entry.document.renameTo(name)) { "Не удалось переименовать объект" }
+        replaceFavoriteUri(oldUri, entry.document.uri)
+        return entry.document.uri
     }
 
     fun delete(entry: FileEntry) {
@@ -192,6 +199,15 @@ class FileRepository(private val context: Context) {
         return current
     }
 
+    private fun replaceFavoriteUri(oldUri: Uri, newUri: Uri) {
+        if (oldUri == newUri) return
+        val current = favoriteUris().toMutableSet()
+        if (current.remove(oldUri)) {
+            current.add(newUri)
+            preferences.edit().putStringSet(KEY_FAVORITES, current.map(Uri::toString).toSet()).apply()
+        }
+    }
+
     fun favoriteEntries(): List<FileEntry> {
         val valid = favoriteUris().mapNotNull { uri ->
             runCatching { documentFromUri(uri)?.takeIf { it.exists() }?.toEntry() }.getOrNull()
@@ -199,6 +215,30 @@ class FileRepository(private val context: Context) {
         val validUris = valid.map { it.uri.toString() }.toSet()
         preferences.edit().putStringSet(KEY_FAVORITES, validUris).apply()
         return valid.sortedBy { it.name.lowercase() }
+    }
+
+    fun showHiddenFiles(): Boolean = preferences.getBoolean(KEY_SHOW_HIDDEN, false)
+
+    fun setShowHiddenFiles(value: Boolean) {
+        preferences.edit().putBoolean(KEY_SHOW_HIDDEN, value).apply()
+    }
+
+    fun showThumbnailFiles(): Boolean = preferences.getBoolean(KEY_SHOW_THUMBNAIL_FILES, false)
+
+    fun setShowThumbnailFiles(value: Boolean) {
+        preferences.edit().putBoolean(KEY_SHOW_THUMBNAIL_FILES, value).apply()
+    }
+
+    fun showGridThumbnails(): Boolean = preferences.getBoolean(KEY_GRID_THUMBNAILS, true)
+
+    fun setShowGridThumbnails(value: Boolean) {
+        preferences.edit().putBoolean(KEY_GRID_THUMBNAILS, value).apply()
+    }
+
+    fun showFavoritesOnHome(): Boolean = preferences.getBoolean(KEY_FAVORITES_HOME, true)
+
+    fun setShowFavoritesOnHome(value: Boolean) {
+        preferences.edit().putBoolean(KEY_FAVORITES_HOME, value).apply()
     }
 
     fun batchRename(entries: List<FileEntry>, newNames: List<String>) {
@@ -228,7 +268,9 @@ class FileRepository(private val context: Context) {
                 }
             }
             entries.zip(cleaned).forEach { (entry, requestedName) ->
+                val oldUri = entry.uri
                 require(entry.document.renameTo(requestedName)) { "Не удалось переименовать ${entry.name}" }
+                replaceFavoriteUri(oldUri, entry.document.uri)
             }
         } catch (error: Throwable) {
             entries.zip(originals).forEach { (entry, original) -> runCatching { entry.document.renameTo(original) } }
@@ -378,7 +420,7 @@ class FileRepository(private val context: Context) {
         walk(root)
 
         val categories = FileCategory.entries.map { category ->
-            val matching = files.filter { it.category() == category }
+            val matching = files.filter { it.matchesCategory(category) }
             CategorySummary(category, matching.size, matching.sumOf(FileEntry::size))
         }
         val duplicateGroups = files
@@ -402,10 +444,107 @@ class FileRepository(private val context: Context) {
         )
     }
 
+    fun saveAnalysis(root: DocumentFile, analysis: StorageAnalysis) {
+        val fileArray = JSONArray()
+        analysis.files.forEach { entry ->
+            fileArray.put(
+                JSONObject()
+                    .put("uri", entry.uri.toString())
+                    .put("name", entry.name)
+                    .put("mime", entry.mimeType ?: JSONObject.NULL)
+                    .put("size", entry.size)
+                    .put("modified", entry.modifiedAt)
+                    .put("parent", entry.parentUri?.toString() ?: JSONObject.NULL)
+            )
+        }
+        val duplicateArray = JSONArray()
+        analysis.duplicateGroups.forEach { group ->
+            duplicateArray.put(JSONArray().apply { group.forEach { put(it.uri.toString()) } })
+        }
+        val payload = JSONObject()
+            .put("version", ANALYSIS_CACHE_VERSION)
+            .put("root", root.uri.toString())
+            .put("scannedAt", analysis.scannedAt)
+            .put("limitReached", analysis.limitReached)
+            .put("files", fileArray)
+            .put("duplicates", duplicateArray)
+        val target = File(context.filesDir, ANALYSIS_CACHE_FILE)
+        val temporary = File(context.filesDir, "$ANALYSIS_CACHE_FILE.tmp")
+        temporary.writeText(payload.toString())
+        if (target.exists()) target.delete()
+        require(temporary.renameTo(target)) { "Не удалось сохранить индекс анализа" }
+    }
+
+    fun loadAnalysis(root: DocumentFile): StorageAnalysis? = runCatching {
+        val target = File(context.filesDir, ANALYSIS_CACHE_FILE)
+        if (!target.exists()) return null
+        val payload = JSONObject(target.readText())
+        if (payload.optInt("version") != ANALYSIS_CACHE_VERSION || payload.optString("root") != root.uri.toString()) {
+            return null
+        }
+        val files = buildList {
+            val array = payload.getJSONArray("files")
+            for (index in 0 until array.length()) {
+                val item = array.getJSONObject(index)
+                val uri = Uri.parse(item.getString("uri"))
+                val document = documentFromUri(uri) ?: continue
+                add(
+                    FileEntry(
+                        document = document,
+                        name = item.getString("name"),
+                        uri = uri,
+                        isDirectory = false,
+                        mimeType = item.optString("mime").takeIf { it.isNotBlank() && it != "null" },
+                        size = item.optLong("size"),
+                        modifiedAt = item.optLong("modified"),
+                        parentUri = item.optString("parent").takeIf { it.isNotBlank() && it != "null" }?.let(Uri::parse),
+                    )
+                )
+            }
+        }
+        val byUri = files.associateBy { it.uri.toString() }
+        val duplicates = buildList {
+            val groups = payload.optJSONArray("duplicates") ?: JSONArray()
+            for (groupIndex in 0 until groups.length()) {
+                val stored = groups.getJSONArray(groupIndex)
+                val restored = buildList {
+                    for (entryIndex in 0 until stored.length()) {
+                        byUri[stored.getString(entryIndex)]?.let(::add)
+                    }
+                }
+                if (restored.size > 1) add(restored)
+            }
+        }
+        val categories = FileCategory.entries.map { category ->
+            val matching = files.filter { it.matchesCategory(category) }
+            CategorySummary(category, matching.size, matching.sumOf(FileEntry::size))
+        }
+        StorageAnalysis(
+            files = files,
+            totalBytes = files.sumOf(FileEntry::size),
+            categories = categories,
+            largeFiles = files.filter { it.size >= LARGE_FILE_BYTES }.sortedByDescending(FileEntry::size).take(50),
+            duplicateGroups = duplicates,
+            limitReached = payload.optBoolean("limitReached"),
+            scannedAt = payload.optLong("scannedAt"),
+        )
+    }.getOrNull()
+
+    fun clearAnalysisCache() {
+        File(context.filesDir, ANALYSIS_CACHE_FILE).delete()
+        File(context.filesDir, "$ANALYSIS_CACHE_FILE.tmp").delete()
+    }
+
     fun openIntent(entry: FileEntry): Intent {
         val accessibleUri = externallyAccessibleUri(entry)
+        val extension = entry.name.substringAfterLast('.', "").lowercase()
+        val resolvedMime = when (extension) {
+            "djvu", "djv" -> "image/vnd.djvu"
+            "apk" -> "application/vnd.android.package-archive"
+            else -> entry.mimeType ?: "*/*"
+        }
         return Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(accessibleUri, entry.mimeType ?: "*/*")
+            setDataAndType(accessibleUri, resolvedMime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }
@@ -470,6 +609,42 @@ class FileRepository(private val context: Context) {
             totalBytes = stats.totalBytes,
             availableBytes = stats.availableBytes,
         )
+    }
+
+    fun storageVolumes(): List<StorageVolumeInfo> {
+        val manager = context.getSystemService(StorageManager::class.java)
+        val mounted = manager.storageVolumes
+            .filterNot { it.isPrimary }
+            .map { volume ->
+                StorageVolumeInfo(
+                    id = volume.uuid ?: volume.toString(),
+                    label = volume.getDescription(context).ifBlank { if (volume.isRemovable) "Съёмный накопитель" else "Накопитель" },
+                    volume = volume,
+                    removable = volume.isRemovable,
+                    state = volume.state,
+                )
+            }
+        if (mounted.isNotEmpty()) return mounted
+
+        val usbManager = context.getSystemService(UsbManager::class.java)
+        return usbManager.deviceList.values
+            .filter { device ->
+                device.deviceClass == UsbConstants.USB_CLASS_MASS_STORAGE ||
+                    (0 until device.interfaceCount).any { index ->
+                        device.getInterface(index).interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE
+                    }
+            }
+            .map { device ->
+                StorageVolumeInfo(
+                    id = "usb-${device.vendorId}-${device.productId}-${device.deviceId}",
+                    label = device.productName?.takeIf(String::isNotBlank)
+                        ?: "USB ${device.vendorId.toString(16).uppercase()}:${device.productId.toString(16).uppercase()}",
+                    volume = null,
+                    removable = true,
+                    state = "USB обнаружено · ожидает монтирования Android",
+                    hardwareDetected = true,
+                )
+            }
     }
 
     private fun copyDocument(
@@ -707,6 +882,12 @@ class FileRepository(private val context: Context) {
         const val KEY_ACCESS_MODE = "access_mode"
         const val KEY_TRASH_RECORDS = "trash_records"
         const val KEY_FAVORITES = "favorite_uris"
+        const val KEY_SHOW_HIDDEN = "show_hidden"
+        const val KEY_SHOW_THUMBNAIL_FILES = "show_thumbnail_files"
+        const val KEY_GRID_THUMBNAILS = "grid_thumbnails"
+        const val KEY_FAVORITES_HOME = "favorites_home"
+        const val ANALYSIS_CACHE_FILE = "analysis-index.json"
+        const val ANALYSIS_CACHE_VERSION = 1
         const val TRASH_FOLDER = ".AuraTrash"
         const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
         const val TIMESTAMP_TOLERANCE_MILLIS = 2_000L
