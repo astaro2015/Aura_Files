@@ -352,9 +352,13 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     }
     BackHandler(
         enabled = !uiState.browserOpen && uiState.activeSection == MainSection.Network &&
-            (uiState.smbPath != "/" || uiState.ftpPath != "/"),
+            (uiState.smbPath != "/" ||
+                (uiState.smbProfile?.share?.isNotBlank() == true && uiState.smbShares.isNotEmpty()) ||
+                uiState.ftpPath != "/"),
     ) {
-        if (uiState.smbPath != "/") viewModel.navigateSmbBack() else viewModel.navigateFtpBack()
+        val smbCanGoBack = uiState.smbPath != "/" ||
+            (uiState.smbProfile?.share?.isNotBlank() == true && uiState.smbShares.isNotEmpty())
+        if (smbCanGoBack) viewModel.navigateSmbBack() else viewModel.navigateFtpBack()
     }
 
     Scaffold(
@@ -463,6 +467,7 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onOpenSettings = { settingsOpen = true },
                         onScanLan = viewModel::scanLan,
                         onConnectSmb = viewModel::connectSmb,
+                        onSelectSmbShare = viewModel::selectSmbShare,
                         onDisconnectSmb = viewModel::disconnectSmb,
                         onRefreshSmb = viewModel::refreshSmb,
                         onBackSmb = viewModel::navigateSmbBack,
@@ -666,6 +671,7 @@ private fun FtpScreen(
     onOpenSettings: () -> Unit,
     onScanLan: () -> Unit,
     onConnectSmb: (SmbProfile) -> Unit,
+    onSelectSmbShare: (String) -> Unit,
     onDisconnectSmb: () -> Unit,
     onRefreshSmb: () -> Unit,
     onBackSmb: () -> Boolean,
@@ -703,8 +709,15 @@ private fun FtpScreen(
                 scanning = state.lanScanning,
                 onScan = onScanLan,
                 onSmb = { device ->
-                    smbDialogInitial = SmbProfile(name = device.name, host = device.address, share = "", username = "", password = "")
-                    smbSettingsOpen = true
+                    onConnectSmb(
+                        SmbProfile(
+                            name = device.name,
+                            host = device.address,
+                            share = "",
+                            username = "",
+                            password = "",
+                        )
+                    )
                 },
                 onFtp = { device ->
                     ftpDialogInitial = FtpProfile(name = device.name, host = device.address, username = "", password = "")
@@ -740,11 +753,18 @@ private fun FtpScreen(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        IconButton(onClick = { onBackSmb() }, enabled = state.smbPath != "/") {
+                        val canGoBack = state.smbPath != "/" ||
+                            (state.smbProfile?.share?.isNotBlank() == true && state.smbShares.isNotEmpty())
+                        IconButton(onClick = { onBackSmb() }, enabled = canGoBack) {
                             Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "На уровень выше")
                         }
                         Text(
-                            state.smbPath,
+                            buildString {
+                                append("\\\\")
+                                append(state.smbProfile?.host.orEmpty())
+                                state.smbProfile?.share?.takeIf(String::isNotBlank)?.let { append("\\").append(it) }
+                                if (state.smbPath != "/") append(state.smbPath.replace('/', '\\'))
+                            },
                             modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                             maxLines = 1,
                             fontWeight = FontWeight.Medium,
@@ -769,6 +789,34 @@ private fun FtpScreen(
             when {
                 state.smbLoading -> item {
                     Box(Modifier.fillMaxWidth().height(130.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                }
+                state.smbProfile?.share.isNullOrBlank() && state.smbShares.isNotEmpty() -> item {
+                    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+                        Column {
+                            state.smbShares.forEachIndexed { index, shareName ->
+                                SmbShareRow(
+                                    name = shareName,
+                                    host = state.smbProfile?.host.orEmpty(),
+                                    onOpen = { onSelectSmbShare(shareName) },
+                                )
+                                if (index != state.smbShares.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(start = 66.dp),
+                                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                state.smbProfile?.share.isNullOrBlank() -> item {
+                    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                        Text(
+                            "Доступные общие папки не найдены. Проверьте учётные данные или укажите имя шары в расширенных настройках.",
+                            modifier = Modifier.fillMaxWidth().padding(24.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 state.smbItems.isEmpty() -> item {
                     Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
@@ -1007,7 +1055,13 @@ private fun LanDevicesCard(
             }
             devices.forEach { device ->
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable(
+                        enabled = LanService.Smb in device.services,
+                        onClick = { onSmb(device) },
+                    ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Column(Modifier.weight(1f)) {
                         Text(device.name, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         val serviceNames = device.services.map { service ->
@@ -1056,7 +1110,7 @@ private fun SmbConnectionCard(
                 IconBubble(Icons.Rounded.Storage, if (state.smbConnected) AuraGreen else AuraBlue)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(state.smbProfile?.name ?: "Сетевая папка SMB", fontWeight = FontWeight.SemiBold)
+                    Text(state.smbProfile?.name ?: "Сетевой компьютер SMB", fontWeight = FontWeight.SemiBold)
                     Text(
                         when {
                             state.smbLoading -> "Подключение…"
@@ -1265,6 +1319,35 @@ private fun generateFtpPassword(): String {
 }
 
 @Composable
+private fun SmbShareRow(
+    name: String,
+    host: String,
+    onOpen: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen)
+            .padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AppleFolderGlyph()
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+            Text(
+                "\\\\$host\\$name",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 11.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onOpen) {
+            Icon(Icons.Rounded.ChevronRight, contentDescription = "Открыть $name")
+        }
+    }
+}
+
+@Composable
 private fun SmbFileRow(
     entry: SmbEntry,
     busy: Boolean,
@@ -1307,12 +1390,13 @@ private fun SmbConnectionDialog(
     onDismiss: () -> Unit,
     onConfirm: (SmbProfile) -> Unit,
 ) {
-    var name by remember(initial) { mutableStateOf(initial?.name ?: "Сетевая папка") }
+    var name by remember(initial) { mutableStateOf(initial?.name ?: "Сетевой компьютер") }
     var host by remember(initial) { mutableStateOf(initial?.host.orEmpty()) }
     var share by remember(initial) { mutableStateOf(initial?.share.orEmpty()) }
     var username by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
     var password by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
     var domain by remember(initial) { mutableStateOf(initial?.domain.orEmpty()) }
+    var advanced by remember(initial) { mutableStateOf(initial?.share?.isNotBlank() == true || initial?.domain?.isNotBlank() == true) }
     var localError by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
@@ -1325,13 +1409,12 @@ private fun SmbConnectionDialog(
                 verticalArrangement = Arrangement.spacedBy(9.dp),
             ) {
                 Text(
-                    "Имя общей папки — часть после адреса: для \\компьютер\\Фото введите «Фото».",
+                    "Укажите только компьютер или IP. Aura попробует гостевой вход, затем введённую учётную запись и покажет доступные общие папки.",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Название") }, singleLine = true)
                 OutlinedTextField(value = host, onValueChange = { host = it }, label = { Text("Компьютер или IP") }, singleLine = true)
-                OutlinedTextField(value = share, onValueChange = { share = it }, label = { Text("Общая папка") }, singleLine = true)
                 OutlinedTextField(
                     value = username,
                     onValueChange = { username = it },
@@ -1345,19 +1428,43 @@ private fun SmbConnectionDialog(
                     visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
                 )
-                OutlinedTextField(value = domain, onValueChange = { domain = it }, label = { Text("Домен (необязательно)") }, singleLine = true)
+                TextButton(onClick = { advanced = !advanced }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (advanced) "Скрыть расширенные настройки" else "Расширенные настройки")
+                }
+                AnimatedVisibility(visible = advanced) {
+                    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        OutlinedTextField(
+                            value = share,
+                            onValueChange = { share = it },
+                            label = { Text("Открыть шару напрямую (необязательно)") },
+                            supportingText = { Text("Например Movies. Пусто — показать список общих папок") },
+                            singleLine = true,
+                        )
+                        OutlinedTextField(
+                            value = domain,
+                            onValueChange = { domain = it },
+                            label = { Text("Домен (необязательно)") },
+                            singleLine = true,
+                        )
+                    }
+                }
                 Text("Поддерживается безопасный SMB2/SMB3; устаревший SMB1 отключён.", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 localError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
             }
         },
         confirmButton = {
             Button(onClick = {
+                val rawTarget = host.trim().removePrefix("\\\\").removePrefix("smb://")
+                val separator = rawTarget.indexOfAny(charArrayOf('\\', '/'))
+                val targetHost = if (separator < 0) rawTarget else rawTarget.substring(0, separator)
+                val pastedShare = if (separator < 0) "" else rawTarget.substring(separator + 1)
+                    .substringBefore('\\').substringBefore('/')
+                val targetShare = share.trim().trim('/', '\\').ifBlank { pastedShare }
                 when {
-                    host.isBlank() -> localError = "Введите адрес устройства"
-                    share.trim().trim('/', '\\').isBlank() -> localError = "Введите имя общей папки"
-                    else -> onConfirm(SmbProfile(name.ifBlank { host }, host, share, username, password, domain))
+                    targetHost.isBlank() -> localError = "Введите адрес устройства"
+                    else -> onConfirm(SmbProfile(name.ifBlank { targetHost }, targetHost, targetShare, username, password, domain))
                 }
-            }) { Text("Подключить") }
+            }) { Text("Подключиться") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
     )
@@ -2422,7 +2529,7 @@ private fun LargeTitleRow(title: String, onSettings: (() -> Unit)? = null) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Быстрый и аккуратный файловый менеджер для Android.")
                     PropertyRow("Разработчик", "Привалов Олег")
-                    PropertyRow("Версия", "0.11.0")
+                    PropertyRow("Версия", "0.12.0")
                 }
             },
             confirmButton = {

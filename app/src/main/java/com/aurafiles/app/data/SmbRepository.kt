@@ -15,6 +15,13 @@ import com.hierynomus.smbj.auth.AuthenticationContext
 import com.hierynomus.smbj.connection.Connection
 import com.hierynomus.smbj.session.Session
 import com.hierynomus.smbj.share.DiskShare
+import java.util.Properties
+import jcifs.CIFSContext
+import jcifs.SmbConstants
+import jcifs.context.BaseContext
+import jcifs.config.PropertyConfiguration
+import jcifs.smb.NtlmPasswordAuthenticator
+import jcifs.smb.SmbFile
 import java.io.IOException
 import java.net.URLConnection
 import java.util.EnumSet
@@ -30,18 +37,49 @@ class SmbRepository(private val context: Context) {
     private var session: Session? = null
     private var share: DiskShare? = null
     private var activeProfile: SmbProfile? = null
+    private var preferredAuth: AuthenticationContext? = null
     private var currentPath = ""
 
-    suspend fun connect(profile: SmbProfile): Pair<String, List<SmbEntry>> = mutex.withLock {
-        validate(profile)
+    suspend fun discoverShares(profile: SmbProfile): List<String> = mutex.withLock {
+        validateHost(profile)
         disconnectInternal()
-        activeProfile = profile.copy(host = profile.host.trim(), share = profile.share.trim().trim('/', '\\'))
-        connectInternal()
+        preferredAuth = null
+        activeProfile = sanitize(profile).copy(share = "")
+        val shares = connectAndEnumerateShares(requireNotNull(activeProfile))
         currentPath = ""
-        displayPath(currentPath) to listInternal(currentPath)
+        shares
     }
 
-    suspend fun disconnect() = mutex.withLock { disconnectInternal() }
+    suspend fun connect(profile: SmbProfile): Pair<String, List<SmbEntry>> = mutex.withLock {
+        validateDirect(profile)
+        disconnectInternal()
+        preferredAuth = null
+        activeProfile = sanitize(profile)
+        currentPath = ""
+        displayPath(currentPath) to connectShareRootInternal()
+    }
+
+    suspend fun connectShare(shareName: String): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val profile = activeProfile ?: throw IOException("Сначала подключитесь к SMB-компьютеру")
+        val normalizedShare = shareName.trim().trim('/', '\\')
+        require(normalizedShare.isNotEmpty()) { "Выберите общую папку" }
+        disconnectInternal()
+        activeProfile = profile.copy(share = normalizedShare)
+        currentPath = ""
+        displayPath(currentPath) to connectShareRootInternal()
+    }
+
+    suspend fun returnToShareList() = mutex.withLock {
+        runCatching { share?.close() }
+        share = null
+        activeProfile = activeProfile?.copy(share = "")
+        currentPath = ""
+    }
+
+    suspend fun disconnect() = mutex.withLock {
+        disconnectInternal()
+        preferredAuth = null
+    }
 
     suspend fun list(path: String): Pair<String, List<SmbEntry>> = mutex.withLock {
         val normalized = normalizePath(path)
@@ -80,30 +118,131 @@ class SmbRepository(private val context: Context) {
 
     private fun connectInternal() {
         val profile = activeProfile ?: throw IOException("SMB-подключение ещё не настроено")
-        val config = SmbConfig.builder()
-            .withTimeout(20, TimeUnit.SECONDS)
-            .withSoTimeout(20, TimeUnit.SECONDS)
-            .withReadTimeout(90, TimeUnit.SECONDS)
-            .withWriteTimeout(90, TimeUnit.SECONDS)
-            .build()
-        val newClient = SMBClient(config)
-        try {
-            val newConnection = newClient.connect(profile.host)
-            val auth = if (profile.username.isBlank()) {
-                AuthenticationContext.guest()
-            } else {
-                AuthenticationContext(profile.username, profile.password.toCharArray(), profile.domain)
+        require(profile.share.isNotBlank()) { "Выберите общую папку" }
+        var lastError: Throwable? = null
+        authenticationCandidates(profile).forEach { auth ->
+            disconnectInternal()
+            val newClient = SMBClient(smbConfig())
+            try {
+                val newConnection = newClient.connect(profile.host)
+                val newSession = newConnection.authenticate(auth)
+                val newShare = newSession.connectShare(profile.share) as? DiskShare
+                    ?: throw IOException("${profile.share} не является файловой SMB-папкой")
+                client = newClient
+                connection = newConnection
+                session = newSession
+                share = newShare
+                preferredAuth = auth
+                return
+            } catch (error: Throwable) {
+                lastError = error
+                runCatching { newClient.close() }
             }
-            val newSession = newConnection.authenticate(auth)
-            val newShare = newSession.connectShare(profile.share) as? DiskShare
-                ?: throw IOException("${profile.share} не является файловой SMB-папкой")
-            client = newClient
-            connection = newConnection
-            session = newSession
-            share = newShare
-        } catch (error: Throwable) {
-            runCatching { newClient.close() }
-            throw IOException(smbMessage(error), error)
+        }
+        val error = lastError ?: IOException("Не удалось подключиться к SMB")
+        throw IOException(smbMessage(error), error)
+    }
+
+    private fun connectShareRootInternal(): List<SmbEntry> {
+        val profile = activeProfile ?: throw IOException("SMB-подключение ещё не настроено")
+        require(profile.share.isNotBlank()) { "Выберите общую папку" }
+        var lastError: Throwable? = null
+        authenticationCandidates(profile).forEach { auth ->
+            disconnectInternal()
+            val newClient = SMBClient(smbConfig())
+            var newShare: DiskShare? = null
+            try {
+                val newConnection = newClient.connect(profile.host)
+                val newSession = newConnection.authenticate(auth)
+                newShare = newSession.connectShare(profile.share) as? DiskShare
+                    ?: throw IOException("${profile.share} не является файловой SMB-папкой")
+                val items = newShare.list("").toEntries("")
+                client = newClient
+                connection = newConnection
+                session = newSession
+                share = newShare
+                preferredAuth = auth
+                return items
+            } catch (error: Throwable) {
+                lastError = error
+                runCatching { newShare?.close() }
+                runCatching { newClient.close() }
+            }
+        }
+        val error = lastError ?: IOException("Не удалось открыть общую папку")
+        throw IOException(smbMessage(error), error)
+    }
+
+    private fun connectAndEnumerateShares(profile: SmbProfile): List<String> {
+        var lastError: Throwable? = null
+        authenticationCandidates(profile).forEach { auth ->
+            val baseContext = BaseContext(PropertyConfiguration(jcifsProperties()))
+            val authenticatedContext: CIFSContext = when {
+                auth.isGuest -> baseContext.withGuestCrendentials()
+                auth.isAnonymous -> baseContext.withAnonymousCredentials()
+                else -> baseContext.withCredentials(
+                    NtlmPasswordAuthenticator(auth.domain, auth.username, String(auth.password))
+                )
+            }
+            try {
+                val shares = SmbFile("smb://${profile.host}/", authenticatedContext).use { root ->
+                    val children = root.listFiles()
+                    try {
+                        children.asSequence()
+                            .filter { it.type == SmbConstants.TYPE_SHARE }
+                            .map { it.name.trim().trimEnd('/') }
+                            .filter { it.isNotEmpty() && !it.endsWith('$') }
+                            .distinctBy { it.lowercase() }
+                            .sortedWith(String.CASE_INSENSITIVE_ORDER)
+                            .toList()
+                    } finally {
+                        children.forEach { runCatching { it.close() } }
+                    }
+                }
+                val suppliedCredentialsRemain = profile.username.isNotBlank() &&
+                    auth.username != profile.username && shares.isEmpty()
+                if (suppliedCredentialsRemain) {
+                    return@forEach
+                }
+                preferredAuth = auth
+                return shares
+            } catch (error: Throwable) {
+                lastError = error
+            } finally {
+                runCatching { authenticatedContext.close() }
+                if (authenticatedContext !== baseContext) runCatching { baseContext.close() }
+            }
+        }
+        val error = lastError ?: IOException("Не удалось получить список общих папок")
+        throw IOException(smbMessage(error), error)
+    }
+
+    private fun jcifsProperties(): Properties = Properties().apply {
+        setProperty("jcifs.smb.client.minVersion", "SMB202")
+        setProperty("jcifs.smb.client.maxVersion", "SMB311")
+        setProperty("jcifs.smb.client.connTimeout", "15000")
+        setProperty("jcifs.smb.client.responseTimeout", "20000")
+        setProperty("jcifs.smb.client.soTimeout", "20000")
+    }
+
+    private fun smbConfig(): SmbConfig = SmbConfig.builder()
+        .withTimeout(20, TimeUnit.SECONDS)
+        .withSoTimeout(20, TimeUnit.SECONDS)
+        .withReadTimeout(90, TimeUnit.SECONDS)
+        .withWriteTimeout(90, TimeUnit.SECONDS)
+        .build()
+
+    private fun authenticationCandidates(profile: SmbProfile): List<AuthenticationContext> {
+        val candidates = buildList {
+            preferredAuth?.let(::add)
+            add(AuthenticationContext.guest())
+            add(AuthenticationContext.anonymous())
+            if (profile.username.isNotBlank()) {
+                add(AuthenticationContext(profile.username, profile.password.toCharArray(), profile.domain))
+            }
+        }
+        return candidates.distinctBy { auth ->
+            "${auth.isGuest}|${auth.isAnonymous}|${auth.username}|${auth.domain}"
         }
     }
 
@@ -156,9 +295,25 @@ class SmbRepository(private val context: Context) {
         runCatching { oldClient?.close() }
     }
 
-    private fun validate(profile: SmbProfile) {
+    private fun validateHost(profile: SmbProfile) {
         require(profile.host.trim().isNotEmpty()) { "Укажите адрес SMB-устройства" }
+    }
+
+    private fun validateDirect(profile: SmbProfile) {
+        validateHost(profile)
         require(profile.share.trim().trim('/', '\\').isNotEmpty()) { "Укажите имя общей папки" }
+    }
+
+    private fun sanitize(profile: SmbProfile): SmbProfile {
+        val rawHost = profile.host.trim().removePrefix("\\\\").removePrefix("smb://")
+        val host = rawHost.substringBefore('\\').substringBefore('/').trim()
+        return profile.copy(
+            name = profile.name.trim().ifBlank { host },
+            host = host,
+            share = profile.share.trim().trim('/', '\\'),
+            username = profile.username.trim(),
+            domain = profile.domain.trim(),
+        )
     }
 
     private fun normalizePath(path: String): String = path.trim().trim('/', '\\').replace('/', '\\')
@@ -181,11 +336,17 @@ class SmbRepository(private val context: Context) {
     private fun smbMessage(error: Throwable): String {
         val raw = error.message.orEmpty()
         return when {
-            raw.contains("STATUS_LOGON_FAILURE", true) -> "SMB: неверный логин или пароль"
-            raw.contains("STATUS_BAD_NETWORK_NAME", true) -> "SMB: общая папка не найдена"
-            raw.contains("STATUS_ACCESS_DENIED", true) -> "SMB: нет доступа к общей папке"
+            raw.contains("STATUS_LOGON_FAILURE", true) || raw.contains("logon failure", true) ->
+                "SMB: неверный логин или пароль"
+            raw.contains("STATUS_BAD_NETWORK_NAME", true) || raw.contains("network name cannot be found", true) ->
+                "SMB: общая папка не найдена"
+            raw.contains("STATUS_ACCESS_DENIED", true) || raw.contains("access is denied", true) ->
+                "SMB: нет доступа. Укажите учётную запись Windows"
+            raw.contains("timed out", true) -> "SMB: устройство не ответило вовремя"
+            raw.contains("connection refused", true) -> "SMB: устройство отклонило подключение"
             raw.isNotBlank() -> "SMB: $raw"
             else -> "Не удалось подключиться к SMB"
         }
     }
+
 }

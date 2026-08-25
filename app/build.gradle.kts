@@ -11,8 +11,8 @@ android {
         applicationId = "com.aurafiles.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "0.11.0"
+        versionCode = 17
+        versionName = "0.12.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -76,6 +76,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.11.0")
     implementation("commons-net:commons-net:3.13.0")
     implementation("com.hierynomus:smbj:0.15.0")
+    implementation("org.codelibs:jcifs:2.1.40")
     implementation("com.github.junrar:junrar:8.1.0")
     runtimeOnly("org.slf4j:slf4j-nop:2.0.18")
 

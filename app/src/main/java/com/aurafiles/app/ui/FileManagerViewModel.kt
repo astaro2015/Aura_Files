@@ -95,6 +95,7 @@ data class FileManagerUiState(
     val lanScanning: Boolean = false,
     val smbProfile: SmbProfile? = null,
     val smbConnected: Boolean = false,
+    val smbShares: List<String> = emptyList(),
     val smbPath: String = "/",
     val smbItems: List<SmbEntry> = emptyList(),
     val smbLoading: Boolean = false,
@@ -1041,21 +1042,68 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     fun connectSmb(profile: SmbProfile) {
         if (_state.value.smbLoading) return
         viewModelScope.launch {
-            _state.update { it.copy(smbLoading = true, smbProfile = profile) }
-            runCatching { withContext(Dispatchers.IO) { smbRepository.connect(profile) } }
+            val normalized = profile.copy(share = profile.share.trim().trim('/', '\\'))
+            _state.update {
+                it.copy(smbLoading = true, smbProfile = normalized, smbShares = emptyList(), smbItems = emptyList())
+            }
+            if (normalized.share.isBlank()) {
+                runCatching { withContext(Dispatchers.IO) { smbRepository.discoverShares(normalized) } }
+                    .onSuccess { shares ->
+                        _state.update {
+                            it.copy(
+                                smbLoading = false,
+                                smbConnected = true,
+                                smbShares = shares,
+                                smbPath = "/",
+                                message = if (shares.isEmpty()) {
+                                    "SMB подключён, но обычные общие папки не найдены. Можно указать шару в расширенных настройках."
+                                } else null,
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update { it.copy(smbLoading = false, smbConnected = false, smbShares = emptyList()) }
+                        showFailure(error)
+                    }
+            } else {
+                runCatching { withContext(Dispatchers.IO) { smbRepository.connect(normalized) } }
+                    .onSuccess { (path, items) ->
+                        _state.update {
+                            it.copy(
+                                smbLoading = false,
+                                smbConnected = true,
+                                smbPath = path,
+                                smbItems = items,
+                                message = "SMB подключён: ${normalized.name}",
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update { it.copy(smbLoading = false, smbConnected = false, smbItems = emptyList()) }
+                        showFailure(error)
+                    }
+            }
+        }
+    }
+
+    fun selectSmbShare(shareName: String) {
+        if (_state.value.smbLoading) return
+        viewModelScope.launch {
+            _state.update { it.copy(smbLoading = true) }
+            runCatching { withContext(Dispatchers.IO) { smbRepository.connectShare(shareName) } }
                 .onSuccess { (path, items) ->
                     _state.update {
                         it.copy(
                             smbLoading = false,
                             smbConnected = true,
+                            smbProfile = it.smbProfile?.copy(share = shareName),
                             smbPath = path,
                             smbItems = items,
-                            message = "SMB подключён: ${profile.name}",
                         )
                     }
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(smbLoading = false, smbConnected = false, smbItems = emptyList()) }
+                    _state.update { it.copy(smbLoading = false, smbItems = emptyList()) }
                     showFailure(error)
                 }
         }
@@ -1065,12 +1113,21 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             withContext(Dispatchers.IO) { smbRepository.disconnect() }
             _state.update {
-                it.copy(smbConnected = false, smbItems = emptyList(), smbPath = "/", message = "SMB отключён")
+                it.copy(
+                    smbConnected = false,
+                    smbShares = emptyList(),
+                    smbItems = emptyList(),
+                    smbPath = "/",
+                    message = "SMB отключён",
+                )
             }
         }
     }
 
-    fun refreshSmb() = loadSmbPath(_state.value.smbPath)
+    fun refreshSmb() {
+        val profile = _state.value.smbProfile ?: return
+        if (profile.share.isBlank()) connectSmb(profile) else loadSmbPath(_state.value.smbPath)
+    }
 
     fun openSmbEntry(entry: SmbEntry) {
         if (entry.isDirectory) loadSmbPath(entry.path)
@@ -1078,7 +1135,21 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun navigateSmbBack(): Boolean {
         val path = _state.value.smbPath.trimEnd('/')
-        if (path.isBlank()) return false
+        if (path.isBlank()) {
+            val state = _state.value
+            if (state.smbProfile?.share.isNullOrBlank() || state.smbShares.isEmpty()) return false
+            viewModelScope.launch {
+                withContext(Dispatchers.IO) { smbRepository.returnToShareList() }
+                _state.update {
+                    it.copy(
+                        smbProfile = it.smbProfile?.copy(share = ""),
+                        smbItems = emptyList(),
+                        smbPath = "/",
+                    )
+                }
+            }
+            return true
+        }
         val parent = path.substringBeforeLast('/', "").ifBlank { "/" }
         loadSmbPath(parent)
         return true

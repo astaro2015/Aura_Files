@@ -41,6 +41,10 @@ Used for CBR/RAR comic archive reading. Licensed under the UnRAR License; see th
 
 Used for SMB2/SMB3 client access. Project: https://github.com/hierynomus/smbj
 
+## CodeLibs JCIFS 2.1.40 — LGPL-2.1
+
+Used only to enumerate the file shares exposed by an SMB2 server; file browsing and transfers remain on SMBJ. Project: https://github.com/codelibs/jcifs
+
 ## slf4j-api / slf4j-nop 2.0.18
 
 Logging API and no-output runtime binding used by the reader/network dependencies.
