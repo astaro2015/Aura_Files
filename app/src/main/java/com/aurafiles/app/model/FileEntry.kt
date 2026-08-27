@@ -20,6 +20,8 @@ data class TrashRecord(
     val originalParentUri: Uri,
     val originalName: String,
     val deletedAt: Long,
+    val originalUri: Uri? = null,
+    val size: Long = entry.size,
 )
 
 data class FolderCrumb(

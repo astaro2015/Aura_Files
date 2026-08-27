@@ -135,16 +135,22 @@ class FileRepository(private val context: Context) {
         val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory }
             ?: root.createDirectory(TRASH_FOLDER)
             ?: throw IOException("Не удалось создать корзину")
-        val copied = copyDocument(entry.document, trash)
-        if (!entry.document.delete()) {
-            copied.delete()
-            throw IOException("Не удалось переместить ${entry.name} в корзину")
+        val moved = if (trash.findFile(entry.name) == null) {
+            tryFastMove(entry.document, originalParentUri, trash)
+        } else null
+        val copied = moved ?: copyDocument(entry.document, trash).also { copy ->
+            if (!entry.document.delete()) {
+                copy.delete()
+                throw IOException("Не удалось переместить ${entry.name} в корзину")
+            }
         }
         val record = TrashRecord(
             entry = copied.toEntry(trash.uri),
             originalParentUri = originalParentUri,
             originalName = entry.name,
             deletedAt = System.currentTimeMillis(),
+            originalUri = entry.uri,
+            size = entry.size,
         )
         saveTrashRecords(loadTrashMetadata() + record)
         return record
@@ -164,10 +170,14 @@ class FileRepository(private val context: Context) {
         val originalParent = documentFromUri(record.originalParentUri)
             ?.takeIf { it.exists() && it.isDirectory && it.canWrite() }
             ?: root
-        val restored = copyDocument(record.entry.document, originalParent, record.originalName)
-        if (!record.entry.document.delete()) {
-            restored.delete()
-            throw IOException("Не удалось удалить копию из корзины")
+        val moved = if (originalParent.findFile(record.originalName) == null) {
+            tryFastMove(record.entry.document, record.entry.parentUri ?: record.entry.uri, originalParent)
+        } else null
+        val restored = moved ?: copyDocument(record.entry.document, originalParent, record.originalName).also { copy ->
+            if (!record.entry.document.delete()) {
+                copy.delete()
+                throw IOException("Не удалось удалить копию из корзины")
+            }
         }
         removeTrashRecord(record.entry.uri)
         return restored
@@ -334,7 +344,7 @@ class FileRepository(private val context: Context) {
             val rawOutput = resolver.openOutputStream(archive.uri, "w")
                 ?: throw IOException("Не удалось открыть архив для записи")
             ZipOutputStream(rawOutput.buffered()).use { zip ->
-                entries.forEach { addToZip(zip, it.document, safeZipSegment(it.name)) }
+                entries.forEach { addToZip(zip, it.document, ArchiveSafety.safeSegment(it.name)) }
             }
             return archive
         } catch (error: Throwable) {
@@ -362,7 +372,7 @@ class FileRepository(private val context: Context) {
                     val zipEntry = zip.nextEntry ?: break
                     itemCount += 1
                     require(itemCount <= MAX_ZIP_ENTRIES) { "В архиве слишком много объектов" }
-                    val segments = safeZipPath(zipEntry.name)
+                    val segments = ArchiveSafety.safePath(zipEntry.name)
                     if (segments.isEmpty()) continue
                     var parent = root
                     segments.dropLast(1).forEach { segment ->
@@ -590,11 +600,11 @@ class FileRepository(private val context: Context) {
         val shareDirectory = File(context.cacheDir, "shares").apply { mkdirs() }
         val expiration = System.currentTimeMillis() - TEMP_SHARE_MAX_AGE_MILLIS
         shareDirectory.listFiles().orEmpty().filter { it.lastModified() < expiration }.forEach(File::delete)
-        val baseName = safeZipSegment(entry.name).removeSuffix(".zip").ifBlank { "Папка" }
+        val baseName = ArchiveSafety.safeSegment(entry.name).removeSuffix(".zip").ifBlank { "Папка" }
         val target = File(shareDirectory, "$baseName-${UUID.randomUUID().toString().take(8)}.zip")
         try {
             ZipOutputStream(target.outputStream().buffered()).use { zip ->
-                addToZip(zip, entry.document, safeZipSegment(entry.name))
+                addToZip(zip, entry.document, ArchiveSafety.safeSegment(entry.name))
             }
             return target
         } catch (error: Throwable) {
@@ -689,7 +699,7 @@ class FileRepository(private val context: Context) {
             zip.putNextEntry(ZipEntry(directoryPath))
             zip.closeEntry()
             source.listFiles().forEach { child ->
-                addToZip(zip, child, "$path/${safeZipSegment(child.name ?: "Без названия")}")
+                addToZip(zip, child, "$path/${ArchiveSafety.safeSegment(child.name ?: "Без названия")}")
             }
         } else {
             zip.putNextEntry(ZipEntry(path).apply {
@@ -715,17 +725,6 @@ class FileRepository(private val context: Context) {
             }
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    private fun safeZipSegment(name: String): String {
-        return name.replace('/', '_').replace('\\', '_').ifBlank { "Без названия" }
-    }
-
-    private fun safeZipPath(rawPath: String): List<String> {
-        require(!rawPath.startsWith('/') && !rawPath.startsWith('\\')) { "Небезопасный путь в архиве" }
-        return rawPath.replace('\\', '/').split('/')
-            .filter(String::isNotBlank)
-            .onEach { require(it != "." && it != "..") { "Небезопасный путь в архиве" } }
     }
 
     @Suppress("DEPRECATION")
@@ -819,6 +818,8 @@ class FileRepository(private val context: Context) {
                             originalParentUri = Uri.parse(item.getString("parent")),
                             originalName = item.getString("name"),
                             deletedAt = item.getLong("deletedAt"),
+                            originalUri = item.optString("originalUri").takeIf(String::isNotBlank)?.let(Uri::parse),
+                            size = item.optLong("size", document.length()),
                         )
                     }.getOrNull()
                     if (record != null) add(record)
@@ -836,6 +837,8 @@ class FileRepository(private val context: Context) {
                     .put("parent", record.originalParentUri.toString())
                     .put("name", record.originalName)
                     .put("deletedAt", record.deletedAt)
+                    .put("originalUri", record.originalUri?.toString().orEmpty())
+                    .put("size", record.size)
             )
         }
         preferences.edit().putString(KEY_TRASH_RECORDS, array.toString()).apply()
@@ -859,6 +862,23 @@ class FileRepository(private val context: Context) {
             if (parent.findFile(candidate) == null) return candidate
             number += 1
         }
+    }
+
+    private fun tryFastMove(source: DocumentFile, sourceParentUri: Uri, destination: DocumentFile): DocumentFile? {
+        val directSource = resolveDirectFile(source.uri)
+        val directDestination = resolveDirectFile(destination.uri)
+        if (directSource != null && directDestination?.isDirectory == true) {
+            val target = File(directDestination, source.name ?: directSource.name)
+            if (!target.exists() && directSource.renameTo(target)) return DocumentFile.fromFile(target)
+        }
+        if (source.uri.scheme != "content" || sourceParentUri.scheme != "content" || destination.uri.scheme != "content") {
+            return null
+        }
+        if (source.uri.authority != destination.uri.authority) return null
+        val movedUri = runCatching {
+            DocumentsContract.moveDocument(resolver, source.uri, sourceParentUri, destination.uri)
+        }.getOrNull() ?: return null
+        return DocumentFile.fromSingleUri(context, movedUri)
     }
 
     private fun DocumentFile.toEntry(parentUri: Uri? = null): FileEntry {

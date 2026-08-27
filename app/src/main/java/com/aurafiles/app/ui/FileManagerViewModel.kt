@@ -9,7 +9,15 @@ import com.aurafiles.app.data.FileRepository
 import com.aurafiles.app.data.FtpRepository
 import com.aurafiles.app.data.LanDiscoveryRepository
 import com.aurafiles.app.data.SmbRepository
+import com.aurafiles.app.data.SmbTransferGatewayAdapter
 import com.aurafiles.app.data.SystemSoundRepository
+import androidx.documentfile.provider.DocumentFile
+import com.aurafiles.app.index.IndexScanProgress
+import com.aurafiles.app.index.IndexScanState
+import com.aurafiles.app.index.StorageIndexer
+import com.aurafiles.app.network.NetworkProfile
+import com.aurafiles.app.network.NetworkProfileRepository
+import com.aurafiles.app.network.NetworkProtocol
 import com.aurafiles.app.model.ClipboardMode
 import com.aurafiles.app.model.CategorySummary
 import com.aurafiles.app.model.FileClipboard
@@ -35,6 +43,17 @@ import com.aurafiles.app.model.isTemporaryCandidate
 import com.aurafiles.app.model.isThumbnailCache
 import com.aurafiles.app.model.matchesCategory
 import com.aurafiles.app.model.sourceLabel
+import com.aurafiles.app.transfer.TransferConflict
+import com.aurafiles.app.transfer.TransferConflictDecision
+import com.aurafiles.app.transfer.TransferConflictPolicy
+import com.aurafiles.app.transfer.TransferController
+import com.aurafiles.app.transfer.TransferDestination
+import com.aurafiles.app.transfer.TransferEngine
+import com.aurafiles.app.transfer.TransferProgress
+import com.aurafiles.app.transfer.TransferRequest
+import com.aurafiles.app.transfer.TransferSource
+import com.aurafiles.app.transfer.TransferState
+import com.aurafiles.app.transfer.TransferType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -77,11 +96,15 @@ data class FileManagerUiState(
     val storageVolumes: List<StorageVolumeInfo> = emptyList(),
     val analysis: StorageAnalysis? = null,
     val analyzing: Boolean = false,
+    val indexProgress: IndexScanProgress? = null,
     val loading: Boolean = false,
     val operationInProgress: Boolean = false,
     val operationLabel: String? = null,
     val operationProgress: Float = 0f,
     val operationCancelable: Boolean = false,
+    val transferProgress: TransferProgress? = null,
+    val transferConflict: TransferConflict? = null,
+    val transferPaused: Boolean = false,
     val fileHashes: Map<Uri, String> = emptyMap(),
     val hashingUris: Set<Uri> = emptySet(),
     val undoTrash: List<TrashRecord> = emptyList(),
@@ -93,6 +116,7 @@ data class FileManagerUiState(
     val ftpTransferLabel: String? = null,
     val lanDevices: List<LanDevice> = emptyList(),
     val lanScanning: Boolean = false,
+    val networkProfiles: List<NetworkProfile> = emptyList(),
     val smbProfile: SmbProfile? = null,
     val smbConnected: Boolean = false,
     val smbShares: List<String> = emptyList(),
@@ -109,6 +133,12 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     private val lanDiscoveryRepository = LanDiscoveryRepository(application)
     private val smbRepository = SmbRepository(application)
     private val systemSoundRepository = SystemSoundRepository(application)
+    private val transferEngine = TransferEngine(
+        application,
+        SmbTransferGatewayAdapter(application, smbRepository),
+    )
+    private val storageIndexer = StorageIndexer(application)
+    private val networkProfileRepository = NetworkProfileRepository(application)
     private val _state = MutableStateFlow(
         FileManagerUiState(
             storage = repository.storageSnapshot(),
@@ -123,11 +153,60 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     )
     val state: StateFlow<FileManagerUiState> = _state.asStateFlow()
     private var operationJob: Job? = null
+    private var transferController: TransferController? = null
     private var ftpKeepAliveJob: Job? = null
     private var categoryToOpenAfterAnalysis: FileCategory? = null
 
     init {
-        _state.update { it.copy(ftpProfile = ftpRepository.loadProfile()) }
+        val savedProfiles = networkProfileRepository.profiles()
+        if (savedProfiles.none { it.protocol == NetworkProtocol.FTP || it.protocol == NetworkProtocol.FTPS }) {
+            ftpRepository.loadProfile()?.let(networkProfileRepository::save)
+        }
+        val initialProfiles = networkProfileRepository.profiles()
+        val initialFtp = initialProfiles
+            .firstOrNull { it.protocol == NetworkProtocol.FTP || it.protocol == NetworkProtocol.FTPS }
+            ?.let(networkProfileRepository::ftp)
+        _state.update { it.copy(ftpProfile = initialFtp, networkProfiles = initialProfiles) }
+        viewModelScope.launch {
+            transferEngine.progress.collect { progress ->
+                _state.update { state ->
+                    val networkLabel = if (state.smbTransferLabel != null) {
+                        progress?.let(::transferLabel) ?: state.smbTransferLabel
+                    } else null
+                    state.copy(
+                        transferProgress = progress,
+                        transferPaused = progress?.state == TransferState.PAUSED,
+                        operationProgress = progress?.fraction ?: state.operationProgress,
+                        operationLabel = progress?.let(::transferLabel) ?: state.operationLabel,
+                        smbTransferLabel = networkLabel,
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
+            transferEngine.conflict.collect { conflict ->
+                _state.update { it.copy(transferConflict = conflict) }
+            }
+        }
+        viewModelScope.launch {
+            storageIndexer.progress.collect { progress ->
+                if (progress.state != IndexScanState.IDLE) {
+                    _state.update {
+                        it.copy(
+                            indexProgress = progress,
+                            operationLabel = when (progress.state) {
+                                IndexScanState.SCANNING -> "Анализ: ${progress.filesCount} файлов · ${progress.currentFolder}"
+                                IndexScanState.HASHING -> "Проверка дубликатов: ${progress.currentFile}"
+                                IndexScanState.CANCELLED -> "Анализ отменён"
+                                IndexScanState.FAILED -> "Ошибка анализа"
+                                IndexScanState.COMPLETED -> "Анализ завершён"
+                                IndexScanState.IDLE -> it.operationLabel
+                            },
+                        )
+                    }
+                }
+            }
+        }
         restoreRoot()
     }
 
@@ -136,7 +215,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             runCatching {
                 withContext(Dispatchers.IO) { repository.attachRoot(uri) }
             }.onSuccess { root ->
-                val cachedAnalysis = withContext(Dispatchers.IO) { repository.loadAnalysis(root) }
+                val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
                 _state.update {
                     it.copy(
                         rootConnected = true,
@@ -174,7 +253,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             }
             runCatching { withContext(Dispatchers.IO) { repository.attachFullRoot() } }
                 .onSuccess { root ->
-                    val cachedAnalysis = withContext(Dispatchers.IO) { repository.loadAnalysis(root) }
+                    val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
                     _state.update {
                         it.copy(
                             rootConnected = true,
@@ -625,33 +704,48 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             _state.update { it.copy(message = "Сначала подключите папку") }
             return
         }
-        viewModelScope.launch {
-            _state.update { it.copy(analyzing = true) }
-            runCatching { withContext(Dispatchers.IO) { repository.analyze(root) } }
+        operationJob = viewModelScope.launch {
+            _state.update {
+                it.copy(
+                    analyzing = true,
+                    operationInProgress = true,
+                    operationLabel = "Подготовка анализа…",
+                    operationCancelable = true,
+                    operationProgress = 0f,
+                )
+            }
+            runCatching { withContext(Dispatchers.IO) { storageIndexer.scan(root) } }
                 .onSuccess { analysis ->
-                    runCatching { withContext(Dispatchers.IO) { repository.saveAnalysis(root, analysis) } }
                     val pendingCategory = categoryToOpenAfterAnalysis
                     categoryToOpenAfterAnalysis = null
+                    val indexedCount = storageIndexer.progress.value.filesCount
+                    val recent = withContext(Dispatchers.IO) { storageIndexer.recentEntries(root, 12) }
                     _state.update {
                         it.copy(
                             analyzing = false,
+                            operationInProgress = false,
+                            operationLabel = null,
+                            operationCancelable = false,
                             analysis = analysis,
-                            recentItems = (analysis.files.sortedByDescending(FileEntry::modifiedAt) + it.recentItems)
-                                .distinctBy(FileEntry::uri)
-                                .take(12),
-                            message = if (analysis.limitReached) {
-                                "Показаны первые 10 000 файлов"
-                            } else {
-                                "Анализ завершён: ${analysis.files.size} файлов"
-                            },
+                            recentItems = recent,
+                            message = "Анализ завершён: $indexedCount файлов",
                         )
                     }
                     if (pendingCategory != null) openCategory(pendingCategory)
                 }
                 .onFailure { error ->
                     categoryToOpenAfterAnalysis = null
-                    _state.update { it.copy(analyzing = false) }
-                    showFailure(error)
+                    _state.update {
+                        it.copy(
+                            analyzing = false,
+                            operationInProgress = false,
+                            operationLabel = null,
+                            operationCancelable = false,
+                        )
+                    }
+                    if (error is CancellationException) {
+                        _state.update { it.copy(message = "Анализ остановлен; предыдущий завершённый индекс сохранён") }
+                    } else showFailure(error)
                 }
         }
     }
@@ -675,17 +769,21 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             FileCategory.Camera -> "Камера"
             FileCategory.Other -> "Другие файлы"
         }
-        val matching = analysis.files
-            .filter { file -> file.matchesCategory(category) }
-            .filter { file -> _state.value.showThumbnailFiles || !file.isThumbnailCache() }
-        _state.update {
-            it.copy(
-                browserOpen = true,
-                activeSection = MainSection.Browse,
-                collectionTitle = title,
-                items = matching,
-                collectionGroups = buildSourceGroups(matching),
-            )
+        val root = _state.value.folderStack.firstOrNull()?.document ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
+            val matching = withContext(Dispatchers.IO) { storageIndexer.categoryEntries(root, category) }
+                .filter { file -> _state.value.showThumbnailFiles || !file.isThumbnailCache() }
+            _state.update {
+                it.copy(
+                    loading = false,
+                    browserOpen = true,
+                    activeSection = MainSection.Browse,
+                    collectionTitle = title,
+                    items = matching,
+                    collectionGroups = buildSourceGroups(matching),
+                )
+            }
         }
     }
 
@@ -708,15 +806,20 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             analyzeStorage()
             return
         }
-        val temporary = analysis.files.filter(FileEntry::isTemporaryCandidate)
-        _state.update {
-            it.copy(
-                browserOpen = true,
-                activeSection = MainSection.Cleanup,
-                collectionTitle = "Временные файлы",
-                items = temporary,
-                collectionGroups = buildSourceGroups(temporary),
-            )
+        val root = _state.value.folderStack.firstOrNull()?.document ?: return
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true) }
+            val temporary = withContext(Dispatchers.IO) { storageIndexer.temporaryEntries(root) }
+            _state.update {
+                it.copy(
+                    loading = false,
+                    browserOpen = true,
+                    activeSection = MainSection.Cleanup,
+                    collectionTitle = "Временные файлы",
+                    items = temporary,
+                    collectionGroups = buildSourceGroups(temporary),
+                )
+            }
         }
     }
 
@@ -812,6 +915,25 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
 
+        val controller = TransferController()
+        transferController = controller
+        val request = TransferRequest(
+            type = if (clipboard.mode == ClipboardMode.Copy) TransferType.COPY else TransferType.MOVE,
+            sources = clipboard.entries.map { entry ->
+                TransferSource.Local(
+                    uri = entry.uri,
+                    parentUri = entry.parentUri,
+                    name = entry.name,
+                    size = entry.size,
+                    modifiedAt = entry.modifiedAt,
+                    isDirectory = entry.isDirectory,
+                    mimeType = entry.mimeType,
+                )
+            },
+            destination = TransferDestination.Local(destination.uri),
+            conflictPolicy = TransferConflictPolicy.ASK,
+            preserveModifiedTime = true,
+        )
         operationJob = viewModelScope.launch {
             _state.update {
                 it.copy(
@@ -822,20 +944,14 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 )
             }
             try {
-                clipboard.entries.forEachIndexed { index, entry ->
-                    ensureActive()
-                    withContext(Dispatchers.IO) {
-                        repository.copy(entry, destination)
-                        if (clipboard.mode == ClipboardMode.Move) repository.delete(entry)
-                    }
-                    _state.update { it.copy(operationProgress = (index + 1f) / clipboard.entries.size) }
-                }
+                withContext(Dispatchers.IO) { transferEngine.execute(request, controller) }
                 withContext(Dispatchers.IO) { repository.clearAnalysisCache() }
                 _state.update {
                     it.copy(
                         operationInProgress = false,
                         operationLabel = null,
                         operationCancelable = false,
+                        transferPaused = false,
                         clipboard = null,
                         analysis = null,
                         message = if (clipboard.mode == ClipboardMode.Copy) {
@@ -853,6 +969,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                         operationInProgress = false,
                         operationLabel = null,
                         operationCancelable = false,
+                        transferPaused = false,
                         clipboard = null,
                         analysis = null,
                         message = "Операция остановлена",
@@ -860,14 +977,36 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 }
                 refreshCurrentFolder()
             } catch (error: Throwable) {
-                _state.update { it.copy(operationInProgress = false, operationLabel = null, operationCancelable = false) }
+                _state.update {
+                    it.copy(
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationCancelable = false,
+                        transferPaused = false,
+                    )
+                }
                 showFailure(error)
+            } finally {
+                transferController = null
             }
         }
     }
 
     fun cancelOperation() {
+        transferController?.cancel()
         operationJob?.cancel()
+    }
+
+    fun pauseOperation() {
+        transferController?.pause()
+    }
+
+    fun resumeOperation() {
+        transferController?.resume()
+    }
+
+    fun resolveTransferConflict(policy: TransferConflictPolicy, applyToAll: Boolean) {
+        transferEngine.resolveConflict(TransferConflictDecision(policy, applyToAll))
     }
 
     fun connectFtp(profile: FtpProfile, save: Boolean = true) {
@@ -876,7 +1015,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             _state.update { it.copy(ftpLoading = true, ftpProfile = profile) }
             runCatching {
                 withContext(Dispatchers.IO) {
-                    if (save) ftpRepository.saveProfile(profile)
+                    if (save) networkProfileRepository.save(profile)
                     ftpRepository.connect(profile)
                 }
             }.onSuccess { (path, items) ->
@@ -887,6 +1026,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                         ftpLoading = false,
                         ftpPath = path,
                         ftpItems = items,
+                        networkProfiles = networkProfileRepository.profiles(),
                         message = "FTP подключён: ${profile.name}",
                     )
                 }
@@ -1043,8 +1183,15 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         if (_state.value.smbLoading) return
         viewModelScope.launch {
             val normalized = profile.copy(share = profile.share.trim().trim('/', '\\'))
+            withContext(Dispatchers.IO) { networkProfileRepository.save(normalized) }
             _state.update {
-                it.copy(smbLoading = true, smbProfile = normalized, smbShares = emptyList(), smbItems = emptyList())
+                it.copy(
+                    smbLoading = true,
+                    smbProfile = normalized,
+                    smbShares = emptyList(),
+                    smbItems = emptyList(),
+                    networkProfiles = networkProfileRepository.profiles(),
+                )
             }
             if (normalized.share.isBlank()) {
                 runCatching { withContext(Dispatchers.IO) { smbRepository.discoverShares(normalized) } }
@@ -1155,6 +1302,53 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         return true
     }
 
+    fun createSmbFolder(name: String) = runSmbMutation("Создание папки") {
+        smbRepository.createDirectory(name)
+    }
+
+    fun renameSmb(entry: SmbEntry, name: String) = runSmbMutation("Переименование") {
+        smbRepository.rename(entry, name)
+    }
+
+    fun deleteSmb(entry: SmbEntry, recursive: Boolean) = runSmbMutation(
+        if (entry.isDirectory) "Удаление папки" else "Удаление файла"
+    ) {
+        smbRepository.delete(entry, recursive)
+    }
+
+    fun uploadToSmb(uris: List<Uri>) {
+        if (uris.isEmpty() || _state.value.smbTransferLabel != null) return
+        val sources = uris.mapNotNull { uri ->
+            val document = runCatching { DocumentFile.fromSingleUri(getApplication(), uri) }.getOrNull()
+            document?.let {
+                TransferSource.Local(
+                    uri = uri,
+                    parentUri = null,
+                    name = it.name ?: "Без имени",
+                    size = it.length(),
+                    modifiedAt = it.lastModified(),
+                    isDirectory = it.isDirectory,
+                    mimeType = it.type,
+                )
+            }
+        }
+        if (sources.size != uris.size) {
+            _state.update { it.copy(message = "Некоторые выбранные файлы недоступны") }
+            return
+        }
+        runNetworkTransfer(
+            request = TransferRequest(
+                type = TransferType.UPLOAD,
+                sources = sources,
+                destination = TransferDestination.Smb(_state.value.smbPath),
+                conflictPolicy = TransferConflictPolicy.KEEP_BOTH,
+            ),
+            initialLabel = "Подготовка загрузки",
+            successMessage = "На SMB загружено файлов: ${uris.size}",
+            refreshSmb = true,
+        )
+    }
+
     fun downloadFromSmb(entry: SmbEntry) {
         val destination = _state.value.folderStack.lastOrNull()?.document
         if (destination == null) {
@@ -1162,21 +1356,52 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
         if (_state.value.smbTransferLabel != null) return
-        viewModelScope.launch {
-            _state.update { it.copy(smbTransferLabel = "Скачивание ${entry.name}") }
-            runCatching { withContext(Dispatchers.IO) { smbRepository.download(entry, destination) } }
-                .onSuccess {
-                    _state.update { state ->
-                        state.copy(
-                            smbTransferLabel = null,
-                            message = "${entry.name} скачан в ${state.folderStack.lastOrNull()?.label ?: "локальную папку"}",
-                        )
-                    }
-                }
-                .onFailure { error ->
-                    _state.update { it.copy(smbTransferLabel = null) }
-                    showFailure(error)
-                }
+        runNetworkTransfer(
+            request = TransferRequest(
+                type = TransferType.DOWNLOAD,
+                sources = listOf(
+                    TransferSource.Smb(
+                        path = entry.path,
+                        name = entry.name,
+                        size = entry.size,
+                        modifiedAt = entry.modifiedAt,
+                        isDirectory = entry.isDirectory,
+                    )
+                ),
+                destination = TransferDestination.Local(destination.uri),
+                conflictPolicy = TransferConflictPolicy.KEEP_BOTH,
+            ),
+            initialLabel = "Скачивание ${entry.name}",
+            successMessage = "${entry.name} скачан в ${_state.value.folderStack.lastOrNull()?.label ?: "локальную папку"}",
+            refreshSmb = false,
+            refreshLocal = true,
+        )
+    }
+
+    private fun runNetworkTransfer(
+        request: TransferRequest,
+        initialLabel: String,
+        successMessage: String,
+        refreshSmb: Boolean,
+        refreshLocal: Boolean = false,
+    ) {
+        val controller = TransferController()
+        transferController = controller
+        operationJob = viewModelScope.launch {
+            _state.update { it.copy(smbTransferLabel = initialLabel) }
+            try {
+                withContext(Dispatchers.IO) { transferEngine.execute(request, controller) }
+                _state.update { it.copy(smbTransferLabel = null, message = successMessage) }
+                if (refreshSmb) loadSmbPath(_state.value.smbPath)
+                if (refreshLocal) refreshCurrentFolder()
+            } catch (_: CancellationException) {
+                _state.update { it.copy(smbTransferLabel = null, message = "Передача остановлена") }
+            } catch (error: Throwable) {
+                _state.update { it.copy(smbTransferLabel = null) }
+                showFailure(error)
+            } finally {
+                transferController = null
+            }
         }
     }
 
@@ -1195,6 +1420,69 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                     showFailure(error)
                 }
         }
+    }
+
+    private fun runSmbMutation(
+        label: String,
+        block: suspend () -> Pair<String, List<SmbEntry>>,
+    ) {
+        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
+        viewModelScope.launch {
+            _state.update { it.copy(smbLoading = true, smbTransferLabel = label) }
+            runCatching { withContext(Dispatchers.IO) { block() } }
+                .onSuccess { (path, items) ->
+                    _state.update {
+                        it.copy(
+                            smbLoading = false,
+                            smbTransferLabel = null,
+                            smbPath = path,
+                            smbItems = items,
+                            message = "$label завершено",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(smbLoading = false, smbTransferLabel = null) }
+                    showFailure(error)
+                }
+        }
+    }
+
+    fun connectNetworkProfile(profile: NetworkProfile) {
+        when (profile.protocol) {
+            NetworkProtocol.FTP,
+            NetworkProtocol.FTPS -> connectFtp(networkProfileRepository.ftp(profile), save = false)
+            NetworkProtocol.SMB -> connectSmb(networkProfileRepository.smb(profile))
+        }
+    }
+
+    fun deleteNetworkProfile(profile: NetworkProfile) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { networkProfileRepository.delete(profile.id) }
+            _state.update {
+                it.copy(
+                    networkProfiles = networkProfileRepository.profiles(),
+                    message = "Подключение «${profile.name}» удалено",
+                )
+            }
+        }
+    }
+
+    fun duplicateNetworkProfile(profile: NetworkProfile) {
+        viewModelScope.launch {
+            val duplicate = withContext(Dispatchers.IO) { networkProfileRepository.duplicate(profile.id) }
+            _state.update {
+                it.copy(
+                    networkProfiles = networkProfileRepository.profiles(),
+                    message = duplicate?.let { saved -> "Создано подключение «${saved.name}»" },
+                )
+            }
+        }
+    }
+
+    fun testNetworkProfile(profile: NetworkProfile) {
+        _state.update { it.copy(message = "Проверка подключения «${profile.name}»…") }
+        connectNetworkProfile(profile)
     }
 
     fun consumeMessage() {
@@ -1232,7 +1520,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             val root = runCatching {
                 withContext(Dispatchers.IO) { repository.restoreRoot() }
             }.getOrNull() ?: return@launch
-            val cachedAnalysis = withContext(Dispatchers.IO) { repository.loadAnalysis(root) }
+            val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
 
             _state.update {
                 it.copy(
@@ -1383,8 +1671,16 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun saveCurrentAnalysis() {
-        val current = _state.value
-        val root = current.folderStack.firstOrNull()?.document ?: return
-        current.analysis?.let { runCatching { repository.saveAnalysis(root, it) } }
+        // Room is reconciled incrementally by the next scan; the last successful generation remains usable.
     }
+
+    private fun transferLabel(progress: TransferProgress): String = when (progress.state) {
+        TransferState.PREPARING -> "Подготовка… ${progress.currentName}"
+        TransferState.RUNNING -> progress.currentName.ifBlank { "Передача файлов" }
+        TransferState.PAUSED -> "Приостановлено · ${progress.currentName}"
+        TransferState.CANCELLING -> "Отмена операции…"
+        TransferState.COMPLETED -> "Операция завершена"
+        TransferState.FAILED -> progress.error ?: "Ошибка операции"
+    }
+
 }

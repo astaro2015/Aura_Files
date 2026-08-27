@@ -1,6 +1,7 @@
 package com.aurafiles.app.data
 
 import android.content.Context
+import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.model.SmbEntry
 import com.aurafiles.app.model.SmbProfile
@@ -25,6 +26,7 @@ import jcifs.smb.SmbFile
 import java.io.IOException
 import java.net.URLConnection
 import java.util.EnumSet
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -88,32 +90,246 @@ class SmbRepository(private val context: Context) {
         displayPath(normalized) to items
     }
 
-    suspend fun download(entry: SmbEntry, destination: DocumentFile): DocumentFile = mutex.withLock {
-        require(!entry.isDirectory) { "Для скачивания выберите файл" }
+    suspend fun createDirectory(requestedName: String): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val name = safeName(requestedName)
+        val disk = connectedShare()
+        val path = childPath(currentPath, name)
+        require(!disk.folderExists(path) && !disk.fileExists(path)) { "$name уже существует" }
+        disk.mkdir(path)
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    suspend fun rename(entry: SmbEntry, requestedName: String): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val name = safeName(requestedName)
+        val disk = connectedShare()
+        val targetPath = childPath(parentPath(entry.path), name)
+        require(!disk.folderExists(targetPath) && !disk.fileExists(targetPath)) { "$name уже существует" }
+        openEntry(disk, entry).use { remote -> remote.rename(targetPath, false) }
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    suspend fun delete(entry: SmbEntry, recursive: Boolean = false): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val disk = connectedShare()
+        if (entry.isDirectory) disk.rmdir(normalizePath(entry.path), recursive)
+        else disk.rm(normalizePath(entry.path))
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    suspend fun upload(
+        uris: List<Uri>,
+        onProgress: (name: String, written: Long, total: Long) -> Unit = { _, _, _ -> },
+    ): Pair<String, List<SmbEntry>> = mutex.withLock {
+        require(uris.isNotEmpty()) { "Выберите файлы для загрузки" }
+        val disk = connectedShare()
+        uris.forEach { uri ->
+            val source = DocumentFile.fromSingleUri(context, uri)
+                ?: throw IOException("Выбранный файл недоступен")
+            require(source.isFile) { "Загрузка папок выполняется из локального браузера" }
+            uploadFile(disk, source, currentPath, onProgress)
+        }
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    suspend fun download(
+        entry: SmbEntry,
+        destination: DocumentFile,
+        onProgress: (name: String, written: Long, total: Long) -> Unit = { _, _, _ -> },
+    ): DocumentFile = mutex.withLock {
         require(destination.isDirectory && destination.canWrite()) { "Локальная папка недоступна для записи" }
-        val fileName = uniqueLocalName(destination, entry.name)
-        val mime = URLConnection.guessContentTypeFromName(fileName) ?: "application/octet-stream"
-        val target = destination.createFile(mime, fileName)
-            ?: throw IOException("Не удалось создать $fileName")
+        val disk = connectedShare()
+        if (entry.isDirectory) downloadDirectory(disk, entry, destination, onProgress)
+        else downloadFile(disk, entry, destination, onProgress)
+    }
+
+    suspend fun move(entry: SmbEntry, destinationPath: String): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val disk = connectedShare()
+        val normalizedDestination = normalizePath(destinationPath)
+        val target = childPath(normalizedDestination, entry.name)
+        require(!disk.fileExists(target) && !disk.folderExists(target)) { "${entry.name} уже существует в папке назначения" }
+        openEntry(disk, entry).use { it.rename(target, false) }
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    suspend fun copy(entry: SmbEntry, destinationPath: String): Pair<String, List<SmbEntry>> = mutex.withLock {
+        val disk = connectedShare()
+        copyRemoteNode(disk, entry, normalizePath(destinationPath))
+        displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
+    }
+
+    private fun uploadFile(
+        disk: DiskShare,
+        source: DocumentFile,
+        destinationPath: String,
+        onProgress: (String, Long, Long) -> Unit,
+    ) {
+        val requested = source.name ?: "Без имени"
+        val finalName = uniqueRemoteName(disk, destinationPath, requested)
+        val finalPath = childPath(destinationPath, finalName)
+        val temporaryPath = childPath(destinationPath, ".aura-part-${UUID.randomUUID()}")
         try {
-            withReconnect { disk ->
-                disk.openFile(
-                    normalizePath(entry.path),
-                    EnumSet.of(AccessMask.GENERIC_READ),
-                    EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
-                    SMB2ShareAccess.ALL,
-                    SMB2CreateDisposition.FILE_OPEN,
-                    EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE, SMB2CreateOptions.FILE_SEQUENTIAL_ONLY),
-                ).use { remote ->
-                    context.contentResolver.openOutputStream(target.uri, "w")?.use(remote::read)
-                        ?: throw IOException("Не удалось записать $fileName")
+            disk.openFile(
+                temporaryPath,
+                EnumSet.of(AccessMask.GENERIC_WRITE, AccessMask.GENERIC_READ, AccessMask.DELETE),
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_HIDDEN),
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_CREATE,
+                EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE, SMB2CreateOptions.FILE_SEQUENTIAL_ONLY),
+            ).use { remote ->
+                val input = context.contentResolver.openInputStream(source.uri)
+                    ?: throw IOException("Не удалось прочитать $requested")
+                var written = 0L
+                input.buffered(TRANSFER_BUFFER_SIZE).use { sourceStream ->
+                    remote.outputStream.buffered(TRANSFER_BUFFER_SIZE).use { targetStream ->
+                        val buffer = ByteArray(TRANSFER_BUFFER_SIZE)
+                        while (true) {
+                            val read = sourceStream.read(buffer)
+                            if (read < 0) break
+                            targetStream.write(buffer, 0, read)
+                            written += read
+                            onProgress(requested, written, source.length())
+                        }
+                        targetStream.flush()
+                    }
                 }
+                val expected = source.length()
+                require(expected < 0L || remote.length == expected) {
+                    "SMB записал ${remote.length} из $expected байт"
+                }
+                remote.rename(finalPath, false)
             }
-            target
         } catch (error: Throwable) {
-            target.delete()
+            runCatching { if (disk.fileExists(temporaryPath)) disk.rm(temporaryPath) }
             throw error
         }
+    }
+
+    private fun downloadFile(
+        disk: DiskShare,
+        entry: SmbEntry,
+        destination: DocumentFile,
+        onProgress: (String, Long, Long) -> Unit,
+    ): DocumentFile {
+        val finalName = uniqueLocalName(destination, entry.name)
+        val temporaryName = ".aura-part-${UUID.randomUUID()}"
+        val temporary = destination.createFile("application/octet-stream", temporaryName)
+            ?: throw IOException("Не удалось создать временный файл для $finalName")
+        try {
+            disk.openFile(
+                normalizePath(entry.path),
+                EnumSet.of(AccessMask.GENERIC_READ),
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE, SMB2CreateOptions.FILE_SEQUENTIAL_ONLY),
+            ).use { remote ->
+                val output = context.contentResolver.openOutputStream(temporary.uri, "w")
+                    ?: throw IOException("Не удалось записать $finalName")
+                var written = 0L
+                remote.inputStream.buffered(TRANSFER_BUFFER_SIZE).use { sourceStream ->
+                    output.buffered(TRANSFER_BUFFER_SIZE).use { targetStream ->
+                        val buffer = ByteArray(TRANSFER_BUFFER_SIZE)
+                        while (true) {
+                            val read = sourceStream.read(buffer)
+                            if (read < 0) break
+                            targetStream.write(buffer, 0, read)
+                            written += read
+                            onProgress(entry.name, written, entry.size)
+                        }
+                        targetStream.flush()
+                    }
+                }
+                require(entry.size < 0L || written == entry.size) {
+                    "Получено $written из ${entry.size} байт"
+                }
+            }
+            require(temporary.renameTo(finalName)) { "Не удалось завершить скачивание $finalName" }
+            return temporary
+        } catch (error: Throwable) {
+            temporary.delete()
+            throw error
+        }
+    }
+
+    private fun downloadDirectory(
+        disk: DiskShare,
+        entry: SmbEntry,
+        destination: DocumentFile,
+        onProgress: (String, Long, Long) -> Unit,
+    ): DocumentFile {
+        val localName = uniqueLocalName(destination, entry.name)
+        val localRoot = destination.createDirectory(localName)
+            ?: throw IOException("Не удалось создать папку $localName")
+        try {
+            disk.list(normalizePath(entry.path)).toEntries(normalizePath(entry.path)).forEach { child ->
+                if (child.isDirectory) downloadDirectory(disk, child, localRoot, onProgress)
+                else downloadFile(disk, child, localRoot, onProgress)
+            }
+            return localRoot
+        } catch (error: Throwable) {
+            localRoot.delete()
+            throw error
+        }
+    }
+
+    private fun copyRemoteNode(disk: DiskShare, entry: SmbEntry, destinationPath: String) {
+        if (entry.isDirectory) {
+            val targetName = uniqueRemoteName(disk, destinationPath, entry.name)
+            val targetDirectory = childPath(destinationPath, targetName)
+            disk.mkdir(targetDirectory)
+            disk.list(normalizePath(entry.path)).toEntries(normalizePath(entry.path)).forEach { child ->
+                copyRemoteNode(disk, child, targetDirectory)
+            }
+            return
+        }
+        val targetName = uniqueRemoteName(disk, destinationPath, entry.name)
+        val finalPath = childPath(destinationPath, targetName)
+        val temporaryPath = childPath(destinationPath, ".aura-part-${UUID.randomUUID()}")
+        try {
+            disk.openFile(
+                normalizePath(entry.path),
+                EnumSet.of(AccessMask.GENERIC_READ),
+                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE),
+            ).use { source ->
+                disk.openFile(
+                    temporaryPath,
+                    EnumSet.of(AccessMask.GENERIC_WRITE, AccessMask.GENERIC_READ, AccessMask.DELETE),
+                    EnumSet.of(FileAttributes.FILE_ATTRIBUTE_HIDDEN),
+                    SMB2ShareAccess.ALL,
+                    SMB2CreateDisposition.FILE_CREATE,
+                    EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE),
+                ).use { target ->
+                    source.remoteCopyTo(target)
+                    require(target.length == entry.size) { "SMB-копия имеет неверный размер" }
+                    target.rename(finalPath, false)
+                }
+            }
+        } catch (error: Throwable) {
+            runCatching { if (disk.fileExists(temporaryPath)) disk.rm(temporaryPath) }
+            throw error
+        }
+    }
+
+    private fun openEntry(disk: DiskShare, entry: SmbEntry) = disk.open(
+        normalizePath(entry.path),
+        EnumSet.of(AccessMask.GENERIC_READ, AccessMask.GENERIC_WRITE, AccessMask.DELETE),
+        EnumSet.of(
+            if (entry.isDirectory) FileAttributes.FILE_ATTRIBUTE_DIRECTORY
+            else FileAttributes.FILE_ATTRIBUTE_NORMAL
+        ),
+        SMB2ShareAccess.ALL,
+        SMB2CreateDisposition.FILE_OPEN,
+        EnumSet.of(
+            if (entry.isDirectory) SMB2CreateOptions.FILE_DIRECTORY_FILE
+            else SMB2CreateOptions.FILE_NON_DIRECTORY_FILE
+        ),
+    )
+
+    private fun connectedShare(): DiskShare = share?.takeIf { it.isConnected } ?: run {
+        connectInternal()
+        requireNotNull(share)
     }
 
     private fun connectInternal() {
@@ -321,6 +537,8 @@ class SmbRepository(private val context: Context) {
     private fun childPath(parent: String, name: String): String =
         if (parent.isBlank()) name else "${normalizePath(parent)}\\$name"
 
+    private fun parentPath(path: String): String = normalizePath(path).substringBeforeLast('\\', "")
+
     private fun displayPath(path: String): String = if (path.isBlank()) "/" else "/${path.replace('\\', '/')}"
 
     private fun uniqueLocalName(parent: DocumentFile, requested: String): String {
@@ -331,6 +549,29 @@ class SmbRepository(private val context: Context) {
         var index = 2
         while (parent.findFile("$base ($index)$extension") != null) index++
         return "$base ($index)$extension"
+    }
+
+    private fun uniqueRemoteName(disk: DiskShare, parent: String, requested: String): String {
+        fun exists(name: String): Boolean {
+            val path = childPath(parent, name)
+            return disk.fileExists(path) || disk.folderExists(path)
+        }
+        if (!exists(requested)) return requested
+        val dot = requested.lastIndexOf('.')
+        val base = if (dot > 0) requested.substring(0, dot) else requested
+        val extension = if (dot > 0) requested.substring(dot) else ""
+        var index = 2
+        while (exists("$base ($index)$extension")) index += 1
+        return "$base ($index)$extension"
+    }
+
+    private fun safeName(raw: String): String {
+        val value = raw.trim()
+        require(value.isNotEmpty()) { "Введите название" }
+        require(value != "." && value != ".." && value.none { it in "\\/:*?\"<>|" }) {
+            "Название содержит недопустимые символы"
+        }
+        return value
     }
 
     private fun smbMessage(error: Throwable): String {
@@ -347,6 +588,10 @@ class SmbRepository(private val context: Context) {
             raw.isNotBlank() -> "SMB: $raw"
             else -> "Не удалось подключиться к SMB"
         }
+    }
+
+    companion object {
+        private const val TRANSFER_BUFFER_SIZE = 1024 * 1024
     }
 
 }

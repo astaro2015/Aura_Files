@@ -11,8 +11,8 @@ android {
         applicationId = "com.aurafiles.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "0.12.0"
+        versionCode = 18
+        versionName = "0.13.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -74,6 +74,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
     implementation("androidx.media3:media3-exoplayer:1.11.0")
     implementation("androidx.media3:media3-ui:1.11.0")
+    implementation("androidx.room:room-runtime:2.8.4")
+    implementation("androidx.room:room-ktx:2.8.4")
+    annotationProcessor("androidx.room:room-compiler:2.8.4")
     implementation("commons-net:commons-net:3.13.0")
     implementation("com.hierynomus:smbj:0.15.0")
     implementation("org.codelibs:jcifs:2.1.40")
@@ -83,6 +86,7 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.room:room-testing:2.8.4")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

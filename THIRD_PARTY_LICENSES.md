@@ -48,3 +48,7 @@ Used only to enumerate the file shares exposed by an SMB2 server; file browsing 
 ## slf4j-api / slf4j-nop 2.0.18
 
 Logging API and no-output runtime binding used by the reader/network dependencies.
+
+## AndroidX Room 2.8.4 — Apache License 2.0
+
+Used for the persistent, incremental storage index. Project: https://developer.android.com/jetpack/androidx/releases/room

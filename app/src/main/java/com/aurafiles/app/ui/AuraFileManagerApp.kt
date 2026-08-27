@@ -76,6 +76,7 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.ContentCut
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.FolderOpen
@@ -84,6 +85,7 @@ import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.PhotoCamera
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.Download
@@ -110,6 +112,7 @@ import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -186,6 +189,11 @@ import com.aurafiles.app.model.StorageAnalysis
 import com.aurafiles.app.model.StorageAccessMode
 import com.aurafiles.app.model.StorageVolumeInfo
 import com.aurafiles.app.model.SystemSoundType
+import com.aurafiles.app.network.NetworkProfile
+import com.aurafiles.app.transfer.TransferConflictPolicy
+import com.aurafiles.app.ui.dialogs.TransferConflictDialog
+import com.aurafiles.app.ui.dialogs.TransferStatusOverlay
+import com.aurafiles.app.ui.network.NetworkProfilesCard
 import com.aurafiles.app.model.TrashRecord
 import com.aurafiles.app.model.displayLocation
 import com.aurafiles.app.model.isTemporaryCandidate
@@ -242,6 +250,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val ftpUploadLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = viewModel::uploadToFtp,
+    )
+    val smbUploadLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+        onResult = viewModel::uploadToSmb,
     )
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -407,6 +419,9 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                     onSort = viewModel::setSortMode,
                     onViewMode = viewModel::setViewMode,
                     onCancelOperation = viewModel::cancelOperation,
+                    onPauseOperation = viewModel::pauseOperation,
+                    onResumeOperation = viewModel::resumeOperation,
+                    onResolveConflict = viewModel::resolveTransferConflict,
                     onToggleDualPane = viewModel::toggleDualPane,
                     onOpenSecondary = viewModel::openSecondaryEntry,
                     onSecondaryBack = viewModel::navigateSecondaryBack,
@@ -466,6 +481,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         serverStatus = ftpServerStatus,
                         onOpenSettings = { settingsOpen = true },
                         onScanLan = viewModel::scanLan,
+                        onConnectProfile = viewModel::connectNetworkProfile,
+                        onTestProfile = viewModel::testNetworkProfile,
+                        onDuplicateProfile = viewModel::duplicateNetworkProfile,
+                        onDeleteProfile = viewModel::deleteNetworkProfile,
                         onConnectSmb = viewModel::connectSmb,
                         onSelectSmbShare = viewModel::selectSmbShare,
                         onDisconnectSmb = viewModel::disconnectSmb,
@@ -473,6 +492,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onBackSmb = viewModel::navigateSmbBack,
                         onOpenSmb = viewModel::openSmbEntry,
                         onDownloadSmb = viewModel::downloadFromSmb,
+                        onUploadSmb = { smbUploadLauncher.launch(arrayOf("*/*")) },
+                        onCreateSmbFolder = viewModel::createSmbFolder,
+                        onRenameSmb = viewModel::renameSmb,
+                        onDeleteSmb = viewModel::deleteSmb,
                         onConnect = viewModel::connectFtp,
                         onDisconnect = viewModel::disconnectFtp,
                         onRefresh = viewModel::refreshFtp,
@@ -670,6 +693,10 @@ private fun FtpScreen(
     serverStatus: FtpServerStatus,
     onOpenSettings: () -> Unit,
     onScanLan: () -> Unit,
+    onConnectProfile: (NetworkProfile) -> Unit,
+    onTestProfile: (NetworkProfile) -> Unit,
+    onDuplicateProfile: (NetworkProfile) -> Unit,
+    onDeleteProfile: (NetworkProfile) -> Unit,
     onConnectSmb: (SmbProfile) -> Unit,
     onSelectSmbShare: (String) -> Unit,
     onDisconnectSmb: () -> Unit,
@@ -677,6 +704,10 @@ private fun FtpScreen(
     onBackSmb: () -> Boolean,
     onOpenSmb: (SmbEntry) -> Unit,
     onDownloadSmb: (SmbEntry) -> Unit,
+    onUploadSmb: () -> Unit,
+    onCreateSmbFolder: (String) -> Unit,
+    onRenameSmb: (SmbEntry, String) -> Unit,
+    onDeleteSmb: (SmbEntry, Boolean) -> Unit,
     onConnect: (FtpProfile) -> Unit,
     onDisconnect: () -> Unit,
     onRefresh: () -> Unit,
@@ -694,6 +725,7 @@ private fun FtpScreen(
     var ftpDialogInitial by remember { mutableStateOf<FtpProfile?>(null) }
     var smbSettingsOpen by remember { mutableStateOf(false) }
     var smbDialogInitial by remember { mutableStateOf<SmbProfile?>(null) }
+    var smbCreateFolderOpen by remember { mutableStateOf(false) }
     var createFolderOpen by remember { mutableStateOf(false) }
     var serverSettingsOpen by remember { mutableStateOf(false) }
 
@@ -703,6 +735,17 @@ private fun FtpScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item { LargeTitleRow("Сеть", onSettings = onOpenSettings) }
+        if (state.networkProfiles.isNotEmpty()) {
+            item {
+                NetworkProfilesCard(
+                    profiles = state.networkProfiles,
+                    onConnect = onConnectProfile,
+                    onTest = onTestProfile,
+                    onDuplicate = onDuplicateProfile,
+                    onDelete = onDeleteProfile,
+                )
+            }
+        }
         item {
             LanDevicesCard(
                 devices = state.lanDevices,
@@ -775,6 +818,28 @@ private fun FtpScreen(
                     }
                 }
             }
+            if (state.smbProfile?.share?.isNotBlank() == true) {
+                item {
+                    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                        ) {
+                            TextButton(onClick = onUploadSmb, enabled = state.smbTransferLabel == null) {
+                                Icon(Icons.Rounded.UploadFile, contentDescription = null)
+                                Spacer(Modifier.width(5.dp))
+                                Text("Загрузить")
+                            }
+                            TextButton(onClick = { smbCreateFolderOpen = true }, enabled = state.smbTransferLabel == null) {
+                                Icon(Icons.Rounded.Add, contentDescription = null)
+                                Spacer(Modifier.width(5.dp))
+                                Text("Папка")
+                            }
+                            TextButton(onClick = onDisconnectSmb) { Text("Отключить") }
+                        }
+                    }
+                }
+            }
             state.smbTransferLabel?.let { label ->
                 item {
                     Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer) {
@@ -832,6 +897,8 @@ private fun FtpScreen(
                                     busy = state.smbTransferLabel != null,
                                     onOpen = { onOpenSmb(entry) },
                                     onDownload = { onDownloadSmb(entry) },
+                                    onRename = { name -> onRenameSmb(entry, name) },
+                                    onDelete = { recursive -> onDeleteSmb(entry, recursive) },
                                 )
                                 if (index != state.smbItems.lastIndex) {
                                     HorizontalDivider(modifier = Modifier.padding(start = 66.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
@@ -992,6 +1059,15 @@ private fun FtpScreen(
         }
     }
 
+    if (smbCreateFolderOpen) {
+        NameDialog(
+            title = "Новая папка SMB",
+            initialValue = "",
+            confirmLabel = "Создать",
+            onDismiss = { smbCreateFolderOpen = false },
+            onConfirm = { name -> smbCreateFolderOpen = false; onCreateSmbFolder(name) },
+        )
+    }
     if (settingsOpen) {
         FtpConnectionDialog(
             initial = ftpDialogInitial ?: state.ftpProfile,
@@ -1353,7 +1429,12 @@ private fun SmbFileRow(
     busy: Boolean,
     onOpen: () -> Unit,
     onDownload: () -> Unit,
+    onRename: (String) -> Unit,
+    onDelete: (Boolean) -> Unit,
 ) {
+    var menuOpen by remember { mutableStateOf(false) }
+    var renameOpen by remember { mutableStateOf(false) }
+    var deleteOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1372,15 +1453,54 @@ private fun SmbFileRow(
                 fontSize = 11.sp,
             )
         }
-        if (entry.isDirectory) {
-            IconButton(onClick = onOpen, enabled = !busy) {
-                Icon(Icons.Rounded.ChevronRight, contentDescription = "Открыть ${entry.name}")
+        Box {
+            IconButton(onClick = { menuOpen = true }, enabled = !busy) {
+                Icon(Icons.Rounded.MoreHoriz, contentDescription = "Действия с ${entry.name}")
             }
-        } else {
-            IconButton(onClick = onDownload, enabled = !busy) {
-                Icon(Icons.Rounded.Download, contentDescription = "Скачать ${entry.name}")
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text(if (entry.isDirectory) "Скачать папку" else "Скачать на устройство") },
+                    leadingIcon = { Icon(Icons.Rounded.Download, contentDescription = null) },
+                    onClick = { menuOpen = false; onDownload() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Переименовать") },
+                    leadingIcon = { Icon(Icons.Rounded.TextFields, contentDescription = null) },
+                    onClick = { menuOpen = false; renameOpen = true },
+                )
+                DropdownMenuItem(
+                    text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
+                    leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                    onClick = { menuOpen = false; deleteOpen = true },
+                )
             }
         }
+    }
+    if (renameOpen) {
+        NameDialog(
+            title = "Переименовать на SMB",
+            initialValue = entry.name,
+            confirmLabel = "Готово",
+            onDismiss = { renameOpen = false },
+            onConfirm = { name -> renameOpen = false; onRename(name) },
+        )
+    }
+    if (deleteOpen) {
+        AlertDialog(
+            onDismissRequest = { deleteOpen = false },
+            title = { Text(if (entry.isDirectory) "Удалить папку SMB?" else "Удалить файл SMB?") },
+            text = {
+                Text(
+                    if (entry.isDirectory) {
+                        "${entry.name}\nПапка и всё её содержимое будут удалены без корзины."
+                    } else "${entry.name}\nФайл будет удалён без корзины."
+                )
+            },
+            confirmButton = {
+                Button(onClick = { deleteOpen = false; onDelete(entry.isDirectory) }) { Text("Удалить") }
+            },
+            dismissButton = { TextButton(onClick = { deleteOpen = false }) { Text("Отмена") } },
+        )
     }
 }
 
@@ -1810,6 +1930,9 @@ private fun BrowserScreen(
     onSort: (FileSortMode) -> Unit,
     onViewMode: (FileViewMode) -> Unit,
     onCancelOperation: () -> Unit,
+    onPauseOperation: () -> Unit,
+    onResumeOperation: () -> Unit,
+    onResolveConflict: (TransferConflictPolicy, Boolean) -> Unit,
     onToggleDualPane: () -> Unit,
     onOpenSecondary: (FileEntry) -> Unit,
     onSecondaryBack: () -> Boolean,
@@ -1995,47 +2118,25 @@ private fun BrowserScreen(
             }
 
             if (state.operationInProgress) {
-                Surface(
+                TransferStatusOverlay(
+                    progress = state.transferProgress,
+                    label = state.operationLabel,
+                    fallbackProgress = state.operationProgress,
+                    cancelable = state.operationCancelable,
+                    paused = state.transferPaused,
+                    onPause = onPauseOperation,
+                    onResume = onResumeOperation,
+                    onCancel = onCancelOperation,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .padding(20.dp),
-                    shape = RoundedCornerShape(18.dp),
-                    color = MaterialTheme.colorScheme.inverseSurface,
-                    tonalElevation = 4.dp,
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            strokeWidth = 2.dp,
-                            color = MaterialTheme.colorScheme.inverseOnSurface,
-                        )
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                state.operationLabel ?: "Выполняется операция…",
-                                color = MaterialTheme.colorScheme.inverseOnSurface,
-                            )
-                            if (state.operationProgress > 0f) {
-                                LinearProgressIndicator(
-                                    progress = { state.operationProgress },
-                                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(3.dp),
-                                    color = MaterialTheme.colorScheme.primaryContainer,
-                                    trackColor = MaterialTheme.colorScheme.inverseOnSurface.copy(alpha = 0.2f),
-                                    gapSize = 0.dp,
-                                    drawStopIndicator = {},
-                                )
-                            }
-                        }
-                        if (state.operationCancelable) {
-                            TextButton(onClick = onCancelOperation) { Text("Стоп") }
-                        }
-                    }
-                }
+                )
             }
         }
+    }
+
+    state.transferConflict?.let { conflict ->
+        TransferConflictDialog(conflict = conflict, onResolve = onResolveConflict)
     }
 
     if (createDialog) {
@@ -2407,7 +2508,7 @@ private fun CleanupScreen(
         if (analysis?.limitReached == true) {
             item {
                 Text(
-                    "Достигнут безопасный предел в 10 000 файлов. Остальные объекты не включены в отчёт.",
+                    "В этом представлении показана часть индекса. Категории и поиск продолжают работать по всей базе.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 4.dp),
@@ -2529,7 +2630,7 @@ private fun LargeTitleRow(title: String, onSettings: (() -> Unit)? = null) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Быстрый и аккуратный файловый менеджер для Android.")
                     PropertyRow("Разработчик", "Привалов Олег")
-                    PropertyRow("Версия", "0.12.0")
+                    PropertyRow("Версия", "0.13.0")
                 }
             },
             confirmButton = {
