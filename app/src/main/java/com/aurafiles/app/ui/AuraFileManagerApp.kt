@@ -255,6 +255,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = viewModel::uploadToSmb,
     )
+    val smbFolderUploadLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree(),
+        onResult = { uri -> uri?.let { viewModel.uploadToSmb(listOf(it)) } },
+    )
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = {
@@ -493,6 +497,7 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onOpenSmb = viewModel::openSmbEntry,
                         onDownloadSmb = viewModel::downloadFromSmb,
                         onUploadSmb = { smbUploadLauncher.launch(arrayOf("*/*")) },
+                        onUploadSmbFolder = { smbFolderUploadLauncher.launch(null) },
                         onCreateSmbFolder = viewModel::createSmbFolder,
                         onRenameSmb = viewModel::renameSmb,
                         onDeleteSmb = viewModel::deleteSmb,
@@ -705,6 +710,7 @@ private fun FtpScreen(
     onOpenSmb: (SmbEntry) -> Unit,
     onDownloadSmb: (SmbEntry) -> Unit,
     onUploadSmb: () -> Unit,
+    onUploadSmbFolder: () -> Unit,
     onCreateSmbFolder: (String) -> Unit,
     onRenameSmb: (SmbEntry, String) -> Unit,
     onDeleteSmb: (SmbEntry, Boolean) -> Unit,
@@ -828,7 +834,12 @@ private fun FtpScreen(
                             TextButton(onClick = onUploadSmb, enabled = state.smbTransferLabel == null) {
                                 Icon(Icons.Rounded.UploadFile, contentDescription = null)
                                 Spacer(Modifier.width(5.dp))
-                                Text("Загрузить")
+                                Text("Файлы")
+                            }
+                            TextButton(onClick = onUploadSmbFolder, enabled = state.smbTransferLabel == null) {
+                                Icon(Icons.Rounded.Folder, contentDescription = null)
+                                Spacer(Modifier.width(5.dp))
+                                Text("Папку")
                             }
                             TextButton(onClick = { smbCreateFolderOpen = true }, enabled = state.smbTransferLabel == null) {
                                 Icon(Icons.Rounded.Add, contentDescription = null)

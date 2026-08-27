@@ -122,10 +122,10 @@ class SmbRepository(private val context: Context) {
         require(uris.isNotEmpty()) { "Выберите файлы для загрузки" }
         val disk = connectedShare()
         uris.forEach { uri ->
-            val source = DocumentFile.fromSingleUri(context, uri)
+            val source = runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
+                ?: runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
                 ?: throw IOException("Выбранный файл недоступен")
-            require(source.isFile) { "Загрузка папок выполняется из локального браузера" }
-            uploadFile(disk, source, currentPath, onProgress)
+            uploadNode(disk, source, currentPath, onProgress)
         }
         displayPath(currentPath) to disk.list(currentPath).toEntries(currentPath)
     }
@@ -199,6 +199,29 @@ class SmbRepository(private val context: Context) {
             }
         } catch (error: Throwable) {
             runCatching { if (disk.fileExists(temporaryPath)) disk.rm(temporaryPath) }
+            throw error
+        }
+    }
+
+    private fun uploadNode(
+        disk: DiskShare,
+        source: DocumentFile,
+        destinationPath: String,
+        onProgress: (String, Long, Long) -> Unit,
+    ) {
+        if (source.isFile) {
+            uploadFile(disk, source, destinationPath, onProgress)
+            return
+        }
+        require(source.isDirectory) { "Выбранный объект недоступен" }
+        val requested = source.name ?: "Папка"
+        val directoryName = uniqueRemoteName(disk, destinationPath, requested)
+        val remoteDirectory = childPath(destinationPath, directoryName)
+        disk.mkdir(remoteDirectory)
+        try {
+            source.listFiles().forEach { child -> uploadNode(disk, child, remoteDirectory, onProgress) }
+        } catch (error: Throwable) {
+            runCatching { disk.rmdir(remoteDirectory, true) }
             throw error
         }
     }

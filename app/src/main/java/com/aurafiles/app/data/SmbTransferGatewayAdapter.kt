@@ -23,7 +23,12 @@ class SmbTransferGatewayAdapter(
     ) {
         controller.checkpoint()
         var previous = 0L
+        var previousName = ""
         repository.upload(listOf(source.uri)) { name, written, total ->
+            if (name != previousName) {
+                previousName = name
+                previous = 0L
+            }
             val delta = (written - previous).coerceAtLeast(0L)
             previous = written
             onBytes(name, delta, total)
@@ -41,6 +46,7 @@ class SmbTransferGatewayAdapter(
             ?: runCatching { DocumentFile.fromSingleUri(appContext, destination.directoryUri) }.getOrNull()
             ?: throw IOException("Локальная папка недоступна")
         var previous = 0L
+        var previousName = ""
         repository.download(
             SmbEntry(
                 name = source.name,
@@ -51,6 +57,10 @@ class SmbTransferGatewayAdapter(
             ),
             local,
         ) { name, written, total ->
+            if (name != previousName) {
+                previousName = name
+                previous = 0L
+            }
             val delta = (written - previous).coerceAtLeast(0L)
             previous = written
             onBytes(name, delta, total)

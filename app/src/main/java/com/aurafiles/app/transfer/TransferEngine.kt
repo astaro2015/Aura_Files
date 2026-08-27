@@ -88,7 +88,6 @@ class TransferEngine(
             ?: throw IOException("Не выбрана SMB-папка назначения")
         request.sources.forEach { raw ->
             val source = raw as? TransferSource.Local ?: throw IOException("Для загрузки нужен локальный файл")
-            require(!source.isDirectory) { "Загрузка папок выполняется через браузер Aura" }
             stats.currentItemBytes = 0L
             stats.currentItemTotalBytes = source.size.coerceAtLeast(0L)
             gateway.upload(source, destination, controller) { name, delta, total ->
@@ -367,7 +366,8 @@ class TransferEngine(
     }
 
     private fun TransferSource.Local.document(): DocumentFile =
-        DocumentFile.fromSingleUri(appContext, uri)
+        runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
+            ?: runCatching { DocumentFile.fromSingleUri(appContext, uri) }.getOrNull()
             ?: throw IOException("Источник $name недоступен")
 
     private fun documentFromUri(uri: android.net.Uri): DocumentFile? =

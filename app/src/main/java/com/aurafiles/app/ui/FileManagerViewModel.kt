@@ -1319,7 +1319,8 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     fun uploadToSmb(uris: List<Uri>) {
         if (uris.isEmpty() || _state.value.smbTransferLabel != null) return
         val sources = uris.mapNotNull { uri ->
-            val document = runCatching { DocumentFile.fromSingleUri(getApplication(), uri) }.getOrNull()
+            val document = runCatching { DocumentFile.fromTreeUri(getApplication(), uri) }.getOrNull()
+                ?: runCatching { DocumentFile.fromSingleUri(getApplication(), uri) }.getOrNull()
             document?.let {
                 TransferSource.Local(
                     uri = uri,
