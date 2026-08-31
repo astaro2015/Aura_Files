@@ -78,12 +78,10 @@ final class Ui {
         final int baseBottom = root.getPaddingBottom();
 
         Window window = activity.getWindow();
-        window.setStatusBarColor(Color.TRANSPARENT);
-        window.setNavigationBarColor(Color.TRANSPARENT);
-        if (Build.VERSION.SDK_INT >= 28) window.setNavigationBarDividerColor(Color.TRANSPARENT);
-        if (Build.VERSION.SDK_INT >= 29) {
-            window.setStatusBarContrastEnforced(false);
-            window.setNavigationBarContrastEnforced(false);
+        // Android 15+ enforces edge-to-edge for our target SDK, so setting bar colors there is
+        // both redundant and deprecated. Older Android versions still need the compatibility path.
+        if (Build.VERSION.SDK_INT < 35) {
+            applyLegacyTransparentSystemBars(window);
         }
         setLightSystemBars(activity, true);
 
@@ -99,10 +97,11 @@ final class Ui {
                 right = bars.right;
                 bottom = bars.bottom;
             } else {
-                left = insets.getSystemWindowInsetLeft();
-                top = insets.getSystemWindowInsetTop();
-                right = insets.getSystemWindowInsetRight();
-                bottom = insets.getSystemWindowInsetBottom();
+                int[] legacy = getLegacySystemWindowInsets(insets);
+                left = legacy[0];
+                top = legacy[1];
+                right = legacy[2];
+                bottom = legacy[3];
             }
             view.setPadding(baseLeft + left, baseTop + top, baseRight + right, baseBottom + bottom);
             return insets;
@@ -120,9 +119,35 @@ final class Ui {
                 controller.setSystemBarsAppearance(light ? mask : 0, mask);
             }
         } else {
-            int flags = decor.getSystemUiVisibility();
-            int lightFlags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
-            decor.setSystemUiVisibility(light ? (flags | lightFlags) : (flags & ~lightFlags));
+            setLegacyLightSystemBars(decor, light);
         }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static int[] getLegacySystemWindowInsets(WindowInsets insets) {
+        return new int[] {
+                insets.getSystemWindowInsetLeft(),
+                insets.getSystemWindowInsetTop(),
+                insets.getSystemWindowInsetRight(),
+                insets.getSystemWindowInsetBottom()
+        };
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void applyLegacyTransparentSystemBars(Window window) {
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 28) window.setNavigationBarDividerColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static void setLegacyLightSystemBars(View decor, boolean light) {
+        int flags = decor.getSystemUiVisibility();
+        int lightFlags = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        decor.setSystemUiVisibility(light ? (flags | lightFlags) : (flags & ~lightFlags));
     }
 }

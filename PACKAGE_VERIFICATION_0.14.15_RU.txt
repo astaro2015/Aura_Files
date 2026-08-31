@@ -1,0 +1,8 @@
+Проверка пакета Aura Files 0.14.15
+
+- versionName: 0.14.15
+- versionCode: 34
+- DeleteAnimationMode содержит Off, Fast, Dissolve, Smoke.
+- «Распад на пиксели» сохранён, «Дым» добавлен отдельным вариантом в настройках.
+- Smoke использует явный ContentDrawScope receiver при повторной отрисовке содержимого.
+- Полный Android Gradle compile в контейнере не заявляется как пройденный; окончательная проверка выполняется Windows-builder.

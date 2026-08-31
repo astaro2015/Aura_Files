@@ -23,6 +23,7 @@ import jcifs.context.BaseContext
 import jcifs.config.PropertyConfiguration
 import jcifs.smb.NtlmPasswordAuthenticator
 import jcifs.smb.SmbFile
+import java.io.File
 import java.io.IOException
 import java.net.URLConnection
 import java.util.EnumSet
@@ -122,8 +123,7 @@ class SmbRepository(private val context: Context) {
         require(uris.isNotEmpty()) { "Выберите файлы для загрузки" }
         val disk = connectedShare()
         uris.forEach { uri ->
-            val source = runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
-                ?: runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
+            val source = documentFromUri(uri)
                 ?: throw IOException("Выбранный файл недоступен")
             uploadNode(disk, source, currentPath, onProgress)
         }
@@ -175,9 +175,14 @@ class SmbRepository(private val context: Context) {
                 SMB2CreateDisposition.FILE_CREATE,
                 EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE, SMB2CreateOptions.FILE_SEQUENTIAL_ONLY),
             ).use { remote ->
-                val input = context.contentResolver.openInputStream(source.uri)
-                    ?: throw IOException("Не удалось прочитать $requested")
+                val input = if (source.uri.scheme == "file") {
+                    File(requireNotNull(source.uri.path) { "Не удалось определить путь $requested" }).inputStream()
+                } else {
+                    context.contentResolver.openInputStream(source.uri)
+                        ?: throw IOException("Не удалось прочитать $requested")
+                }
                 var written = 0L
+                onProgress(requested, 0L, source.length())
                 input.buffered(TRANSFER_BUFFER_SIZE).use { sourceStream ->
                     remote.outputStream.buffered(TRANSFER_BUFFER_SIZE).use { targetStream ->
                         val buffer = ByteArray(TRANSFER_BUFFER_SIZE)
@@ -245,9 +250,14 @@ class SmbRepository(private val context: Context) {
                 SMB2CreateDisposition.FILE_OPEN,
                 EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE, SMB2CreateOptions.FILE_SEQUENTIAL_ONLY),
             ).use { remote ->
-                val output = context.contentResolver.openOutputStream(temporary.uri, "w")
-                    ?: throw IOException("Не удалось записать $finalName")
+                val output = if (temporary.uri.scheme == "file") {
+                    File(requireNotNull(temporary.uri.path) { "Не удалось определить путь $finalName" }).outputStream()
+                } else {
+                    context.contentResolver.openOutputStream(temporary.uri, "w")
+                        ?: throw IOException("Не удалось записать $finalName")
+                }
                 var written = 0L
+                onProgress(entry.name, 0L, entry.size)
                 remote.inputStream.buffered(TRANSFER_BUFFER_SIZE).use { sourceStream ->
                     output.buffered(TRANSFER_BUFFER_SIZE).use { targetStream ->
                         val buffer = ByteArray(TRANSFER_BUFFER_SIZE)
@@ -473,12 +483,12 @@ class SmbRepository(private val context: Context) {
 
     private fun authenticationCandidates(profile: SmbProfile): List<AuthenticationContext> {
         val candidates = buildList {
-            preferredAuth?.let(::add)
-            add(AuthenticationContext.guest())
-            add(AuthenticationContext.anonymous())
             if (profile.username.isNotBlank()) {
                 add(AuthenticationContext(profile.username, profile.password.toCharArray(), profile.domain))
             }
+            preferredAuth?.let(::add)
+            add(AuthenticationContext.guest())
+            add(AuthenticationContext.anonymous())
         }
         return candidates.distinctBy { auth ->
             "${auth.isGuest}|${auth.isAnonymous}|${auth.username}|${auth.domain}"
@@ -555,7 +565,16 @@ class SmbRepository(private val context: Context) {
         )
     }
 
-    private fun normalizePath(path: String): String = path.trim().trim('/', '\\').replace('/', '\\')
+    private fun documentFromUri(uri: Uri): DocumentFile? {
+    if (uri.scheme == "file") {
+        val path = uri.path ?: return null
+        return runCatching { DocumentFile.fromFile(File(path)) }.getOrNull()
+    }
+    return runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
+        ?: runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
+}
+
+private fun normalizePath(path: String): String = path.trim().trim('/', '\\').replace('/', '\\')
 
     private fun childPath(parent: String, name: String): String =
         if (parent.isBlank()) name else "${normalizePath(parent)}\\$name"

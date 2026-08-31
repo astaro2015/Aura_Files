@@ -1,0 +1,17 @@
+Aura Files 0.14.1 — Java resource merge fix #2
+
+Исправлено после реальной Windows-сборки:
+- mergeDebugJavaResource падал на трёх одинаковых META-INF/LICENSE.md
+  из BouncyCastle bcpkix / bcutil / bcprov.
+- Добавлены безопасные исключения META-INF/LICENSE.md, META-INF/license.md
+  и META-INF/DEPENDENCIES.txt.
+
+Это служебные license/metadata-файлы JAR. На код и runtime-функции библиотек
+исключение не влияет; THIRD_PARTY_LICENSES.md в проекте сохраняется.
+
+Проверенный этап до исправления:
+- NDK build: OK
+- Android resources/manifest: OK
+- Kotlin compilation: OK (только warnings)
+- Java compilation: OK (только deprecation notes)
+- Failure point: mergeDebugJavaResource / META-INF/LICENSE.md duplicate

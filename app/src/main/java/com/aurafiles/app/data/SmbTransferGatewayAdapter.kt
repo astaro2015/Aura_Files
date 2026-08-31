@@ -7,6 +7,7 @@ import com.aurafiles.app.transfer.SmbTransferGateway
 import com.aurafiles.app.transfer.TransferController
 import com.aurafiles.app.transfer.TransferDestination
 import com.aurafiles.app.transfer.TransferSource
+import java.io.File
 import java.io.IOException
 
 class SmbTransferGatewayAdapter(
@@ -19,19 +20,21 @@ class SmbTransferGatewayAdapter(
         source: TransferSource.Local,
         destination: TransferDestination.Smb,
         controller: TransferController,
-        onBytes: (String, Long, Long) -> Unit,
+        onBytes: (String, Long, Long, Boolean) -> Unit,
     ) {
         controller.checkpoint()
         var previous = 0L
         var previousName = ""
         repository.upload(listOf(source.uri)) { name, written, total ->
-            if (name != previousName) {
+            controller.checkpointBlocking()
+            val started = written == 0L || name != previousName
+            if (started) {
                 previousName = name
                 previous = 0L
             }
             val delta = (written - previous).coerceAtLeast(0L)
             previous = written
-            onBytes(name, delta, total)
+            onBytes(name, delta, total, started)
         }
     }
 
@@ -39,11 +42,10 @@ class SmbTransferGatewayAdapter(
         source: TransferSource.Smb,
         destination: TransferDestination.Local,
         controller: TransferController,
-        onBytes: (String, Long, Long) -> Unit,
+        onBytes: (String, Long, Long, Boolean) -> Unit,
     ) {
         controller.checkpoint()
-        val local = runCatching { DocumentFile.fromTreeUri(appContext, destination.directoryUri) }.getOrNull()
-            ?: runCatching { DocumentFile.fromSingleUri(appContext, destination.directoryUri) }.getOrNull()
+        val local = documentFromUri(destination.directoryUri)
             ?: throw IOException("Локальная папка недоступна")
         var previous = 0L
         var previousName = ""
@@ -57,13 +59,24 @@ class SmbTransferGatewayAdapter(
             ),
             local,
         ) { name, written, total ->
-            if (name != previousName) {
+            controller.checkpointBlocking()
+            val started = written == 0L || name != previousName
+            if (started) {
                 previousName = name
                 previous = 0L
             }
             val delta = (written - previous).coerceAtLeast(0L)
             previous = written
-            onBytes(name, delta, total)
+            onBytes(name, delta, total, started)
         }
+    }
+
+    private fun documentFromUri(uri: android.net.Uri): DocumentFile? {
+        if (uri.scheme == "file") {
+            val path = uri.path ?: return null
+            return runCatching { DocumentFile.fromFile(File(path)) }.getOrNull()
+        }
+        return runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
+            ?: runCatching { DocumentFile.fromSingleUri(appContext, uri) }.getOrNull()
     }
 }

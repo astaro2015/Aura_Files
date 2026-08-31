@@ -10,6 +10,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Build;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -17,6 +18,8 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -287,9 +290,7 @@ public final class ReaderActivity extends Activity {
         WebSettings webSettings = webView.getSettings();
         webSettings.setJavaScriptEnabled(true);
         webSettings.setDomStorageEnabled(false);
-        webSettings.setAllowFileAccess(true);
-        webSettings.setAllowFileAccessFromFileURLs(true);
-        webSettings.setAllowUniversalAccessFromFileURLs(false);
+        configureFileUrlCompatibility(webSettings);
         webSettings.setAllowContentAccess(false);
         webSettings.setBlockNetworkImage(true);
         webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
@@ -330,6 +331,18 @@ public final class ReaderActivity extends Activity {
             }
         });
         webView.setOnTouchListener((v, event) -> handleReaderTouch(event));
+    }
+
+    /**
+     * EPUB pages are rendered from an app-private file:// extraction directory. These file-access
+     * WebSettings calls are deprecated on newer Android because WebViewAssetLoader is preferred,
+     * but retaining them on the compatibility path avoids breaking relative EPUB resources.
+     */
+    @SuppressWarnings("deprecation")
+    private static void configureFileUrlCompatibility(WebSettings webSettings) {
+        webSettings.setAllowFileAccess(true);
+        webSettings.setAllowFileAccessFromFileURLs(true);
+        webSettings.setAllowUniversalAccessFromFileURLs(false);
     }
 
     private boolean handleReaderTouch(MotionEvent event) {
@@ -1287,11 +1300,32 @@ public final class ReaderActivity extends Activity {
         chromeVisible = !chromeVisible;
         toolbar.setVisibility(chromeVisible ? View.VISIBLE : View.GONE);
         footer.setVisibility(chromeVisible ? View.VISIBLE : View.GONE);
-        if (chromeVisible) {
-            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
-            Ui.setLightSystemBars(this, true);
+        setReaderSystemBarsVisible(chromeVisible);
+        if (chromeVisible) Ui.setLightSystemBars(this, true);
+    }
+
+    private void setReaderSystemBarsVisible(boolean visible) {
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller == null) return;
+            if (visible) {
+                controller.show(WindowInsets.Type.systemBars());
+            } else {
+                controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                controller.hide(WindowInsets.Type.systemBars());
+            }
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
+            setLegacyReaderSystemBarsVisible(visible);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void setLegacyReaderSystemBarsVisible(boolean visible) {
+        View decor = getWindow().getDecorView();
+        if (visible) {
+            decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+        } else {
+            decor.setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_FULLSCREEN
                             | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);

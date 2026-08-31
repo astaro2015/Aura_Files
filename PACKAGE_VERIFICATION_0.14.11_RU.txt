@@ -1,0 +1,10 @@
+Aura Files 0.14.11 — проверка пакета
+
+PASS: versionName=0.14.11, versionCode=30.
+PASS: -Xlint:deprecation включён для JavaCompile.
+PASS: современные WindowInsets API используются на Android 11+ в ReaderActivity/Ui.
+PASS: legacy deprecated API изолированы в методах с точечным @SuppressWarnings("deprecation").
+PASS: bootstrap_windows.ps1 больше не смешивает native stderr через PowerShell 5.1 2>&1.
+PASS: XML/Kotlin/Java/PowerShell структура проверяется перед упаковкой.
+
+Полная Android Gradle-компиляция в контейнере не заявляется как выполненная, если Gradle/Android SDK недоступны.

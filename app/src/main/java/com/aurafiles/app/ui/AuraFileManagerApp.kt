@@ -13,6 +13,7 @@ import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.storage.StorageManager
 import android.os.storage.StorageVolume
 import android.hardware.usb.UsbManager
@@ -127,6 +128,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -146,6 +148,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -168,7 +171,10 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.aurafiles.app.model.ClipboardMode
+import com.aurafiles.app.model.DeleteAnimationMode
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.FileCollectionGroup
@@ -178,11 +184,15 @@ import com.aurafiles.app.model.FtpEntry
 import com.aurafiles.app.model.FtpProfile
 import com.aurafiles.app.model.FtpServerConfig
 import com.aurafiles.app.model.FtpServerStatus
+import com.aurafiles.app.model.SftpServerConfig
+import com.aurafiles.app.model.SftpServerStatus
 import com.aurafiles.app.model.LanDevice
 import com.aurafiles.app.model.LanService
 import com.aurafiles.app.model.SmbEntry
 import com.aurafiles.app.model.SmbProfile
+import com.aurafiles.app.model.SftpProfile
 import com.aurafiles.app.data.FtpServerService
+import com.aurafiles.app.data.SftpServerService
 import com.aurafiles.app.model.MainSection
 import com.aurafiles.app.model.StorageSnapshot
 import com.aurafiles.app.model.StorageAnalysis
@@ -190,6 +200,7 @@ import com.aurafiles.app.model.StorageAccessMode
 import com.aurafiles.app.model.StorageVolumeInfo
 import com.aurafiles.app.model.SystemSoundType
 import com.aurafiles.app.network.NetworkProfile
+import com.aurafiles.app.network.NetworkProtocol
 import com.aurafiles.app.transfer.TransferConflictPolicy
 import com.aurafiles.app.ui.dialogs.TransferConflictDialog
 import com.aurafiles.app.ui.dialogs.TransferStatusOverlay
@@ -217,18 +228,29 @@ import java.security.SecureRandom
 fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val uiState by viewModel.state.collectAsState()
     val ftpServerStatus by FtpServerService.status.collectAsState()
+    val sftpServerStatus by SftpServerService.status.collectAsState()
     val context = LocalContext.current
+    val openSftpWorkspace: (NetworkProfile) -> Unit = { profile ->
+        context.startActivity(
+            Intent(context, BackendWorkspaceActivity::class.java)
+                .putExtra(BackendWorkspaceActivity.EXTRA_INITIAL_BACKEND_ID, "sftp:${profile.id}")
+        )
+    }
     val snackbarHostState = remember { SnackbarHostState() }
     var previewEntry by remember { mutableStateOf<FileEntry?>(null) }
     var settingsOpen by remember { mutableStateOf(false) }
-    var pendingServerConfig by remember { mutableStateOf<FtpServerConfig?>(null) }
+    var pendingFtpServerConfig by remember { mutableStateOf<FtpServerConfig?>(null) }
+    var pendingSftpServerConfig by remember { mutableStateOf<SftpServerConfig?>(null) }
     var pendingSystemSound by remember { mutableStateOf<Pair<FileEntry, SystemSoundType>?>(null) }
+    var selectionModeActive by remember { mutableStateOf(false) }
     val openLocalFile: (FileEntry) -> Unit = { entry ->
-        if (entry.isReaderSupported()) {
-            runCatching { openBookReader(context, entry) }
+        when {
+            entry.isReaderSupported() -> runCatching { openBookReader(context, entry) }
                 .onFailure { previewEntry = entry }
-        } else {
-            previewEntry = entry
+            ArchiveBrowserActivity.isBrowsableArchiveName(entry.name) ->
+                runCatching { ArchiveBrowserActivity.start(context, entry) }.onFailure { previewEntry = entry }
+            openEnhancedPreview(context, entry, uiState.items) -> Unit
+            else -> previewEntry = entry
         }
     }
     val treeLauncher = rememberLauncherForActivityResult(
@@ -262,8 +284,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = {
-            pendingServerConfig?.let { config -> startFtpServer(context, uiState, config) }
-            pendingServerConfig = null
+            pendingFtpServerConfig?.let { config -> startFtpServer(context, uiState, config) }
+            pendingSftpServerConfig?.let { config -> startSftpServer(context, uiState, config) }
+            pendingFtpServerConfig = null
+            pendingSftpServerConfig = null
         },
     )
     val systemSettingsLauncher = rememberLauncherForActivityResult(
@@ -311,7 +335,18 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) viewModel.refreshStorageVolumes()
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val externallyDeleted = ExternalFileChanges.consumeDeleted()
+                if (externallyDeleted.isNotEmpty()) {
+                    viewModel.refreshStorageVolumes()
+                    viewModel.applyExternalDeletions(externallyDeleted)
+                } else {
+                    // Files may have been renamed or deleted by another application while
+                    // Aura was in the background. Re-read the visible local destination
+                    // instead of keeping a stale folder/category snapshot indefinitely.
+                    viewModel.onAppResumed()
+                }
+            }
         }
         val storageManager = context.getSystemService(StorageManager::class.java)
         val storageCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -381,10 +416,12 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
         containerColor = MaterialTheme.colorScheme.background,
         snackbarHost = { SnackbarHost(snackbarHostState) },
         bottomBar = {
-            AuraBottomNavigation(
-                selected = uiState.activeSection,
-                onSelect = viewModel::selectSection,
-            )
+            if (!selectionModeActive) {
+                AuraBottomNavigation(
+                    selected = uiState.activeSection,
+                    onSelect = viewModel::selectSection,
+                )
+            }
         },
     ) { padding ->
         AnimatedContent(
@@ -431,13 +468,13 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                     onSecondaryBack = viewModel::navigateSecondaryBack,
                     onRefreshSecondary = viewModel::refreshSecondaryFolder,
                     onCopyToOtherPane = viewModel::copyToOtherPane,
+                    onSelectionModeChanged = { selectionModeActive = it },
                 )
             } else {
                 when (uiState.activeSection) {
                     MainSection.Browse -> HomeScreen(
                         state = uiState,
                         onChooseRoot = { treeLauncher.launch(null) },
-                        onOpenRoot = viewModel::openRoot,
                         onOpenFavorites = viewModel::openFavorites,
                         onOpenVolume = { volume ->
                             val mountedVolume = volume.volume
@@ -452,7 +489,6 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                             runCatching { context.startActivity(intent) }
                                 .onFailure { context.startActivity(Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)) }
                         },
-                        onReconnect = { treeLauncher.launch(null) },
                         onAnalyze = viewModel::analyzeStorage,
                         onOpenCategory = viewModel::openCategory,
                         onFullAccess = {
@@ -479,16 +515,27 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onShare = { entries ->
                             viewModel.prepareShare(entries) { intent -> shareFiles(context, intent) }
                         },
+                        onSelectionModeChanged = { selectionModeActive = it },
                     )
                     MainSection.Network -> FtpScreen(
                         state = uiState,
                         serverStatus = ftpServerStatus,
+                        sftpServerStatus = sftpServerStatus,
                         onOpenSettings = { settingsOpen = true },
                         onScanLan = viewModel::scanLan,
-                        onConnectProfile = viewModel::connectNetworkProfile,
-                        onTestProfile = viewModel::testNetworkProfile,
+                        onConnectProfile = { profile ->
+                            if (profile.protocol == NetworkProtocol.SFTP) openSftpWorkspace(profile)
+                            else viewModel.connectNetworkProfile(profile)
+                        },
+                        onTestProfile = { profile ->
+                            if (profile.protocol == NetworkProtocol.SFTP) openSftpWorkspace(profile)
+                            else viewModel.testNetworkProfile(profile)
+                        },
                         onDuplicateProfile = viewModel::duplicateNetworkProfile,
                         onDeleteProfile = viewModel::deleteNetworkProfile,
+                        onLoadSftpProfile = viewModel::sftpProfile,
+                        onSaveSftpProfile = viewModel::saveSftpProfile,
+                        onOpenSftpProfile = openSftpWorkspace,
                         onConnectSmb = viewModel::connectSmb,
                         onSelectSmbShare = viewModel::selectSmbShare,
                         onDisconnectSmb = viewModel::disconnectSmb,
@@ -516,13 +563,25 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                                 ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
                             ) {
-                                pendingServerConfig = config
+                                pendingFtpServerConfig = config
                                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                             } else {
                                 startFtpServer(context, uiState, config)
                             }
                         },
                         onStopServer = { FtpServerService.stop(context) },
+                        onStartSftpServer = { config ->
+                            if (
+                                Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) {
+                                pendingSftpServerConfig = config
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            } else {
+                                startSftpServer(context, uiState, config)
+                            }
+                        },
+                        onStopSftpServer = { SftpServerService.stop(context) },
                     )
                     MainSection.Cleanup -> CleanupScreen(
                         state = uiState,
@@ -555,6 +614,7 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
             onShowThumbnailFiles = viewModel::setShowThumbnailFiles,
             onGridThumbnails = viewModel::setShowGridThumbnails,
             onFavoritesHome = viewModel::setShowFavoritesOnHome,
+            onDeleteAnimationMode = viewModel::setDeleteAnimationMode,
             onChooseFolder = {
                 settingsOpen = false
                 treeLauncher.launch(null)
@@ -571,11 +631,9 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
 private fun HomeScreen(
     state: FileManagerUiState,
     onChooseRoot: () -> Unit,
-    onOpenRoot: () -> Unit,
     onOpenFavorites: () -> Unit,
     onOpenVolume: (StorageVolumeInfo) -> Unit,
     onStorageSettings: () -> Unit,
-    onReconnect: () -> Unit,
     onAnalyze: () -> Unit,
     onOpenCategory: (FileCategory) -> Unit,
     onFullAccess: () -> Unit,
@@ -615,30 +673,26 @@ private fun HomeScreen(
                 }
             }
         }
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                LocationCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Rounded.Smartphone,
-                    title = "На устройстве",
-                    subtitle = state.folderStack.firstOrNull()?.label
-                        ?: if (state.rootConnected) "Папка подключена" else "Выбрать папку",
-                    tint = AuraBlue,
-                    onClick = if (state.rootConnected) onOpenRoot else onChooseRoot,
-                    onReconnect = if (state.rootConnected) onReconnect else null,
-                )
-                LocationCard(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Rounded.Storage,
-                    title = "Весь накопитель",
-                    subtitle = when {
-                        state.accessMode == StorageAccessMode.Full -> "Активен"
-                        state.fullAccessGranted -> "Разрешён"
-                        else -> "Настроить доступ"
-                    },
-                    tint = AuraOrange,
-                    onClick = onFullAccess,
-                )
+        if (!state.rootConnected) {
+            item {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    LocationCard(
+                        modifier = Modifier.weight(1f),
+                        icon = Icons.Rounded.Smartphone,
+                        title = "На устройстве",
+                        subtitle = "Выбрать папку",
+                        tint = AuraBlue,
+                        onClick = onChooseRoot,
+                    )
+                    LocationCard(
+                        modifier = Modifier.weight(1f),
+                        icon = Icons.Rounded.Storage,
+                        title = "Весь накопитель",
+                        subtitle = if (state.fullAccessGranted) "Использовать доступ" else "Настроить доступ",
+                        tint = AuraOrange,
+                        onClick = onFullAccess,
+                    )
+                }
             }
         }
         if (state.storageVolumes.isNotEmpty()) {
@@ -696,12 +750,16 @@ private fun HomeScreen(
 private fun FtpScreen(
     state: FileManagerUiState,
     serverStatus: FtpServerStatus,
+    sftpServerStatus: SftpServerStatus,
     onOpenSettings: () -> Unit,
     onScanLan: () -> Unit,
     onConnectProfile: (NetworkProfile) -> Unit,
     onTestProfile: (NetworkProfile) -> Unit,
     onDuplicateProfile: (NetworkProfile) -> Unit,
     onDeleteProfile: (NetworkProfile) -> Unit,
+    onLoadSftpProfile: (NetworkProfile?) -> SftpProfile?,
+    onSaveSftpProfile: (SftpProfile) -> NetworkProfile,
+    onOpenSftpProfile: (NetworkProfile) -> Unit,
     onConnectSmb: (SmbProfile) -> Unit,
     onSelectSmbShare: (String) -> Unit,
     onDisconnectSmb: () -> Unit,
@@ -726,14 +784,26 @@ private fun FtpScreen(
     onDelete: (FtpEntry) -> Unit,
     onStartServer: (FtpServerConfig) -> Unit,
     onStopServer: () -> Unit,
+    onStartSftpServer: (SftpServerConfig) -> Unit,
+    onStopSftpServer: () -> Unit,
 ) {
     var settingsOpen by remember { mutableStateOf(false) }
     var ftpDialogInitial by remember { mutableStateOf<FtpProfile?>(null) }
     var smbSettingsOpen by remember { mutableStateOf(false) }
     var smbDialogInitial by remember { mutableStateOf<SmbProfile?>(null) }
     var smbCreateFolderOpen by remember { mutableStateOf(false) }
+    var sftpSettingsOpen by remember { mutableStateOf(false) }
+    var sftpDialogInitial by remember { mutableStateOf<SftpProfile?>(null) }
     var createFolderOpen by remember { mutableStateOf(false) }
     var serverSettingsOpen by remember { mutableStateOf(false) }
+    var sftpServerSettingsOpen by remember { mutableStateOf(false) }
+    var connectSectionExpanded by remember { mutableStateOf(false) }
+    var serverSectionExpanded by remember { mutableStateOf(serverStatus.running || sftpServerStatus.running) }
+    val savedSftpProfile = state.networkProfiles.firstOrNull { it.protocol == NetworkProtocol.SFTP }
+
+    LaunchedEffect(serverStatus.running, sftpServerStatus.running) {
+        if (serverStatus.running || sftpServerStatus.running) serverSectionExpanded = true
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -741,17 +811,6 @@ private fun FtpScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item { LargeTitleRow("Сеть", onSettings = onOpenSettings) }
-        if (state.networkProfiles.isNotEmpty()) {
-            item {
-                NetworkProfilesCard(
-                    profiles = state.networkProfiles,
-                    onConnect = onConnectProfile,
-                    onTest = onTestProfile,
-                    onDuplicate = onDuplicateProfile,
-                    onDelete = onDeleteProfile,
-                )
-            }
-        }
         item {
             LanDevicesCard(
                 devices = state.lanDevices,
@@ -772,28 +831,105 @@ private fun FtpScreen(
                     ftpDialogInitial = FtpProfile(name = device.name, host = device.address, username = "", password = "")
                     settingsOpen = true
                 },
-                onManualSmb = {
-                    smbDialogInitial = state.smbProfile
-                    smbSettingsOpen = true
+                onSftp = { device ->
+                    sftpDialogInitial = SftpProfile(
+                        name = device.name,
+                        host = device.address,
+                        port = 22,
+                        username = "",
+                    )
+                    sftpSettingsOpen = true
                 },
             )
         }
         item {
-            SmbConnectionCard(
-                state = state,
-                onConfigure = {
-                    smbDialogInitial = state.smbProfile
-                    smbSettingsOpen = true
-                },
-                onConnect = {
-                    val profile = state.smbProfile
-                    if (profile == null) {
-                        smbDialogInitial = null
+            ExpandableNetworkSection(
+                title = "Подключиться к",
+                subtitle = "SMB, FTP, SFTP и сохранённые подключения",
+                icon = Icons.Rounded.Language,
+                accent = AuraPurple,
+                expanded = connectSectionExpanded,
+                onToggle = { connectSectionExpanded = !connectSectionExpanded },
+            ) {
+                if (state.networkProfiles.isNotEmpty()) {
+                    NetworkProfilesCard(
+                        profiles = state.networkProfiles,
+                        onConnect = onConnectProfile,
+                        onTest = onTestProfile,
+                        onDuplicate = onDuplicateProfile,
+                        onDelete = onDeleteProfile,
+                        deleteAnimationMode = state.deleteAnimationMode,
+                    )
+                }
+                SmbConnectionCard(
+                    state = state,
+                    onConfigure = {
+                        smbDialogInitial = state.smbProfile
                         smbSettingsOpen = true
-                    } else onConnectSmb(profile)
+                    },
+                    onConnect = {
+                        val profile = state.smbProfile
+                        if (profile == null) {
+                            smbDialogInitial = null
+                            smbSettingsOpen = true
+                        } else onConnectSmb(profile)
+                    },
+                    onDisconnect = onDisconnectSmb,
+                )
+                FtpConnectionCard(
+                    state = state,
+                    onConfigure = {
+                        ftpDialogInitial = state.ftpProfile
+                        settingsOpen = true
+                    },
+                    onConnect = { profile -> onConnect(profile) },
+                )
+                SftpConnectionCard(
+                    profile = savedSftpProfile,
+                    onConfigure = {
+                        sftpDialogInitial = onLoadSftpProfile(savedSftpProfile)
+                        sftpSettingsOpen = true
+                    },
+                    onConnect = {
+                        if (savedSftpProfile == null) {
+                            sftpDialogInitial = null
+                            sftpSettingsOpen = true
+                        } else {
+                            onOpenSftpProfile(savedSftpProfile)
+                        }
+                    },
+                )
+            }
+        }
+        item {
+            ExpandableNetworkSection(
+                title = "Создать сервер",
+                subtitle = when {
+                    serverStatus.running && sftpServerStatus.running ->
+                        "FTP и SFTP работают · подключений: ${serverStatus.clients + sftpServerStatus.clients}"
+                    serverStatus.running -> "FTP работает · подключений: ${serverStatus.clients}"
+                    sftpServerStatus.running -> "SFTP работает · подключений: ${sftpServerStatus.clients}"
+                    else -> "FTP или защищённый SFTP-сервер на телефоне"
                 },
-                onDisconnect = onDisconnectSmb,
-            )
+                icon = Icons.Rounded.Smartphone,
+                accent = if (serverStatus.running || sftpServerStatus.running) AuraGreen else AuraBlue,
+                expanded = serverSectionExpanded,
+                onToggle = { serverSectionExpanded = !serverSectionExpanded },
+            ) {
+                FtpServerCard(
+                    status = serverStatus,
+                    rootConnected = state.rootConnected,
+                    onConfigure = { serverSettingsOpen = true },
+                    onStop = onStopServer,
+                )
+                SftpHostServerCard(
+                    status = sftpServerStatus,
+                    rootConnected = state.rootConnected,
+                    fullAccessGranted = state.fullAccessGranted,
+                    onConfigure = { sftpServerSettingsOpen = true },
+                    onStop = onStopSftpServer,
+                )
+            }
         }
         if (state.smbConnected) {
             item {
@@ -899,84 +1035,32 @@ private fun FtpScreen(
                         Text("Общая папка пуста", modifier = Modifier.fillMaxWidth().padding(30.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                else -> item {
-                    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+                else -> itemsIndexed(
+                    items = state.smbItems,
+                    key = { _, entry -> "smb:${entry.path}" },
+                ) { index, entry ->
+                    val shape = networkListRowShape(index, state.smbItems.lastIndex)
+                    Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
                         Column {
-                            state.smbItems.forEachIndexed { index, entry ->
-                                SmbFileRow(
-                                    entry = entry,
-                                    busy = state.smbTransferLabel != null,
-                                    onOpen = { onOpenSmb(entry) },
-                                    onDownload = { onDownloadSmb(entry) },
-                                    onRename = { name -> onRenameSmb(entry, name) },
-                                    onDelete = { recursive -> onDeleteSmb(entry, recursive) },
+                            SmbFileRow(
+                                entry = entry,
+                                busy = state.smbTransferLabel != null,
+                                onOpen = { onOpenSmb(entry) },
+                                onDownload = { onDownloadSmb(entry) },
+                                onRename = { name -> onRenameSmb(entry, name) },
+                                onDelete = { recursive -> onDeleteSmb(entry, recursive) },
+                            )
+                            if (index != state.smbItems.lastIndex) {
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(start = 66.dp),
+                                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
                                 )
-                                if (index != state.smbItems.lastIndex) {
-                                    HorizontalDivider(modifier = Modifier.padding(start = 66.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
-                                }
                             }
                         }
                     }
                 }
             }
         }
-        item {
-            Surface(
-                shape = RoundedCornerShape(22.dp),
-                color = MaterialTheme.colorScheme.surface,
-            ) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconBubble(Icons.Rounded.Language, if (state.ftpConnected) AuraGreen else AuraOrange)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(state.ftpProfile?.name ?: "FTP-сервер", fontWeight = FontWeight.SemiBold)
-                            Text(
-                                when {
-                                    state.ftpLoading -> "Подключение…"
-                                    state.ftpConnected -> "Подключено · keep-alive 25 с"
-                                    state.ftpProfile != null -> "Соединение закрыто"
-                                    else -> "Добавьте подключение"
-                                },
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 12.sp,
-                            )
-                        }
-                        TextButton(onClick = { ftpDialogInitial = state.ftpProfile; settingsOpen = true }) { Text("Настроить") }
-                    }
-                    if (!state.ftpConnected) {
-                        Button(
-                            onClick = {
-                                val profile = state.ftpProfile
-                                if (profile == null) {
-                                    ftpDialogInitial = null
-                                    settingsOpen = true
-                                } else onConnect(profile)
-                            },
-                            enabled = !state.ftpLoading,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Text(if (state.ftpProfile == null) "Добавить FTP" else "Подключиться снова")
-                        }
-                    } else {
-                        Text(
-                            "Если Android усыпит сеть, Aura автоматически выполнит повторный вход перед следующей командой.",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 12.sp,
-                        )
-                    }
-                }
-            }
-        }
-        item {
-            FtpServerCard(
-                status = serverStatus,
-                rootConnected = state.rootConnected,
-                onConfigure = { serverSettingsOpen = true },
-                onStop = onStopServer,
-            )
-        }
-
         if (state.ftpConnected) {
             item {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
@@ -1044,24 +1128,26 @@ private fun FtpScreen(
                         )
                     }
                 }
-                else -> item {
-                    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+                else -> itemsIndexed(
+                    items = state.ftpItems,
+                    key = { _, entry -> "ftp:${entry.path}" },
+                ) { index, entry ->
+                    val shape = networkListRowShape(index, state.ftpItems.lastIndex)
+                    Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
                         Column {
-                            state.ftpItems.forEachIndexed { index, entry ->
-                                FtpFileRow(
-                                    entry = entry,
-                                    busy = state.ftpTransferLabel != null,
-                                    onOpen = { onOpen(entry) },
-                                    onDownload = { onDownload(entry) },
-                                    onRename = { name -> onRename(entry, name) },
-                                    onDelete = { onDelete(entry) },
+                            FtpFileRow(
+                                entry = entry,
+                                busy = state.ftpTransferLabel != null,
+                                onOpen = { onOpen(entry) },
+                                onDownload = { onDownload(entry) },
+                                onRename = { name -> onRename(entry, name) },
+                                onDelete = { onDelete(entry) },
+                            )
+                            if (index != state.ftpItems.lastIndex) {
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(start = 66.dp),
+                                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
                                 )
-                                if (index != state.ftpItems.lastIndex) {
-                                    HorizontalDivider(
-                                        modifier = Modifier.padding(start = 66.dp),
-                                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                                    )
-                                }
                             }
                         }
                     }
@@ -1093,6 +1179,17 @@ private fun FtpScreen(
             onConfirm = { profile -> smbSettingsOpen = false; onConnectSmb(profile) },
         )
     }
+    if (sftpSettingsOpen) {
+        SftpConnectionDialog(
+            initial = sftpDialogInitial,
+            onDismiss = { sftpSettingsOpen = false },
+            onConfirm = { profile ->
+                sftpSettingsOpen = false
+                val saved = onSaveSftpProfile(profile)
+                onOpenSftpProfile(saved)
+            },
+        )
+    }
     if (createFolderOpen) {
         NameDialog(
             title = "Новая папка на FTP",
@@ -1111,6 +1208,22 @@ private fun FtpScreen(
             },
         )
     }
+    if (sftpServerSettingsOpen) {
+        SftpServerConfigDialog(
+            onDismiss = { sftpServerSettingsOpen = false },
+            onConfirm = { config ->
+                sftpServerSettingsOpen = false
+                onStartSftpServer(config)
+            },
+        )
+    }
+}
+
+private fun networkListRowShape(index: Int, lastIndex: Int): RoundedCornerShape = when {
+    lastIndex <= 0 -> RoundedCornerShape(22.dp)
+    index == 0 -> RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+    index == lastIndex -> RoundedCornerShape(bottomStart = 22.dp, bottomEnd = 22.dp)
+    else -> RoundedCornerShape(0.dp)
 }
 
 @Composable
@@ -1120,7 +1233,7 @@ private fun LanDevicesCard(
     onScan: () -> Unit,
     onSmb: (LanDevice) -> Unit,
     onFtp: (LanDevice) -> Unit,
-    onManualSmb: () -> Unit,
+    onSftp: (LanDevice) -> Unit,
 ) {
     Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1144,8 +1257,14 @@ private fun LanDevicesCard(
                 HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
                 Row(
                     modifier = Modifier.fillMaxWidth().clickable(
-                        enabled = LanService.Smb in device.services,
-                        onClick = { onSmb(device) },
+                        enabled = device.services.any { it == LanService.Smb || it == LanService.Ssh || it == LanService.Ftp },
+                        onClick = {
+                            when {
+                                LanService.Smb in device.services -> onSmb(device)
+                                LanService.Ssh in device.services -> onSftp(device)
+                                LanService.Ftp in device.services -> onFtp(device)
+                            }
+                        },
                     ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -1170,16 +1289,115 @@ private fun LanDevicesCard(
                     }
                     if (LanService.Smb in device.services) TextButton(onClick = { onSmb(device) }) { Text("SMB") }
                     if (LanService.Ftp in device.services) TextButton(onClick = { onFtp(device) }) { Text("FTP") }
+                    if (LanService.Ssh in device.services) TextButton(onClick = { onSftp(device) }) { Text("SFTP") }
                 }
             }
             if (!scanning && devices.isEmpty()) {
                 Text(
-                    "Пока ничего не найдено. Проверьте одну Wi‑Fi-сеть и отключите в роутере изоляцию клиентов. SMB можно добавить вручную.",
+                    "Пока ничего не найдено. Проверьте одну Wi‑Fi-сеть и отключите в роутере изоляцию клиентов. Для ручного ввода откройте «Подключиться к» ниже.",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     fontSize = 12.sp,
                 )
             }
-            TextButton(onClick = onManualSmb, modifier = Modifier.fillMaxWidth()) { Text("Добавить SMB вручную") }
+        }
+    }
+}
+
+@Composable
+private fun ExpandableNetworkSection(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    accent: Color,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle)
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                IconBubble(icon, accent)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        subtitle,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Icon(
+                    Icons.Rounded.ChevronRight,
+                    contentDescription = if (expanded) "Свернуть" else "Развернуть",
+                    modifier = Modifier.graphicsLayer(rotationZ = if (expanded) 90f else 0f),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f))
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    content()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FtpConnectionCard(
+    state: FileManagerUiState,
+    onConfigure: () -> Unit,
+    onConnect: (FtpProfile) -> Unit,
+) {
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(Icons.Rounded.Language, if (state.ftpConnected) AuraGreen else AuraOrange)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("FTP-сервер", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        when {
+                            state.ftpLoading -> "Подключение…"
+                            state.ftpConnected -> "Подключено · keep-alive 25 с"
+                            state.ftpProfile != null -> "${state.ftpProfile?.name.orEmpty()} · соединение закрыто"
+                            else -> "Удалённый FTP-сервер"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                    )
+                }
+                TextButton(onClick = onConfigure) { Text("Параметры") }
+            }
+            if (!state.ftpConnected) {
+                Button(
+                    onClick = {
+                        val profile = state.ftpProfile
+                        if (profile == null) onConfigure() else onConnect(profile)
+                    },
+                    enabled = !state.ftpLoading,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (state.ftpProfile == null) "Настроить и подключиться" else "Подключиться")
+                }
+            } else {
+                Text(
+                    "Если Android усыпит сеть, Aura автоматически выполнит повторный вход перед следующей командой.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 12.sp,
+                )
+            }
         }
     }
 }
@@ -1191,31 +1409,69 @@ private fun SmbConnectionCard(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconBubble(Icons.Rounded.Storage, if (state.smbConnected) AuraGreen else AuraBlue)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text(state.smbProfile?.name ?: "Сетевой компьютер SMB", fontWeight = FontWeight.SemiBold)
+                    Text("SMB-сервер", fontWeight = FontWeight.SemiBold)
                     Text(
                         when {
                             state.smbLoading -> "Подключение…"
                             state.smbConnected -> "SMB2/3 · ${state.smbProfile?.host.orEmpty()}"
+                            state.smbProfile != null -> "${state.smbProfile?.name.orEmpty()} · ${state.smbProfile?.host.orEmpty()}"
                             else -> "Windows, macOS, NAS и роутеры"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 12.sp,
                     )
                 }
-                TextButton(onClick = onConfigure) { Text("Настроить") }
+                TextButton(onClick = onConfigure) { Text("Параметры") }
             }
             if (state.smbConnected) {
                 TextButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("Отключить SMB") }
             } else {
                 Button(onClick = onConnect, enabled = !state.smbLoading, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (state.smbProfile == null) "Добавить SMB" else "Подключиться")
+                    Text(if (state.smbProfile == null) "Настроить и подключиться" else "Подключиться")
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SftpConnectionCard(
+    profile: NetworkProfile?,
+    onConfigure: () -> Unit,
+    onConnect: () -> Unit,
+) {
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(Icons.Rounded.Lock, AuraPurple)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("SFTP-сервер", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (profile == null) {
+                            "SFTP через SSH · обычно порт 22"
+                        } else {
+                            "${profile.name} · ${profile.host}:${profile.port}"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                    )
+                }
+                TextButton(onClick = onConfigure) { Text("Параметры") }
+            }
+            Text(
+                "Шифрованное подключение к Windows OpenSSH, Linux, NAS и серверам.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 12.sp,
+            )
+            Button(onClick = onConnect, modifier = Modifier.fillMaxWidth()) {
+                Text(if (profile == null) "Настроить и подключиться" else "Открыть SFTP")
             }
         }
     }
@@ -1229,19 +1485,19 @@ private fun FtpServerCard(
     onStop: () -> Unit,
 ) {
     val context = LocalContext.current
-    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconBubble(Icons.Rounded.Smartphone, if (status.running) AuraGreen else AuraBlue)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("Сервер на телефоне", fontWeight = FontWeight.SemiBold)
+                    Text("FTP-сервер на телефоне", fontWeight = FontWeight.SemiBold)
                     Text(
                         when {
                             status.starting -> "Запуск…"
                             status.running -> "Работает · подключений: ${status.clients}"
                             status.error != null -> "Не запущен"
-                            else -> "Доступ к файлам с компьютера"
+                            else -> "Доступ к файлам телефона с компьютера"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 12.sp,
@@ -1306,7 +1562,7 @@ private fun FtpServerCard(
                     onClick = onConfigure,
                     modifier = Modifier.fillMaxWidth(),
                     enabled = rootConnected && !status.starting,
-                ) { Text(if (rootConnected) "Запустить сервер" else "Сначала подключите папку") }
+                ) { Text(if (rootConnected) "Настроить и запустить FTP-сервер" else "Сначала подключите папку") }
                 Text(
                     "Сервер публикует только подключённую в Aura папку и работает до нажатия «Остановить».",
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1315,6 +1571,190 @@ private fun FtpServerCard(
             }
         }
     }
+}
+
+@Composable
+private fun SftpHostServerCard(
+    status: SftpServerStatus,
+    rootConnected: Boolean,
+    fullAccessGranted: Boolean,
+    onConfigure: () -> Unit,
+    onStop: () -> Unit,
+) {
+    val context = LocalContext.current
+    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerLow) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBubble(Icons.Rounded.Lock, if (status.running) AuraGreen else AuraPurple)
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("SFTP-сервер на телефоне", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        when {
+                            status.starting -> "Запуск…"
+                            status.running -> "Работает · подключений: ${status.clients}"
+                            else -> "SSH/SFTP · шифрованная передача файлов"
+                        },
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+            status.error?.let {
+                Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+            }
+            if (status.running) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text("Адрес", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+                    SelectionContainer {
+                        Column {
+                            status.endpoints.forEach { endpoint -> Text(endpoint, fontWeight = FontWeight.SemiBold) }
+                        }
+                    }
+                    PropertyRow("Логин", status.username)
+                    PropertyRow("Пароль", status.password)
+                    PropertyRow("Папка", status.rootLabel)
+                    Text(
+                        if (status.readOnly) "Режим: только чтение" else "Режим: чтение и запись",
+                        color = if (status.readOnly) AuraBlue else AuraOrange,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        modifier = Modifier.weight(1f),
+                        onClick = {
+                            val details = buildString {
+                                appendLine(status.endpoints.firstOrNull().orEmpty())
+                                appendLine("Логин: ${status.username}")
+                                append("Пароль: ${status.password}")
+                            }
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            clipboard.setPrimaryClip(ClipData.newPlainText("Aura SFTP", details))
+                            Toast.makeText(context, "Реквизиты скопированы", Toast.LENGTH_SHORT).show()
+                        },
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = null)
+                        Spacer(Modifier.width(5.dp))
+                        Text("Копировать")
+                    }
+                    Button(modifier = Modifier.weight(1f), onClick = onStop) { Text("Остановить") }
+                }
+                Text(
+                    "SFTP шифрует логин, пароль и файлы. Aura поднимает только файловый SFTP-подсервис — командной SSH-оболочки нет.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+            } else {
+                Button(
+                    onClick = onConfigure,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = rootConnected && !status.starting,
+                ) {
+                    Text(if (rootConnected) "Настроить и запустить SFTP-сервер" else "Сначала подключите папку")
+                }
+                Text(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !fullAccessGranted) {
+                        "Для SFTP-сервера нужен прямой доступ Android к локальной памяти. В Aura включите «Весь накопитель». FTP при этом продолжает работать и с обычной выбранной папкой."
+                    } else {
+                        "Публикуется подключённая локальная память/SD-карта. Облачные SAF-папки как корень SFTP-сервера не поддерживаются."
+                    },
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SftpServerConfigDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (SftpServerConfig) -> Unit,
+) {
+    var port by remember { mutableStateOf("2222") }
+    var username by remember { mutableStateOf("aura") }
+    var password by remember { mutableStateOf(generateFtpPassword()) }
+    var readOnly by remember { mutableStateOf(true) }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
+        title = { Text("Настройка SFTP-сервера на телефоне") },
+        text = {
+            Column(
+                modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    "Корнем станет подключённая локальная память. По умолчанию используется порт 2222; соединение шифруется SSH.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 12.sp,
+                )
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter(Char::isDigit).take(5) },
+                    label = { Text("Порт") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it.take(64) },
+                    label = { Text("Логин") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it.take(64) },
+                    label = { Text("Пароль") },
+                    singleLine = true,
+                    supportingText = { Text("Показывается открыто, чтобы ввести на другом устройстве") },
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Lock, contentDescription = null, tint = if (readOnly) AuraGreen else AuraOrange)
+                    Spacer(Modifier.width(9.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Только чтение", fontWeight = FontWeight.Medium)
+                        Text(
+                            if (readOnly) "Клиент сможет только читать и скачивать" else "Разрешены загрузка, удаление и переименование",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Switch(checked = readOnly, onCheckedChange = { readOnly = it })
+                }
+                Text(
+                    "Подключения принимаются только из локальной/частной сети. Командная SSH-оболочка намеренно отключена — работает только SFTP.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp,
+                )
+                localError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val parsedPort = port.toIntOrNull()
+                when {
+                    parsedPort == null || parsedPort !in 1024..65535 -> localError = "Порт должен быть от 1024 до 65535"
+                    username.length !in 3..64 || username.any(Char::isWhitespace) -> localError = "Логин: 3–64 символа без пробелов"
+                    password.length < 8 -> localError = "Пароль должен содержать не менее 8 символов"
+                    password.any { it == '\r' || it == '\n' || it == '\u0000' } -> localError = "Некорректный пароль"
+                    else -> onConfirm(SftpServerConfig(parsedPort, username, password, readOnly))
+                }
+            }) { Text("Запустить") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
 }
 
 @Composable
@@ -1331,7 +1771,7 @@ private fun FtpServerConfigDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { Icon(Icons.Rounded.Smartphone, contentDescription = null) },
-        title = { Text("FTP-сервер на телефоне") },
+        title = { Text("Настройка FTP-сервера на телефоне") },
         text = {
             Column(
                 modifier = Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
@@ -1446,10 +1886,18 @@ private fun SmbFileRow(
     var menuOpen by remember { mutableStateOf(false) }
     var renameOpen by remember { mutableStateOf(false) }
     var deleteOpen by remember { mutableStateOf(false) }
+    var dissolving by remember(entry.path) { mutableStateOf(false) }
+    val context = LocalContext.current
+    val deleteAnimationMode = remember(context) { com.aurafiles.app.data.FileRepository(context.applicationContext).deleteAnimationMode() }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(busy) {
+        if (!busy) dissolving = false
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = entry.isDirectory && !busy, onClick = onOpen)
+            .auraDeleteEffect(dissolving, deleteAnimationMode, entry.path.hashCode())
+            .clickable(enabled = entry.isDirectory && !busy && !dissolving, onClick = onOpen)
             .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1508,11 +1956,140 @@ private fun SmbFileRow(
                 )
             },
             confirmButton = {
-                Button(onClick = { deleteOpen = false; onDelete(entry.isDirectory) }) { Text("Удалить") }
+                Button(onClick = {
+                    deleteOpen = false
+                    dissolving = true
+                    scope.launch {
+                        val wait = deleteAnimationMode.preDeleteDelayMillis()
+                        if (wait > 0L) delay(wait)
+                        onDelete(entry.isDirectory)
+                    }
+                }) { Text("Удалить") }
             },
             dismissButton = { TextButton(onClick = { deleteOpen = false }) { Text("Отмена") } },
         )
     }
+}
+
+@Composable
+private fun SftpConnectionDialog(
+    initial: SftpProfile?,
+    onDismiss: () -> Unit,
+    onConfirm: (SftpProfile) -> Unit,
+) {
+    var name by remember(initial) { mutableStateOf(initial?.name ?: "SFTP") }
+    var host by remember(initial) { mutableStateOf(initial?.host.orEmpty()) }
+    var port by remember(initial) { mutableStateOf((initial?.port ?: 22).toString()) }
+    var username by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
+    var password by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
+    var privateKey by remember(initial) { mutableStateOf(initial?.privateKey.orEmpty()) }
+    var passphrase by remember(initial) { mutableStateOf(initial?.privateKeyPassphrase.orEmpty()) }
+    var initialPath by remember(initial) { mutableStateOf(initial?.initialPath ?: "/") }
+    var advanced by remember(initial) {
+        mutableStateOf(initial?.usesKey == true || initial?.initialPath?.let { it != "/" } == true)
+    }
+    var localError by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Rounded.Lock, contentDescription = null) },
+        title = { Text("SFTP-подключение") },
+        text = {
+            Column(
+                modifier = Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(9.dp),
+            ) {
+                Text(
+                    "SFTP работает поверх SSH. На Windows нужен включённый OpenSSH Server; стандартный порт — 22.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Название") }, singleLine = true)
+                OutlinedTextField(value = host, onValueChange = { host = it }, label = { Text("Сервер или IP") }, singleLine = true)
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter(Char::isDigit).take(5) },
+                    label = { Text("Порт") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    singleLine = true,
+                )
+                OutlinedTextField(value = username, onValueChange = { username = it }, label = { Text("Логин") }, singleLine = true)
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text(if (privateKey.isBlank()) "Пароль" else "Пароль (не используется при ключе)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+                TextButton(onClick = { advanced = !advanced }, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (advanced) "Скрыть дополнительные настройки" else "Ключ SSH и начальная папка")
+                }
+                AnimatedVisibility(visible = advanced) {
+                    Column(verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        OutlinedTextField(
+                            value = privateKey,
+                            onValueChange = { privateKey = it },
+                            label = { Text("Приватный ключ (необязательно)") },
+                            minLines = 3,
+                            maxLines = 7,
+                            supportingText = { Text("Если ключ указан, Aura использует его вместо пароля") },
+                        )
+                        OutlinedTextField(
+                            value = passphrase,
+                            onValueChange = { passphrase = it },
+                            label = { Text("Passphrase ключа") },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = true,
+                        )
+                        OutlinedTextField(
+                            value = initialPath,
+                            onValueChange = { initialPath = it },
+                            label = { Text("Начальная папка") },
+                            supportingText = { Text("Например /home/onda или /C:/Users/Onda") },
+                            singleLine = true,
+                        )
+                    }
+                }
+                Text(
+                    "При первом подключении Aura покажет SHA-256 fingerprint ключа сервера и попросит подтвердить его. Пароль и ключ сохраняются в защищённом хранилище.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                localError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val targetPort = port.toIntOrNull()
+                val targetHost = host.trim()
+                    .removePrefix("sftp://")
+                    .removePrefix("ssh://")
+                    .substringBefore('/')
+                    .substringBefore(':')
+                when {
+                    targetHost.isBlank() -> localError = "Введите адрес сервера"
+                    targetPort == null || targetPort !in 1..65535 -> localError = "Некорректный порт"
+                    username.isBlank() -> localError = "Введите логин"
+                    password.isBlank() && privateKey.isBlank() -> localError = "Введите пароль или приватный ключ"
+                    else -> onConfirm(
+                        SftpProfile(
+                            id = initial?.id.orEmpty(),
+                            name = name.trim().ifBlank { targetHost },
+                            host = targetHost,
+                            port = targetPort,
+                            username = username.trim(),
+                            password = password,
+                            privateKey = privateKey,
+                            privateKeyPassphrase = passphrase,
+                            trustedFingerprint = initial?.trustedFingerprint.orEmpty(),
+                            initialPath = initialPath.trim().ifBlank { "/" },
+                        )
+                    )
+                }
+            }) { Text("Подключиться") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
 }
 
 @Composable
@@ -1613,10 +2190,18 @@ private fun FtpFileRow(
     var menuOpen by remember { mutableStateOf(false) }
     var renameOpen by remember { mutableStateOf(false) }
     var deleteOpen by remember { mutableStateOf(false) }
+    var dissolving by remember(entry.path) { mutableStateOf(false) }
+    val context = LocalContext.current
+    val deleteAnimationMode = remember(context) { com.aurafiles.app.data.FileRepository(context.applicationContext).deleteAnimationMode() }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(busy) {
+        if (!busy) dissolving = false
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = entry.isDirectory && !busy, onClick = onOpen)
+            .auraDeleteEffect(dissolving, deleteAnimationMode, entry.path.hashCode())
+            .clickable(enabled = entry.isDirectory && !busy && !dissolving, onClick = onOpen)
             .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -1671,7 +2256,15 @@ private fun FtpFileRow(
             title = { Text("Удалить ${entry.name} с FTP?") },
             text = { Text(if (entry.isDirectory) "Удалить можно только пустую папку." else "Это действие нельзя отменить.") },
             confirmButton = {
-                TextButton(onClick = { deleteOpen = false; onDelete() }) {
+                TextButton(onClick = {
+                    deleteOpen = false
+                    dissolving = true
+                    scope.launch {
+                        val wait = deleteAnimationMode.preDeleteDelayMillis()
+                        if (wait > 0L) delay(wait)
+                        onDelete()
+                    }
+                }) {
                     Text("Удалить", color = MaterialTheme.colorScheme.error)
                 }
             },
@@ -1949,6 +2542,7 @@ private fun BrowserScreen(
     onSecondaryBack: () -> Boolean,
     onRefreshSecondary: () -> Unit,
     onCopyToOtherPane: (FileEntry, Boolean) -> Unit,
+    onSelectionModeChanged: (Boolean) -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
     var searchVisible by remember { mutableStateOf(false) }
@@ -1960,28 +2554,48 @@ private fun BrowserScreen(
     var archiveEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var batchRenameEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     val context = LocalContext.current
-    val shownItems = sortEntries(
-        entries = state.items.filter {
-            (state.showHidden || !it.name.startsWith('.')) &&
-                (state.showThumbnailFiles || !it.isThumbnailCache()) &&
-                it.name.contains(query, ignoreCase = true)
-        },
-        mode = state.sortMode,
-        ascending = state.sortAscending,
-    )
-    val shownGroups = state.collectionGroups.mapNotNull { group ->
-        val entries = sortEntries(
-            group.entries.filter {
+    val hasCollectionGroups = state.collectionGroups.isNotEmpty()
+    val shownItems = remember(
+        state.items, state.showHidden, state.showThumbnailFiles, query, state.sortMode, state.sortAscending, hasCollectionGroups
+    ) {
+        // Collection screens render their grouped data, so sorting the same 5,000-file list here
+        // as well is pure duplicate work. Skip the flat sort when groups are available.
+        if (hasCollectionGroups) emptyList() else sortEntries(
+            entries = state.items.filter {
                 (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
             },
-            state.sortMode,
-            state.sortAscending,
+            mode = state.sortMode,
+            ascending = state.sortAscending,
         )
-        if (entries.isEmpty()) null else group.copy(entries = entries)
     }
-    val selectedEntries = state.items.filter { it.uri in selectedUris }
+    val shownGroups = remember(
+        state.collectionGroups, state.showHidden, state.showThumbnailFiles, query, state.sortMode, state.sortAscending
+    ) {
+        state.collectionGroups.mapNotNull { group ->
+            val sorted = sortEntries(
+                group.entries.filter {
+                    (state.showHidden || !it.name.startsWith('.')) &&
+                        (state.showThumbnailFiles || !it.isThumbnailCache()) &&
+                        it.name.contains(query, ignoreCase = true)
+                },
+                state.sortMode,
+                state.sortAscending,
+            )
+            val entries = if (state.duplicateOriginalUris.isEmpty()) sorted else
+                sorted.sortedByDescending { it.uri in state.duplicateOriginalUris }
+            if (entries.isEmpty()) null else group.copy(entries = entries)
+        }
+    }
+    val selectedEntries = remember(state.items, selectedUris) { state.items.filter { it.uri in selectedUris } }
+
+    LaunchedEffect(selectedEntries.isNotEmpty()) {
+        onSelectionModeChanged(selectedEntries.isNotEmpty())
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSelectionModeChanged(false) }
+    }
 
     if (state.dualPane) {
         DualPaneBrowser(
@@ -2020,33 +2634,19 @@ private fun BrowserScreen(
         } else {
             SelectionHeader(
                 count = selectedEntries.size,
-                shareEnabled = selectedEntries.isNotEmpty(),
+                shareEnabled = true,
                 dateEnabled = selectedEntries.none(FileEntry::isDirectory),
-                extractEnabled = selectedEntries.size == 1 && selectedEntries.first().name.endsWith(".zip", true),
-                allFavorited = selectedEntries.isNotEmpty() && selectedEntries.all { it.uri in state.favoriteUris },
-                batchRenameEnabled = selectedEntries.size > 1,
-                onClear = { selectedUris = emptySet() },
-                onChangeDate = { dateDialogEntries = selectedEntries },
-                onCopy = {
-                    onClipboardMany(selectedEntries, ClipboardMode.Copy)
-                    selectedUris = emptySet()
-                },
-                onMove = {
-                    onClipboardMany(selectedEntries, ClipboardMode.Move)
-                    selectedUris = emptySet()
-                },
-                onArchive = { archiveEntries = selectedEntries },
-                onExtract = {
-                    onExtractArchive(selectedEntries.first())
-                    selectedUris = emptySet()
-                },
+                allFavorited = selectedEntries.all { it.uri in state.favoriteUris },
                 onFavorite = {
                     onToggleFavorites(selectedEntries)
                     selectedUris = emptySet()
                 },
-                onBatchRename = { batchRenameEntries = selectedEntries },
-                onShare = { onShare(selectedEntries) },
-                onDelete = { deleteEntries = selectedEntries },
+                onShare = {
+                    onShare(selectedEntries)
+                    selectedUris = emptySet()
+                },
+                onChangeDate = { dateDialogEntries = selectedEntries },
+                onClear = { selectedUris = emptySet() },
             )
         }
         if (state.collectionTitle == null) Breadcrumbs(state = state)
@@ -2085,15 +2685,18 @@ private fun BrowserScreen(
             )
         }
 
-        Box(modifier = Modifier.fillMaxSize()) {
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             when {
                 state.loading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
-                shownItems.isEmpty() -> EmptyFolder(modifier = Modifier.align(Alignment.Center))
+                shownItems.isEmpty() && shownGroups.isEmpty() -> EmptyFolder(modifier = Modifier.align(Alignment.Center))
                 state.viewMode == FileViewMode.List -> BrowserListContent(
                     entries = shownItems,
                     groups = shownGroups,
                     selectedUris = selectedUris,
                     selectionMode = selectedEntries.isNotEmpty(),
+                    deletingUris = state.deletingUris,
+                    deleteAnimationMode = state.deleteAnimationMode,
+                    duplicateOriginalUris = state.duplicateOriginalUris,
                     onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else onOpenFile(entry) },
                     onToggleSelection = { entry ->
                         selectedUris = toggleSelection(selectedUris, entry.uri)
@@ -2113,6 +2716,9 @@ private fun BrowserScreen(
                     showThumbnails = state.showGridThumbnails,
                     selectedUris = selectedUris,
                     selectionMode = selectedEntries.isNotEmpty(),
+                    deletingUris = state.deletingUris,
+                    deleteAnimationMode = state.deleteAnimationMode,
+                    duplicateOriginalUris = state.duplicateOriginalUris,
                     onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else onOpenFile(entry) },
                     onToggleSelection = { entry ->
                         selectedUris = toggleSelection(selectedUris, entry.uri)
@@ -2143,6 +2749,26 @@ private fun BrowserScreen(
                         .padding(20.dp),
                 )
             }
+        }
+        if (selectedEntries.isNotEmpty()) {
+            SelectionBottomBar(
+                extractEnabled = selectedEntries.size == 1 && isExtractableArchiveName(selectedEntries.first().name),
+                onCopy = {
+                    onClipboardMany(selectedEntries, ClipboardMode.Copy)
+                    selectedUris = emptySet()
+                },
+                onMove = {
+                    onClipboardMany(selectedEntries, ClipboardMode.Move)
+                    selectedUris = emptySet()
+                },
+                onArchive = { archiveEntries = selectedEntries },
+                onExtract = {
+                    onExtractArchive(selectedEntries.first())
+                    selectedUris = emptySet()
+                },
+                onBatchRename = { batchRenameEntries = selectedEntries },
+                onDelete = { deleteEntries = selectedEntries },
+            )
         }
     }
 
@@ -2177,7 +2803,7 @@ private fun BrowserScreen(
 
     if (archiveEntries.isNotEmpty()) {
         NameDialog(
-            title = "Создать ZIP-архив",
+            title = "Создать архив · ZIP / TAR / GZ / BZ2 / XZ",
             initialValue = if (archiveEntries.size == 1) archiveEntries.first().name.substringBeforeLast('.') else "Архив",
             confirmLabel = "Создать",
             onDismiss = { archiveEntries = emptyList() },
@@ -2244,6 +2870,7 @@ private fun RecentScreen(
     onCalculateHash: (FileEntry) -> Unit,
     onViewMode: (FileViewMode) -> Unit,
     onShare: (List<FileEntry>) -> Unit,
+    onSelectionModeChanged: (Boolean) -> Unit,
 ) {
     val items = state.recentItems
     var selectedUris by remember { mutableStateOf<Set<Uri>>(emptySet()) }
@@ -2253,6 +2880,13 @@ private fun RecentScreen(
     var archiveEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var batchRenameEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     val selectedEntries = items.filter { it.uri in selectedUris }
+
+    LaunchedEffect(selectedEntries.isNotEmpty()) {
+        onSelectionModeChanged(selectedEntries.isNotEmpty())
+    }
+    DisposableEffect(Unit) {
+        onDispose { onSelectionModeChanged(false) }
+    }
 
     BackHandler(enabled = selectedEntries.isNotEmpty()) { selectedUris = emptySet() }
 
@@ -2281,19 +2915,17 @@ private fun RecentScreen(
                 count = selectedEntries.size,
                 shareEnabled = true,
                 dateEnabled = true,
-                extractEnabled = selectedEntries.size == 1 && selectedEntries.first().name.endsWith(".zip", true),
                 allFavorited = selectedEntries.all { it.uri in state.favoriteUris },
-                batchRenameEnabled = selectedEntries.size > 1,
-                onClear = { selectedUris = emptySet() },
+                onFavorite = {
+                    onToggleFavorites(selectedEntries)
+                    selectedUris = emptySet()
+                },
+                onShare = {
+                    onShare(selectedEntries)
+                    selectedUris = emptySet()
+                },
                 onChangeDate = { dateEntries = selectedEntries },
-                onCopy = { onClipboardMany(selectedEntries, ClipboardMode.Copy); selectedUris = emptySet() },
-                onMove = { onClipboardMany(selectedEntries, ClipboardMode.Move); selectedUris = emptySet() },
-                onArchive = { archiveEntries = selectedEntries },
-                onExtract = { onExtractArchive(selectedEntries.first()); selectedUris = emptySet() },
-                onFavorite = { onToggleFavorites(selectedEntries); selectedUris = emptySet() },
-                onBatchRename = { batchRenameEntries = selectedEntries },
-                onShare = { onShare(selectedEntries); selectedUris = emptySet() },
-                onDelete = { deleteEntries = selectedEntries },
+                onClear = { selectedUris = emptySet() },
             )
         }
         if (items.isEmpty()) {
@@ -2312,6 +2944,8 @@ private fun RecentScreen(
                         groups = emptyList(),
                         selectedUris = selectedUris,
                         selectionMode = selectedEntries.isNotEmpty(),
+                        deletingUris = state.deletingUris,
+                        deleteAnimationMode = state.deleteAnimationMode,
                         onOpen = onOpenFile,
                         onToggleSelection = { selectedUris = toggleSelection(selectedUris, it.uri) },
                         onRename = onRename,
@@ -2330,6 +2964,8 @@ private fun RecentScreen(
                         showThumbnails = state.showGridThumbnails,
                         selectedUris = selectedUris,
                         selectionMode = selectedEntries.isNotEmpty(),
+                        deletingUris = state.deletingUris,
+                        deleteAnimationMode = state.deleteAnimationMode,
                         onOpen = onOpenFile,
                         onToggleSelection = { selectedUris = toggleSelection(selectedUris, it.uri) },
                         onRename = onRename,
@@ -2343,6 +2979,17 @@ private fun RecentScreen(
                     )
                 }
             }
+        }
+        if (selectedEntries.isNotEmpty()) {
+            SelectionBottomBar(
+                extractEnabled = selectedEntries.size == 1 && isExtractableArchiveName(selectedEntries.first().name),
+                onCopy = { onClipboardMany(selectedEntries, ClipboardMode.Copy); selectedUris = emptySet() },
+                onMove = { onClipboardMany(selectedEntries, ClipboardMode.Move); selectedUris = emptySet() },
+                onArchive = { archiveEntries = selectedEntries },
+                onExtract = { onExtractArchive(selectedEntries.first()); selectedUris = emptySet() },
+                onBatchRename = { batchRenameEntries = selectedEntries },
+                onDelete = { deleteEntries = selectedEntries },
+            )
         }
     }
 
@@ -2359,7 +3006,7 @@ private fun RecentScreen(
     }
     if (archiveEntries.isNotEmpty()) {
         NameDialog(
-            title = "Создать ZIP",
+            title = "Создать архив · ZIP / TAR / GZ / BZ2 / XZ",
             initialValue = if (archiveEntries.size == 1) archiveEntries.first().name.substringBeforeLast('.') else "Архив",
             confirmLabel = "Создать",
             onDismiss = { archiveEntries = emptyList() },
@@ -2465,8 +3112,8 @@ private fun CleanupScreen(
                         title = "Крупные файлы",
                         subtitle = when {
                             analysis == null -> "Сначала выполните анализ"
-                            analysis.largeFiles.isEmpty() -> "Крупных файлов не найдено"
-                            else -> "Показать ${analysis.largeFiles.size} самых крупных"
+                            analysis.largeFileCount == 0 -> "Крупных файлов не найдено"
+                            else -> "${analysis.largeFileCount} файлов размером от 50 МБ"
                         },
                         onClick = if (analysis == null) onAnalyze else onOpenLargeFiles,
                     )
@@ -2489,8 +3136,8 @@ private fun CleanupScreen(
                         modifier = Modifier.padding(start = 64.dp),
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.55f),
                     )
-                    val temporaryCount = analysis?.files?.count(FileEntry::isTemporaryCandidate) ?: 0
-                    val temporaryBytes = analysis?.files?.filter(FileEntry::isTemporaryCandidate)?.sumOf(FileEntry::size) ?: 0L
+                    val temporaryCount = analysis?.temporaryFileCount ?: 0
+                    val temporaryBytes = analysis?.temporaryBytes ?: 0L
                     RecommendationRow(
                         icon = Icons.Rounded.DeleteForever,
                         tint = AuraOrange,
@@ -2530,6 +3177,8 @@ private fun CleanupScreen(
     if (trashOpen) {
         TrashDialog(
             records = state.trashRecords,
+            deletingUris = state.deletingUris,
+            deleteAnimationMode = state.deleteAnimationMode,
             onRestore = onRestoreTrash,
             onDelete = onDeleteTrash,
             onEmpty = onEmptyTrash,
@@ -2641,7 +3290,7 @@ private fun LargeTitleRow(title: String, onSettings: (() -> Unit)? = null) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Быстрый и аккуратный файловый менеджер для Android.")
                     PropertyRow("Разработчик", "Привалов Олег")
-                    PropertyRow("Версия", "0.13.0")
+                    PropertyRow("Версия", com.aurafiles.app.BuildConfig.VERSION_NAME)
                 }
             },
             confirmButton = {
@@ -2659,9 +3308,11 @@ private fun SettingsPage(
     onShowThumbnailFiles: (Boolean) -> Unit,
     onGridThumbnails: (Boolean) -> Unit,
     onFavoritesHome: (Boolean) -> Unit,
+    onDeleteAnimationMode: (DeleteAnimationMode) -> Unit,
     onChooseFolder: () -> Unit,
     onFullAccess: () -> Unit,
 ) {
+    val context = LocalContext.current
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Column {
@@ -2712,6 +3363,46 @@ private fun SettingsPage(
                             }
                         }
                     }
+                    item { SectionHeader("Анимации") }
+                    item {
+                        Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
+                            Column {
+                                DeleteAnimationChoice(
+                                    title = "Распад на пиксели",
+                                    subtitle = "Основной эффект Aura · срабатывает перед удалением",
+                                    selected = state.deleteAnimationMode == DeleteAnimationMode.Dissolve,
+                                    onClick = { onDeleteAnimationMode(DeleteAnimationMode.Dissolve) },
+                                )
+                                HorizontalDivider(Modifier.padding(start = 16.dp))
+                                DeleteAnimationChoice(
+                                    title = "Песчинки",
+                                    subtitle = "Будто мелкие частицы сдувает ветром",
+                                    selected = state.deleteAnimationMode == DeleteAnimationMode.Smoke,
+                                    onClick = { onDeleteAnimationMode(DeleteAnimationMode.Smoke) },
+                                )
+                                HorizontalDivider(Modifier.padding(start = 16.dp))
+                                DeleteAnimationChoice(
+                                    title = "Сгорание",
+                                    subtitle = "Рваная кромка тлеет, вспыхивает и прогорает внутрь",
+                                    selected = state.deleteAnimationMode == DeleteAnimationMode.Burn,
+                                    onClick = { onDeleteAnimationMode(DeleteAnimationMode.Burn) },
+                                )
+                                HorizontalDivider(Modifier.padding(start = 16.dp))
+                                DeleteAnimationChoice(
+                                    title = "Без анимации",
+                                    subtitle = "Удалять сразу",
+                                    selected = state.deleteAnimationMode == DeleteAnimationMode.Off,
+                                    onClick = { onDeleteAnimationMode(DeleteAnimationMode.Off) },
+                                )
+                            }
+                        }
+                    }
+                    item {
+                        Button(
+                            onClick = { AdvancedSettingsActivity.start(context) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text("Расширенные возможности 0.14") }
+                    }
                     item { SectionHeader("Область работы") }
                     item {
                         Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
@@ -2749,6 +3440,25 @@ private fun SettingsPage(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun DeleteAnimationChoice(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(16.dp, 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, fontWeight = FontWeight.Medium)
+            Text(subtitle, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+        }
+        RadioButton(selected = selected, onClick = onClick)
     }
 }
 
@@ -2898,13 +3608,14 @@ private fun CategoryGrid(
         Triple(FileCategory.Camera, Icons.Rounded.PhotoCamera, AuraPink),
         Triple(FileCategory.Other, Icons.AutoMirrored.Rounded.InsertDriveFile, MaterialTheme.colorScheme.onSurfaceVariant),
     )
+    val categorySummaries = remember(state.analysis) {
+        state.analysis?.categories?.associateBy { it.category }.orEmpty()
+    }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         tiles.chunked(2).forEach { rowTiles ->
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 rowTiles.forEach { (category, icon, tint) ->
-                    val matching = state.analysis?.files?.filter {
-                        it.matchesCategory(category) && (state.showThumbnailFiles || !it.isThumbnailCache())
-                    }
+                    val summary = categorySummaries[category]
                     Surface(
                         modifier = Modifier
                             .weight(1f)
@@ -2919,8 +3630,8 @@ private fun CategoryGrid(
                             Text(
                                 when {
                                     state.analyzing -> "Анализ…"
-                                    matching == null -> "Найти файлы"
-                                    else -> "${matching.size} · ${formatBytes(matching.sumOf(FileEntry::size))}"
+                                    summary == null -> "Найти файлы"
+                                    else -> "${summary.count} · ${formatBytes(summary.bytes)}"
                                 },
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 11.sp,
@@ -2932,6 +3643,10 @@ private fun CategoryGrid(
             }
         }
     }
+}
+
+private fun isExtractableArchiveName(name: String): Boolean {
+    return ArchiveBrowserActivity.isBrowsableArchiveName(name)
 }
 
 private fun categoryLabel(category: FileCategory): String = when (category) {
@@ -3077,6 +3792,9 @@ private fun BrowserListContent(
     groups: List<FileCollectionGroup>,
     selectedUris: Set<Uri>,
     selectionMode: Boolean,
+    deletingUris: Set<Uri> = emptySet(),
+    deleteAnimationMode: DeleteAnimationMode = DeleteAnimationMode.Dissolve,
+    duplicateOriginalUris: Set<Uri> = emptySet(),
     onOpen: (FileEntry) -> Unit,
     onToggleSelection: (FileEntry) -> Unit,
     onRename: (FileEntry, String) -> Unit,
@@ -3111,13 +3829,22 @@ private fun BrowserListContent(
                     index == group.entries.lastIndex -> RoundedCornerShape(bottomStart = 22.dp, bottomEnd = 22.dp)
                     else -> RoundedCornerShape(0.dp)
                 }
-                Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
+                Surface(
+                    modifier = Modifier.auraDeleteEffect(
+                        active = entry.uri in deletingUris,
+                        mode = deleteAnimationMode,
+                        seed = entry.uri.toString().hashCode(),
+                    ),
+                    shape = shape,
+                    color = MaterialTheme.colorScheme.surface,
+                ) {
                     Column {
                         BrowserFileRow(
                             entry = entry,
                             selected = entry.uri in selectedUris,
                             selectionMode = selectionMode,
                             showLocation = groups.isNotEmpty(),
+                            duplicateOriginal = entry.uri in duplicateOriginalUris,
                             onClick = { onOpen(entry) },
                             onToggleSelection = { onToggleSelection(entry) },
                             onRename = { onRename(entry, it) },
@@ -3149,6 +3876,9 @@ private fun BrowserGridContent(
     showThumbnails: Boolean,
     selectedUris: Set<Uri>,
     selectionMode: Boolean,
+    deletingUris: Set<Uri> = emptySet(),
+    deleteAnimationMode: DeleteAnimationMode = DeleteAnimationMode.Dissolve,
+    duplicateOriginalUris: Set<Uri> = emptySet(),
     onOpen: (FileEntry) -> Unit,
     onToggleSelection: (FileEntry) -> Unit,
     onRename: (FileEntry, String) -> Unit,
@@ -3183,11 +3913,19 @@ private fun BrowserGridContent(
                 }
             }
             items(group.entries, key = { it.uri.toString() }) { entry ->
-                GridFileTile(
+                Box(
+                    Modifier.auraDeleteEffect(
+                        active = entry.uri in deletingUris,
+                        mode = deleteAnimationMode,
+                        seed = entry.uri.toString().hashCode(),
+                    )
+                ) {
+                    GridFileTile(
                     entry = entry,
                     selected = entry.uri in selectedUris,
                     selectionMode = selectionMode,
                     showThumbnail = showThumbnails,
+                    duplicateOriginal = entry.uri in duplicateOriginalUris,
                     onClick = { onOpen(entry) },
                     onToggleSelection = { onToggleSelection(entry) },
                     onRename = { onRename(entry, it) },
@@ -3198,7 +3936,8 @@ private fun BrowserGridContent(
                     onOpenExternal = { onOpenExternal(entry) },
                     onSetSystemSound = { type -> onSetSystemSound(entry, type) },
                     onProperties = { onProperties(entry) },
-                )
+                    )
+                }
             }
         }
     }
@@ -3210,6 +3949,7 @@ private fun GridFileTile(
     selected: Boolean,
     selectionMode: Boolean,
     showThumbnail: Boolean,
+    duplicateOriginal: Boolean = false,
     onClick: () -> Unit,
     onToggleSelection: () -> Unit,
     onRename: (String) -> Unit,
@@ -3261,6 +4001,15 @@ private fun GridFileTile(
                         color = AuraOrange.copy(alpha = 0.90f),
                     ) {
                         Text("временный", modifier = Modifier.padding(6.dp, 3.dp), color = Color.White, fontSize = 9.sp)
+                    }
+                }
+                if (duplicateOriginal) {
+                    Surface(
+                        modifier = Modifier.align(Alignment.BottomStart).padding(8.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        color = AuraGreen.copy(alpha = 0.94f),
+                    ) {
+                        Text("ОРИГИНАЛ?", modifier = Modifier.padding(7.dp, 3.dp), color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     }
                 }
                 Box(modifier = Modifier.align(Alignment.TopEnd)) {
@@ -3371,6 +4120,7 @@ private fun BrowserFileRow(
     selected: Boolean,
     selectionMode: Boolean,
     showLocation: Boolean = false,
+    duplicateOriginal: Boolean = false,
     onClick: () -> Unit,
     onToggleSelection: () -> Unit,
     onRename: (String) -> Unit,
@@ -3405,12 +4155,29 @@ private fun BrowserFileRow(
     ) {
         FileIcon(entry)
         Spacer(Modifier.width(12.dp))
-        FileCopy(
-            entry = entry,
-            modifier = Modifier.weight(1f),
-            location = if (showLocation) entry.displayLocation() else null,
-            temporaryCandidate = showLocation && entry.isTemporaryCandidate(),
-        )
+        Column(modifier = Modifier.weight(1f)) {
+            FileCopy(
+                entry = entry,
+                modifier = Modifier.fillMaxWidth(),
+                location = if (showLocation) entry.displayLocation() else null,
+                temporaryCandidate = showLocation && entry.isTemporaryCandidate(),
+            )
+            if (duplicateOriginal) {
+                Surface(
+                    modifier = Modifier.padding(top = 3.dp),
+                    shape = RoundedCornerShape(7.dp),
+                    color = AuraGreen.copy(alpha = 0.16f),
+                ) {
+                    Text(
+                        "★ Оригинал? · оставить",
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                        color = AuraGreen,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                }
+            }
+        }
         if (selectionMode) {
             IconButton(onClick = onToggleSelection) {
                 Icon(
@@ -3542,23 +4309,16 @@ private fun SelectionHeader(
     count: Int,
     shareEnabled: Boolean,
     dateEnabled: Boolean,
-    extractEnabled: Boolean,
     allFavorited: Boolean,
-    batchRenameEnabled: Boolean,
-    onClear: () -> Unit,
-    onChangeDate: () -> Unit,
-    onCopy: () -> Unit,
-    onMove: () -> Unit,
-    onArchive: () -> Unit,
-    onExtract: () -> Unit,
     onFavorite: () -> Unit,
-    onBatchRename: () -> Unit,
     onShare: () -> Unit,
-    onDelete: () -> Unit,
+    onChangeDate: () -> Unit,
+    onClear: () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
+
     Row(
-        modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp, end = 8.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp, end = 8.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onClear) {
@@ -3570,62 +4330,101 @@ private fun SelectionHeader(
             fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
         )
-        IconButton(onClick = onShare, enabled = shareEnabled) {
-            Icon(Icons.Rounded.Share, contentDescription = "Поделиться")
-        }
-        IconButton(onClick = onChangeDate, enabled = dateEnabled) {
-            Icon(Icons.Rounded.CalendarMonth, contentDescription = "Изменить дату")
-        }
         Box {
             IconButton(onClick = { menuOpen = true }) {
-                Icon(Icons.Rounded.MoreHoriz, contentDescription = "Другие действия")
+                Icon(Icons.Rounded.MoreHoriz, contentDescription = "Ещё действия")
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
-                    text = { Text("Копировать") },
-                    leadingIcon = { Icon(Icons.Rounded.ContentCopy, contentDescription = null) },
-                    onClick = { menuOpen = false; onCopy() },
-                )
-                DropdownMenuItem(
-                    text = { Text("Переместить") },
-                    leadingIcon = { Icon(Icons.Rounded.ContentCut, contentDescription = null) },
-                    onClick = { menuOpen = false; onMove() },
-                )
-                DropdownMenuItem(
-                    text = { Text("Создать ZIP") },
-                    leadingIcon = { Icon(Icons.Rounded.Archive, contentDescription = null) },
-                    onClick = { menuOpen = false; onArchive() },
-                )
-                DropdownMenuItem(
                     text = { Text(if (allFavorited) "Убрать из избранного" else "В избранное") },
                     leadingIcon = {
-                        Icon(if (allFavorited) Icons.Rounded.Star else Icons.Rounded.StarBorder, contentDescription = null)
+                        Icon(
+                            if (allFavorited) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+                            contentDescription = null,
+                        )
                     },
-                    onClick = { menuOpen = false; onFavorite() },
+                    onClick = {
+                        menuOpen = false
+                        onFavorite()
+                    },
                 )
-                if (batchRenameEnabled) {
-                    DropdownMenuItem(
-                        text = { Text("Пакетно переименовать") },
-                        leadingIcon = { Icon(Icons.Rounded.DriveFileRenameOutline, contentDescription = null) },
-                        onClick = { menuOpen = false; onBatchRename() },
-                    )
-                }
-                if (extractEnabled) {
-                    DropdownMenuItem(
-                        text = { Text("Распаковать ZIP") },
-                        leadingIcon = { Icon(Icons.Rounded.FolderOpen, contentDescription = null) },
-                        onClick = { menuOpen = false; onExtract() },
-                    )
-                }
                 DropdownMenuItem(
-                    text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
-                    leadingIcon = {
-                        Icon(Icons.Rounded.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                    text = { Text("Поделиться") },
+                    leadingIcon = { Icon(Icons.Rounded.Share, contentDescription = null) },
+                    enabled = shareEnabled,
+                    onClick = {
+                        menuOpen = false
+                        onShare()
                     },
-                    onClick = { menuOpen = false; onDelete() },
+                )
+                DropdownMenuItem(
+                    text = { Text("Изменить дату") },
+                    leadingIcon = { Icon(Icons.Rounded.CalendarMonth, contentDescription = null) },
+                    enabled = dateEnabled,
+                    onClick = {
+                        menuOpen = false
+                        onChangeDate()
+                    },
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun SelectionBottomBar(
+    extractEnabled: Boolean,
+    onCopy: () -> Unit,
+    onMove: () -> Unit,
+    onArchive: () -> Unit,
+    onExtract: () -> Unit,
+    onBatchRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f),
+        tonalElevation = 3.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            SelectionAction(Icons.Rounded.ContentCopy, "Копировать", onCopy)
+            SelectionAction(Icons.Rounded.ContentCut, "Переместить", onMove)
+            SelectionAction(Icons.Rounded.Archive, "Сжать", onArchive)
+            SelectionAction(
+                Icons.Rounded.Delete,
+                "Удалить",
+                onDelete,
+                tint = MaterialTheme.colorScheme.error,
+            )
+            if (extractEnabled) SelectionAction(Icons.Rounded.FolderOpen, "Распаковать", onExtract)
+            SelectionAction(Icons.Rounded.DriveFileRenameOutline, "Переименовать", onBatchRename)
+        }
+    }
+}
+
+@Composable
+private fun SelectionAction(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    tint: Color = MaterialTheme.colorScheme.onSurface,
+) {
+    val actualTint = if (enabled) tint else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    Column(
+        modifier = Modifier
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 5.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(icon, contentDescription = label, tint = actualTint, modifier = Modifier.size(23.dp))
+        Text(label, fontSize = 10.sp, color = actualTint, maxLines = 1)
     }
 }
 
@@ -3718,6 +4517,7 @@ private fun FilePropertiesDialog(
     onToggleFavorite: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
         icon = { FileIcon(entry) },
@@ -3748,6 +4548,11 @@ private fun FilePropertiesDialog(
                         }
                         else -> TextButton(onClick = onCalculateHash) { Text("Рассчитать SHA-256") }
                     }
+                }
+                TextButton(
+                    onClick = { EnhancedPropertiesActivity.start(context, entry); onDismiss() },
+                ) {
+                    Text(if (entry.isDirectory) "Рассчитать размер папки" else "MD5 / SHA-1 / SHA-256")
                 }
             }
         },
@@ -3814,7 +4619,7 @@ private fun FileIcon(entry: FileEntry, showThumbnail: Boolean = false) {
             Icons.Rounded.MusicNote to AuraGreen
         mime == "application/pdf" || extension in setOf("pdf", "djvu", "djv") -> Icons.Rounded.Description to AuraRed
         mime == "application/vnd.android.package-archive" || extension == "apk" -> Icons.Rounded.Apps to AuraGreen
-        mime.contains("zip") || mime.contains("archive") || extension in setOf("zip", "rar", "7z", "tar", "gz") ->
+        mime.contains("zip") || mime.contains("archive") || extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz2", "txz") ->
             Icons.Rounded.Archive to AuraOrange
         mime.startsWith("text/") || extension in setOf("txt", "md", "doc", "docx", "rtf", "odt") ->
             Icons.Rounded.Description to AuraBlue
@@ -3842,7 +4647,7 @@ private fun fileAccent(entry: FileEntry): Color {
         mime.startsWith("audio/") || extension in setOf("mp3", "m4a", "wav", "flac", "ogg", "aac") -> AuraGreen
         extension in setOf("pdf", "djvu", "djv") -> AuraRed
         extension == "apk" -> AuraGreen
-        extension in setOf("zip", "rar", "7z", "tar", "gz") -> AuraOrange
+        extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz2", "txz") -> AuraOrange
         extension in setOf("txt", "md", "doc", "docx", "rtf", "odt") -> AuraBlue
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
@@ -4260,6 +5065,17 @@ private fun BatchRenameDialog(
     onDismiss: () -> Unit,
     onConfirm: (List<String>) -> Unit,
 ) {
+    if (entries.size == 1) {
+        NameDialog(
+            title = "Переименовать",
+            initialValue = entries.first().name,
+            confirmLabel = "Готово",
+            onDismiss = onDismiss,
+            onConfirm = { onConfirm(listOf(it)) },
+        )
+        return
+    }
+
     var find by remember(entries) { mutableStateOf("") }
     var replace by remember(entries) { mutableStateOf("") }
     var prefix by remember(entries) { mutableStateOf("") }
@@ -4376,6 +5192,8 @@ private fun categoryColor(category: FileCategory): Color = when (category) {
 @Composable
 private fun TrashDialog(
     records: List<TrashRecord>,
+    deletingUris: Set<Uri>,
+    deleteAnimationMode: DeleteAnimationMode,
     onRestore: (TrashRecord) -> Unit,
     onDelete: (TrashRecord) -> Unit,
     onEmpty: () -> Unit,
@@ -4395,7 +5213,14 @@ private fun TrashDialog(
                     items(records.size) { index ->
                         val record = records[index]
                         Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .auraDeleteEffect(
+                                    active = record.entry.uri in deletingUris,
+                                    mode = deleteAnimationMode,
+                                    seed = record.entry.uri.toString().hashCode(),
+                                )
+                                .padding(vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             FileIcon(record.entry)
@@ -4493,6 +5318,27 @@ private fun startFtpServer(context: Context, state: FileManagerUiState, config: 
         FtpServerService.start(context, root.document.uri, root.label, config)
     }.onFailure {
         Toast.makeText(context, it.message ?: "Не удалось запустить FTP-сервер", Toast.LENGTH_LONG).show()
+    }
+}
+
+private fun startSftpServer(context: Context, state: FileManagerUiState, config: SftpServerConfig) {
+    val root = state.folderStack.firstOrNull()
+    if (root == null) {
+        Toast.makeText(context, "Сначала подключите локальную папку", Toast.LENGTH_LONG).show()
+        return
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+        Toast.makeText(
+            context,
+            "Для SFTP-сервера включите «Весь накопитель» в настройках Aura",
+            Toast.LENGTH_LONG,
+        ).show()
+        return
+    }
+    runCatching {
+        SftpServerService.start(context, root.document.uri, root.label, config)
+    }.onFailure {
+        Toast.makeText(context, it.message ?: "Не удалось запустить SFTP-сервер", Toast.LENGTH_LONG).show()
     }
 }
 

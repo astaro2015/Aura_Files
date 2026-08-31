@@ -1,0 +1,17 @@
+Aura Files 0.14.11 — изменения
+
+1. Java deprecation cleanup
+- javac теперь запускается с -Xlint:deprecation: новые устаревшие Java API показываются с точным файлом и строкой.
+- Полноэкранный режим Чтеца на Android 11+ переведён с deprecated SYSTEM_UI_FLAG_* на WindowInsetsController.
+- Работа светлых системных панелей использует WindowInsetsController на Android 11+; старый API изолирован только для Android 8–10.
+- Deprecated установки цветов status/navigation bar не вызываются на Android 15+; старый путь оставлен только для совместимых версий.
+- Два deprecated WebSettings для file:// EPUB оставлены осознанно ради совместимости с относительными ресурсами EPUB и локально подавлены точечно.
+
+2. Windows builder
+- Gradle stderr теперь объединяется со stdout внутри cmd.exe, а не средствами Windows PowerShell 5.1.
+- Обычные javac/Gradle предупреждения больше не должны превращаться PowerShell в красный NativeCommandError.
+- Ошибка определяется по реальному коду завершения Gradle; настоящий BUILD FAILED остаётся ошибкой.
+
+3. Версия
+versionName: 0.14.11
+versionCode: 30

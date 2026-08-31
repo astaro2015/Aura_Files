@@ -1,0 +1,22 @@
+Aura Files 0.14.8 — проверка пакета
+===================================
+
+PASS: versionName=0.14.8, versionCode=27.
+PASS: в «Сеть» сохранены три логических блока: «Устройства рядом», «Подключиться к», «Создать сервер».
+PASS: SFTP-клиент остаётся внутри «Подключиться к»; в «Создать сервер» теперь присутствуют два отдельных сервера — FTP и SFTP.
+PASS: добавлен SFTP-only foreground server service на Apache MINA SSHD 2.19.0; shell/command factory не устанавливаются.
+PASS: SFTP server использует парольную авторизацию, постоянный RSA-3072 host key, chroot/sandbox через VirtualFileSystemFactory и порт 2222 по умолчанию.
+PASS: режим «Только чтение» блокирует открытие файлов на запись/создание/усечение, изменение атрибутов/ACL/прав, создание папок/ссылок, rename/copy/delete и extension attributes.
+PASS: входящие SFTP-сессии ограничены loopback/link-local/private IPv4 и IPv6 ULA адресами.
+PASS: тяжёлый запуск SFTP (включая первичную генерацию host key) вынесен с Android main thread в Dispatchers.IO; остановка во время запуска обработана.
+PASS: foreground service использует отдельное уведомление, Wi-Fi high-performance lock и PARTIAL_WAKE_LOCK и корректно освобождает их при остановке.
+PASS: корень SFTP-сервера ограничен реальными локальными путями памяти/SD; для Android 11+ общей памяти требуется режим «Весь накопитель»; произвольные облачные/сетевые SAF roots отвергаются понятной ошибкой.
+PASS: launcher art заменён на утверждённую иконку «открытая синяя папка + вертикальная microSD + Au»; внешний белый фон удалён, PNG уменьшен до 512×512 без лишних metadata; themed monochrome drawable присутствует.
+PASS: все 13 Android XML-ресурсов проходят XML parse.
+PASS: изменённые Kotlin-файлы прошли parser/syntax sanity-check через kotlinc без синтаксических диагностик (полный classpath Android/Compose/MINA в этой среде отсутствует).
+PASS: статический поиск TODO/FIXME/HACK, GlobalScope и runBlocking в изменённых участках не выявил проблемных маркеров.
+
+NOT RUN: полный Gradle Android compile/lint. Gradle Wrapper доходит до загрузки Gradle 9.5.0, но текущий контейнер получает java.net.UnknownHostException: services.gradle.org. Поэтому компиляцию с реальным Android/Compose/Maven classpath должен выполнить Windows-builder из архива.
+
+Ожидаемый debug APK после Windows-builder:
+BUILD_OUTPUT\Aura_Files_0.14.8-debug.apk

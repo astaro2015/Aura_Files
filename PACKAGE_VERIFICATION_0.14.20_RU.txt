@@ -1,0 +1,14 @@
+Проверка пакета Aura Files 0.14.20
+
+- versionName: 0.14.20
+- versionCode: 39
+- «Сгорание» переписано на edge-driven burn + domain-warped FBM; случайные дырки в центре не используются
+- Android 13+: RuntimeShader/AGSL, с runtime-fallback на случай несовместимого GPU/драйвера
+- Android 8–12: Canvas fallback
+- фаза тления, тонкая многослойная горячая/обугленная кромка и частицы, привязанные к движущемуся фронту
+- DeleteEffect.kt проверен отдельной Kotlin-компиляцией с Compose/Android-compatible stub API
+- XML-ресурсы разбираются перед упаковкой
+- итоговый ZIP проверяется тестом целостности
+
+Полный Android Gradle compile в контейнере не заявляется: локальный Android/Gradle dependency cache отсутствует.
+Окончательная компиляционная проверка выполняется BUILD_ON_CLEAN_WINDOWS.bat.

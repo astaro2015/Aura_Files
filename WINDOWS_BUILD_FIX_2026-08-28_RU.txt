@@ -1,0 +1,16 @@
+﻿Aura Files 0.14.1 — исправление Windows-сборщика
+
+Исправлено ложное падение PowerShell на строке:
+  Picked up JAVA_TOOL_OPTIONS: ...
+
+Причина: Windows PowerShell 5.1 мог воспринимать обычный stderr Java/Gradle
+как ErrorRecord при перенаправлении 2>&1 и $ErrorActionPreference=Stop.
+
+Что изменено:
+- JAVA_TOOL_OPTIONS больше не используется; сетевые параметры перенесены в GRADLE_OPTS.
+- stderr Gradle сам по себе больше не считается ошибкой.
+- ошибка определяется по реальному exit code Gradle.
+- LAST_ERROR.txt теперь включает текст исключения и последние 120 строк build.log.
+
+Запуск: BUILD_ON_CLEAN_WINDOWS.bat
+Если окружение уже было скачано предыдущей версией, повторно скачивать его не требуется.

@@ -1,0 +1,13 @@
+Проверка пакета Aura Files 0.14.19
+
+- versionName: 0.14.19
+- versionCode: 38
+- режим «Сгорание» полностью переделан: AGSL RuntimeShader на API 33+ + Canvas fallback на API 26–32
+- RuntimeShader защищён runtime-fallback: ошибка компиляции AGSL на конкретном драйвере не должна ронять приложение
+- «Песчинки», «Распад на пиксели» и «Без анимации» сохранены
+- DeleteEffect.kt проверяется отдельной Kotlin-компиляцией с Compose/Android-compatible stub API
+- XML-ресурсы разбираются перед упаковкой
+- итоговый ZIP проверяется тестом целостности
+
+Полный Android Gradle compile в контейнере не заявляется: локальный Android/Gradle dependency cache отсутствует.
+Окончательная компиляционная проверка выполняется BUILD_ON_CLEAN_WINDOWS.bat.

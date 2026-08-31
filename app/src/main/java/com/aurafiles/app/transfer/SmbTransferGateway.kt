@@ -5,14 +5,13 @@ interface SmbTransferGateway {
         source: TransferSource.Local,
         destination: TransferDestination.Smb,
         controller: TransferController,
-        onBytes: (name: String, delta: Long, total: Long) -> Unit,
+        onBytes: (name: String, delta: Long, total: Long, started: Boolean) -> Unit,
     )
 
     suspend fun download(
         source: TransferSource.Smb,
         destination: TransferDestination.Local,
         controller: TransferController,
-        onBytes: (name: String, delta: Long, total: Long) -> Unit,
+        onBytes: (name: String, delta: Long, total: Long, started: Boolean) -> Unit,
     )
 }
-

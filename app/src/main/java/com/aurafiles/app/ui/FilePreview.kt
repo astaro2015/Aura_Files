@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -12,6 +13,8 @@ import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.util.Size
 import android.util.LruCache
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
@@ -78,6 +81,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.File
 import java.io.IOException
 import kotlin.math.roundToInt
@@ -93,7 +98,9 @@ internal fun FileThumbnail(
     val context = LocalContext.current
     val bitmap by produceState<Bitmap?>(initialValue = null, entry.uri, entry.modifiedAt, canPreview) {
         value = if (canPreview) withContext(Dispatchers.IO) {
-            runCatching { loadThumbnail(context, entry, 240) }.getOrNull()
+            THUMBNAIL_DECODER.withPermit {
+                runCatching { loadThumbnail(context, entry, 240) }.getOrNull()
+            }
         } else null
     }
     if (bitmap == null) fallback()
@@ -111,7 +118,6 @@ internal fun FilePreviewDialog(
     onOpenExternal: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val context = LocalContext.current
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(
             modifier = Modifier.fillMaxSize().padding(10.dp),
@@ -136,16 +142,7 @@ internal fun FilePreviewDialog(
                     IconButton(onClick = onOpenExternal) {
                         Icon(Icons.AutoMirrored.Rounded.Launch, contentDescription = "Открыть в другом приложении")
                     }
-                    if (isVideo(entry)) {
-                        IconButton(onClick = {
-                            context.startActivity(
-                                Intent(context, FullscreenVideoActivity::class.java)
-                                    .putExtra(FullscreenVideoActivity.EXTRA_URI, entry.uri.toString())
-                            )
-                        }) {
-                            Icon(Icons.Rounded.Fullscreen, contentDescription = "На весь экран")
-                        }
-                    }
+                                        // Fullscreen is launched from MediaPreview so playback position is preserved.
                 }
                 PreviewBody(entry = entry, onOpenExternal = onOpenExternal, modifier = Modifier.weight(1f))
             }
@@ -289,6 +286,18 @@ private fun MediaPreview(
             playWhenReady = true
         }
     }
+    val fullscreenLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val position = result.data?.getLongExtra(
+                FullscreenVideoActivity.EXTRA_POSITION,
+                player.currentPosition,
+            ) ?: player.currentPosition
+            player.seekTo(position.coerceAtLeast(0L))
+            player.play()
+        }
+    }
     var playbackError by remember(entry.uri) { mutableStateOf<String?>(null) }
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -323,7 +332,23 @@ private fun MediaPreview(
                 Modifier.weight(1f).fillMaxWidth()
             },
         )
-        playbackError?.let { error ->
+        if (!audioOnly) {
+    TextButton(
+        onClick = {
+            val position = player.currentPosition.coerceAtLeast(0L)
+            player.pause()
+            fullscreenLauncher.launch(
+                Intent(context, FullscreenVideoActivity::class.java)
+                    .putExtra(FullscreenVideoActivity.EXTRA_URI, entry.uri.toString())
+                    .putExtra(FullscreenVideoActivity.EXTRA_POSITION, position)
+            )
+        }
+    ) {
+        Icon(Icons.Rounded.Fullscreen, contentDescription = null)
+        Text("На весь экран")
+    }
+}
+playbackError?.let { error ->
             Surface(color = MaterialTheme.colorScheme.errorContainer, shape = RoundedCornerShape(14.dp)) {
                 Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text(error, modifier = Modifier.weight(1f), color = MaterialTheme.colorScheme.onErrorContainer)
@@ -441,6 +466,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int)
 private const val MAX_TEXT_PREVIEW_CHARS = 300_000
 private const val MAX_IMAGE_EDGE = 2_048
 private const val THUMBNAIL_CACHE_BYTES = 24 * 1024 * 1024
+private val THUMBNAIL_DECODER = Semaphore(4)
 private val THUMBNAIL_CACHE = object : LruCache<String, Bitmap>(THUMBNAIL_CACHE_BYTES) {
     override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
 }

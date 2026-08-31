@@ -45,11 +45,22 @@ sealed interface TransferSource {
         override val modifiedAt: Long,
         val isDirectory: Boolean,
     ) : TransferSource
+
+    data class Backend(
+        val backendId: String,
+        val path: String,
+        override val name: String,
+        override val size: Long,
+        override val modifiedAt: Long,
+        val isDirectory: Boolean,
+        val mimeType: String? = null,
+    ) : TransferSource
 }
 
 sealed interface TransferDestination {
     data class Local(val directoryUri: Uri) : TransferDestination
     data class Smb(val directoryPath: String) : TransferDestination
+    data class Backend(val backendId: String, val directoryPath: String) : TransferDestination
 }
 
 data class TransferRequest(
@@ -66,5 +77,6 @@ data class TransferResult(
     val completedItems: Int,
     val skippedItems: Int,
     val processedBytes: Long,
+    /** Non-fatal maintenance problems after the requested data was committed. */
+    val warnings: List<String> = emptyList(),
 )
-

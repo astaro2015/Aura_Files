@@ -1,0 +1,9 @@
+Aura Files 0.14.14 — hotfix компиляции эффекта удаления
+
+Исправлено:
+- Kotlin compile error в ui/DeleteEffect.kt: внутри clipRect() drawContent() теперь вызывается через явный receiver ContentDrawScope (this@drawWithContent.drawContent()).
+- Исправление основано на фактическом build.log Windows-сборки 0.14.13, где compileDebugKotlin падал на DeleteEffect.kt:95:25.
+- Все возможности 0.14.13 сохранены, включая анимацию «Распад на пиксели», быстрый режим и отключение анимации.
+
+Версия: 0.14.14
+versionCode: 33

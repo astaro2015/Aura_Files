@@ -1,0 +1,21 @@
+Aura Files 0.14.10 — проверка пакета
+====================================
+
+PASS: versionName=0.14.10, versionCode=29.
+PASS: Room index database version=3; MIGRATION_2_3 переклассифицирует ZIP/RAR/7Z/TAR/GZ/BZ2/XZ/TGZ/TBZ2/TXZ в «Archives» без обязательного полного пересканирования и не уводит FB2.ZIP из «Книг».
+PASS: FileClassifier включает ZIP, RAR, 7Z, TAR, GZ, BZ2, XZ, TGZ, TBZ2 и TXZ в категорию «Архивы»; CBZ/CBR/FB2.ZIP остаются книгами.
+PASS: ArchiveBrowser и нижняя команда «Распаковать» принимают ZIP, RAR, 7Z, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, TAR.XZ/TXZ, GZ, BZ2 и XZ.
+PASS: одиночные GZ/BZ2/XZ открываются как один виртуальный файл и распаковываются с лимитом результирующего размера; XZ дополнительно имеет лимит рабочей памяти.
+PASS: создание поддерживает ZIP, TAR, TAR.GZ/TGZ, TAR.BZ2/TBZ2, TAR.XZ/TXZ, а GZ/BZ2/XZ — для одного обычного файла.
+PASS: защита архивов (safePath, запрет TAR symlink/link, ZIP symlink, лимиты количества/размера) сохранена для контейнерных форматов.
+PASS: добавлена явная зависимость org.tukaani:xz:1.10 для XZ backend Commons Compress.
+PASS: GitHub Actions artifact обновлён до Aura-Files-0.14.10-debug.
+PASS: все 14 XML (ресурсы + AndroidManifest.xml) проходят XML parse.
+PASS: SQL миграции 2→3 отдельно проверен на тестовой in-memory SQLite: обычные архивы переклассифицируются, book.fb2.zip и book.cbz остаются Books.
+PASS: изменённые Kotlin-файлы прогнаны через kotlinc без Android/Compose classpath; ожидаемо получены unresolved-reference diagnostics, при этом parser diagnostics (expecting/unexpected tokens/redeclaration) = 0.
+PASS: AuraIndexDatabase.java прогнан через javac без Android/Room classpath; ожидаемо получены missing-package diagnostics, синтаксических diagnostics (expected/illegal start/reached end) = 0.
+
+NOT RUN: полный Gradle Android compile/lint. Gradle Wrapper пытается загрузить Gradle 9.5.0, но текущая среда получает java.net.UnknownHostException: services.gradle.org. Поэтому реальную компиляцию с Android/Compose/Room/Commons Compress classpath должен выполнить Windows-builder из архива.
+
+Ожидаемый debug APK после Windows-builder:
+BUILD_OUTPUT\Aura_Files_0.14.10-debug.apk

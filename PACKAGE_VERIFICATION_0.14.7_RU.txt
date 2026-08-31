@@ -1,0 +1,19 @@
+Aura Files 0.14.7 — проверка пакета
+===================================
+
+PASS: versionName=0.14.7, versionCode=26.
+PASS: нижняя панель выделения всегда содержит «Переименовать». Для 1 файла используется обычный Rename dialog, для 2+ — пакетный шаблон.
+PASS: верхняя часть экрана «Сеть» состоит из трёх логических блоков: «Устройства рядом», «Подключиться к», «Создать сервер».
+PASS: SMB / FTP / SFTP и сохранённые профили скрыты внутри «Подключиться к»; FTP-сервер телефона — внутри «Создать сервер».
+PASS: новый adaptive launcher foreground и отдельный monochrome drawable присутствуют; XML ресурсов разбирается корректно.
+PASS: сетевые SMB/FTP списки переведены на ленивую выдачу строк LazyColumn.
+PASS: FolderSizeCalculator, LocalStorageBackend и корзина используют FastDocumentListing в горячих SAF-листингах; корзина очищает осиротевшую метаинформацию.
+PASS: SimilarPhotos не пересканирует все пары для каждой отображаемой группы.
+PASS: статический поиск TODO/FIXME/HACK, GlobalScope и runBlocking в исходниках не выявил соответствующих проблемных маркеров.
+PASS: изменённые Kotlin-файлы прошли parser/syntax sanity-check через kotlinc без синтаксических диагностик.
+PASS: все Android XML-ресурсы проходят XML parse.
+
+NOT RUN: полный Gradle Android compile/lint. Причина: Gradle 9.5 отсутствует локально, а Gradle Wrapper в текущем контейнере не может получить https://services.gradle.org/distributions/gradle-9.5.0-bin.zip из-за сетевой/DNS-недоступности.
+
+Ожидаемый debug APK после Windows-builder:
+BUILD_OUTPUT\Aura_Files_0.14.7-debug.apk

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="workspace_title">Universal panels</string>
+    <string name="workspace_compare">Compare panels</string>
+    <string name="workspace_sync_right">Synchronize →</string>
+    <string name="workspace_sync_left">← Synchronize</string>
+    <string name="sftp_title">SFTP</string>
+    <string name="similar_photos_title">Similar photos</string>
+    <string name="apk_info_title">Application info</string>
+    <string name="calculate_folder_size">Calculate size</string>
+    <string name="advanced_settings_014">Aura 0.14 features</string>
+</resources>

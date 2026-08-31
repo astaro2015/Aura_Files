@@ -1,0 +1,8 @@
+Aura Files 0.14.21 package verification
+PASS: versionName=0.14.21, versionCode=40.
+PASS: full-screen burn uses fitted image bounds instead of transparent fillMaxSize bounds.
+PASS: RuntimeShader RenderEffect is keyed by progress/content size.
+PASS: pre-Android-13 burn fallback no longer uses rectangular cell erosion.
+PASS: SHA-256 manifest contains 225 files (excluding the manifest itself).
+PASS: 13 Android XML resources parsed successfully.
+NOTE: full Gradle Android compile was not executed in this container; run BUILD_ON_CLEAN_WINDOWS.bat for final compiler verification.

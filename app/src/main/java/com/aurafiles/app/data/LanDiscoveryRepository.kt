@@ -40,17 +40,13 @@ class LanDiscoveryRepository(context: Context) {
     }
 
     private suspend fun scanSubnet(): List<LanDevice> = coroutineScope {
-        val localAddress = localIpv4() ?: return@coroutineScope emptyList()
-        val octets = localAddress.hostAddress?.split('.') ?: return@coroutineScope emptyList()
-        if (octets.size != 4) return@coroutineScope emptyList()
-        val prefix = octets.take(3).joinToString(".")
-        val own = localAddress.hostAddress
-        val semaphore = Semaphore(56)
-        (1..254).map { suffix ->
+        val localNetwork = localIpv4Network() ?: return@coroutineScope emptyList()
+        val own = localNetwork.address.hostAddress ?: return@coroutineScope emptyList()
+        val addresses = generateIpv4ScanAddresses(own, localNetwork.prefixLength)
+        val semaphore = Semaphore(64)
+        addresses.map { address ->
             async(Dispatchers.IO) {
                 semaphore.withPermit {
-                    val address = "$prefix.$suffix"
-                    if (address == own) return@withPermit null
                     val services = buildSet {
                         if (portOpen(address, 445)) add(LanService.Smb)
                         if (portOpen(address, 21)) add(LanService.Ftp)
@@ -60,7 +56,7 @@ class LanDiscoveryRepository(context: Context) {
                         if (portOpen(address, 554)) add(LanService.Media)
                     }
                     if (services.isEmpty()) return@withPermit null
-                    val resolvedName = withTimeoutOrNull(350) {
+                    val resolvedName = withTimeoutOrNull(500) {
                         withContext(Dispatchers.IO) { InetAddress.getByName(address).canonicalHostName }
                     }?.takeIf { it != address }.orEmpty()
                     LanDevice(address, resolvedName.ifBlank { address }, services)
@@ -133,23 +129,109 @@ class LanDiscoveryRepository(context: Context) {
         }
     }.getOrDefault(emptyList())
 
-    private fun localIpv4(): Inet4Address? {
+    private fun localIpv4Network(): LocalIpv4Network? {
         val connectivity = appContext.getSystemService(ConnectivityManager::class.java)
         val active = connectivity.activeNetwork?.let(connectivity::getLinkProperties)
             ?.linkAddresses
-            ?.map { it.address }
-            ?.filterIsInstance<Inet4Address>()
-            ?.firstOrNull { it.isSiteLocalAddress }
+            ?.firstNotNullOfOrNull { linkAddress ->
+                val address = linkAddress.address as? Inet4Address ?: return@firstNotNullOfOrNull null
+                address.takeIf(Inet4Address::isSiteLocalAddress)
+                    ?.let { LocalIpv4Network(it, linkAddress.prefixLength) }
+            }
         if (active != null) return active
-        val addresses = Collections.list(NetworkInterface.getNetworkInterfaces())
+        val interfaces = runCatching { Collections.list(NetworkInterface.getNetworkInterfaces()) }
+            .getOrDefault(emptyList())
+        return interfaces
             .filter { runCatching { it.isUp && !it.isLoopback }.getOrDefault(false) }
             .sortedBy { if (it.name.contains("wlan", true) || it.name.contains("wifi", true)) 0 else 1 }
-            .flatMap { Collections.list(it.inetAddresses) }
-        return addresses.filterIsInstance<Inet4Address>().firstOrNull { it.isSiteLocalAddress }
+            .flatMap(NetworkInterface::getInterfaceAddresses)
+            .firstNotNullOfOrNull { interfaceAddress ->
+                val address = interfaceAddress.address as? Inet4Address ?: return@firstNotNullOfOrNull null
+                address.takeIf(Inet4Address::isSiteLocalAddress)
+                    ?.let { LocalIpv4Network(it, interfaceAddress.networkPrefixLength.toInt()) }
+            }
     }
 
+    private data class LocalIpv4Network(val address: Inet4Address, val prefixLength: Int)
+
     private companion object {
-        const val CONNECT_TIMEOUT_MS = 170
+        // 170 ms caused false negatives on power-saving TVs/NAS devices. 250 ms is
+        // still short enough for the bounded scan but tolerates a busy Wi-Fi hop.
+        const val CONNECT_TIMEOUT_MS = 250
         const val SSDP_WINDOW_MS = 2_600L
     }
+}
+
+internal const val DEFAULT_LAN_SCAN_ADDRESS_LIMIT = 512
+
+/**
+ * Returns addresses inside the actual IPv4 subnet, excluding this device and
+ * (where applicable) the network and broadcast addresses.
+ *
+ * Small networks are returned completely. Huge corporate/VPN networks are
+ * deliberately bounded: Aura checks the conventional first host (usually the
+ * router) and then the addresses nearest to the phone. This keeps discovery
+ * useful without accidentally starting a many-minute /16 or /8 port scan.
+ */
+internal fun generateIpv4ScanAddresses(
+    localAddress: String,
+    prefixLength: Int,
+    maxAddresses: Int = DEFAULT_LAN_SCAN_ADDRESS_LIMIT,
+): List<String> {
+    require(prefixLength in 0..32) { "IPv4 prefix length must be between 0 and 32" }
+    require(maxAddresses >= 0) { "Address limit must not be negative" }
+    if (maxAddresses == 0) return emptyList()
+
+    val local = ipv4ToLong(localAddress)
+        ?: throw IllegalArgumentException("Invalid IPv4 address: $localAddress")
+    val mask = if (prefixLength == 0) 0L else (0xffff_ffffL shl (32 - prefixLength)) and 0xffff_ffffL
+    val network = local and mask
+    val broadcast = network or (mask.inv() and 0xffff_ffffL)
+    val first = if (prefixLength <= 30) network + 1 else network
+    val last = if (prefixLength <= 30) broadcast - 1 else broadcast
+    if (first > last) return emptyList()
+
+    val available = (last - first + 1) - if (local in first..last) 1 else 0
+    if (available <= 0) return emptyList()
+    if (available <= maxAddresses.toLong()) {
+        return (first..last).asSequence()
+            .filter { it != local }
+            .map(::longToIpv4)
+            .toList()
+    }
+
+    val result = LinkedHashSet<Long>(maxAddresses)
+    // The first usable address is commonly the router/default gateway.
+    if (first != local) result += first
+    var distance = 1L
+    while (result.size < maxAddresses && (local - distance >= first || local + distance <= last)) {
+        val before = local - distance
+        if (before >= first && before != local) result += before
+        if (result.size >= maxAddresses) break
+        val after = local + distance
+        if (after <= last && after != local) result += after
+        distance += 1
+    }
+    return result.map(::longToIpv4)
+}
+
+private fun ipv4ToLong(address: String): Long? {
+    val octets = address.split('.')
+    if (octets.size != 4) return null
+    var result = 0L
+    for (octetText in octets) {
+        val octet = octetText.toIntOrNull()?.takeIf { it in 0..255 } ?: return null
+        result = (result shl 8) or octet.toLong()
+    }
+    return result
+}
+
+private fun longToIpv4(address: Long): String = buildString {
+    append(address shr 24 and 0xff)
+    append('.')
+    append(address shr 16 and 0xff)
+    append('.')
+    append(address shr 8 and 0xff)
+    append('.')
+    append(address and 0xff)
 }

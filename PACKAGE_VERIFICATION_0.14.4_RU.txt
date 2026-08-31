@@ -1,0 +1,10 @@
+Aura Files 0.14.4 — проверка пакета
+
+PASS: versionName=0.14.4, versionCode=23.
+PASS: в сетевом разделе используются явные действия «Подключиться к SMB-серверу», «Подключиться к FTP-серверу», «Создать FTP-сервер на телефоне».
+PASS: в ImageViewerActivity корзина расположена плавающей кнопкой поверх полноэкранной области изображения.
+PASS: reverseLayout=true сохранён для обратного направления листания изображений.
+PASS: старые кнопки «Вписать» / «100 %» отсутствуют в ImageViewerActivity.
+
+Полный Gradle compile в контейнере не выполнен: Gradle wrapper пытается получить gradle-9.5.0-bin.zip, но среда не имеет DNS/сетевого доступа к services.gradle.org.
+Ожидаемый debug APK: BUILD_OUTPUT\Aura_Files_0.14.4-debug.apk

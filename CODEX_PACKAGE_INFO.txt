@@ -1,0 +1,12 @@
+Aura Files 1.0 NO-OCR — STABLE FULL SOURCE
+
+Это полное дерево исходников, а не набор патчей.
+Для Codex: начать с 00_CODEX_TASK.md и AURA_1.0_CHANGES_RU.txt.
+Для чистого Windows-ПК: запустить BUILD_ON_CLEAN_WINDOWS.bat.
+Не накладывать поверх этого дерева старые FIXPACK-архивы.
+
+Сборщик устанавливает переносимые инструменты без Android Studio,
+переносит проект в ASCII-путь и создаёт debug APK в BUILD_OUTPUT.
+
+Версия приложения: 1.0 (versionCode 100).
+OCR намеренно не включён.

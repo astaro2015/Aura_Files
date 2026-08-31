@@ -1,0 +1,17 @@
+Aura Files 1.0 — Windows-ready stable package
+
+Пакет содержит полное дерево исходников Aura Files 1.0 и автономный сборщик для Windows.
+Состав стабильного релиза перечислен в AURA_1.0_CHANGES_RU.txt.
+
+Сборщик загружает с возобновлением:
+- Eclipse Temurin JDK 17
+- Android Command-line Tools 15859902
+- Android NDK r28c / 28.2.13676358
+- Gradle 9.5.0
+
+Незавершённые загрузки сохраняются как *.part в C:\Users\Public\AuraBuildTools\downloads.
+Число попыток и сетевые тайм-ауты ограничены: ошибка сети больше не оставляет сборщик в бесконечном ожидании.
+Проект для сборки переносится в ASCII-путь C:\Users\Public\AuraBuild\Aura_Files_1.0.
+Результат и журнал сборки сохраняются в BUILD_OUTPUT.
+
+Windows bootstrap revision: 1.0 / BOUNDED_DOWNLOADS.

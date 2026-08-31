@@ -95,50 +95,31 @@ data class StorageAnalysis(
     val totalBytes: Long,
     val categories: List<CategorySummary>,
     val largeFiles: List<FileEntry>,
+    val largeFileCount: Int = largeFiles.size,
     val duplicateGroups: List<List<FileEntry>>,
+    val temporaryFileCount: Int = 0,
+    val temporaryBytes: Long = 0L,
     val limitReached: Boolean,
     val scannedAt: Long,
 ) {
-    val duplicateFileCount: Int get() = duplicateGroups.sumOf { (it.size - 1).coerceAtLeast(0) }
-    val reclaimableDuplicateBytes: Long
-        get() = duplicateGroups.sumOf { group ->
+    val duplicateFileCount: Int by lazy(LazyThreadSafetyMode.NONE) {
+        duplicateGroups.sumOf { (it.size - 1).coerceAtLeast(0) }
+    }
+    val reclaimableDuplicateBytes: Long by lazy(LazyThreadSafetyMode.NONE) {
+        duplicateGroups.sumOf { group ->
             (group.firstOrNull()?.size ?: 0L) * (group.size - 1).coerceAtLeast(0)
         }
-}
-
-fun FileEntry.category(): FileCategory {
-    val extension = name.substringAfterLast('.', "").lowercase()
-    return when {
-        mimeType?.startsWith("image/") == true -> FileCategory.Images
-        mimeType?.startsWith("video/") == true -> FileCategory.Video
-        mimeType?.startsWith("audio/") == true -> FileCategory.Audio
-        isBookFormat() -> FileCategory.Books
-        mimeType == "application/pdf" || mimeType?.startsWith("text/") == true ||
-            extension in setOf("pdf", "djvu", "djv", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "rtf", "txt", "md", "csv") -> FileCategory.Documents
-        extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz") ||
-            mimeType?.contains("zip") == true || mimeType?.contains("archive") == true -> FileCategory.Archives
-        extension == "apk" || mimeType == "application/vnd.android.package-archive" -> FileCategory.Apk
-        else -> FileCategory.Other
     }
 }
 
-fun FileEntry.isBookFormat(): Boolean {
-    val lower = name.lowercase()
-    return lower.endsWith(".fb2.zip") || name.substringAfterLast('.', "").lowercase() in setOf(
-        "epub", "fb2", "mobi", "azw", "azw3", "prc", "cbz", "cbr"
-    )
-}
+fun FileEntry.category(): FileCategory = FileClassifier.category(name, FileClassifier.extension(name), mimeType)
 
-fun FileEntry.isReaderSupported(): Boolean {
-    val lower = name.lowercase()
-    return lower.endsWith(".fb2.zip") || name.substringAfterLast('.', "").lowercase() in setOf(
-        "epub", "fb2", "mobi", "azw", "azw3", "prc", "docx", "rtf", "md", "markdown",
-        "txt", "html", "htm", "pdf", "djvu", "djv", "cbz", "cbr"
-    )
-}
+fun FileEntry.isBookFormat(): Boolean = FileClassifier.primaryBook(name)
+
+fun FileEntry.isReaderSupported(): Boolean = FileClassifier.readerSupported(name)
 
 fun FileEntry.isAudioFile(): Boolean {
-    val extension = name.substringAfterLast('.', "").lowercase()
+    val extension = FileClassifier.extension(name)
     return mimeType?.startsWith("audio/") == true || extension in setOf(
         "mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "3gp", "mid", "midi"
     )
@@ -146,40 +127,19 @@ fun FileEntry.isAudioFile(): Boolean {
 
 fun FileEntry.matchesCategory(category: FileCategory): Boolean = when (category) {
     FileCategory.Books -> isReaderSupported()
-    FileCategory.Downloads -> searchablePath().containsPathPart("download") || searchablePath().containsPathPart("downloads")
-    FileCategory.Camera -> searchablePath().contains("dcim/camera") || searchablePath().contains("dcim\\camera")
+    FileCategory.Downloads -> sourceLabel() == "Загрузки"
+    FileCategory.Camera -> sourceLabel() == "Камера"
     else -> category() == category
 }
 
-fun FileEntry.isThumbnailCache(): Boolean {
-    val path = searchablePath()
-    return path.contains(".thumbnails") || path.containsPathPart("thumbnails") || path.containsPathPart("thumbnail")
-}
+fun FileEntry.isThumbnailCache(): Boolean = FileClassifier.isThumbnailCache(searchablePath())
 
 fun FileEntry.isTemporaryCandidate(): Boolean {
     val path = searchablePath()
-    val extension = name.substringAfterLast('.', "").lowercase()
-    return isThumbnailCache() ||
-        path.containsPathPart("cache") ||
-        path.containsPathPart("temp") ||
-        path.containsPathPart("tmp") ||
-        extension in setOf("tmp", "temp", "log", "bak")
+    return FileClassifier.temporaryCandidate(path, FileClassifier.extension(name), FileClassifier.sourceLabel(path))
 }
 
-fun FileEntry.sourceLabel(): String {
-    val path = searchablePath()
-    return when {
-        isThumbnailCache() -> "Миниатюры и кэш"
-        path.contains("whatsapp") || path.contains("com.whatsapp") -> "WhatsApp"
-        path.contains("telegram") || path.contains("org.telegram") -> "Telegram"
-        path.contains("dcim/camera") || path.contains("dcim\\camera") -> "Камера"
-        path.containsPathPart("screenshots") || path.containsPathPart("screenshot") -> "Снимки экрана"
-        path.containsPathPart("download") || path.containsPathPart("downloads") -> "Загрузки"
-        path.containsPathPart("bluetooth") -> "Bluetooth"
-        path.containsPathPart("documents") -> "Документы"
-        else -> "Другие папки"
-    }
-}
+fun FileEntry.sourceLabel(): String = FileClassifier.sourceLabel(searchablePath())
 
 fun FileEntry.displayLocation(): String {
     val decoded = Uri.decode((parentUri ?: uri).toString())
@@ -191,15 +151,7 @@ fun FileEntry.displayLocation(): String {
     return parent.takeLast(80).ifBlank { sourceLabel() }
 }
 
-private fun FileEntry.searchablePath(): String = Uri.decode("${parentUri?.toString().orEmpty()}|$uri|$name")
-    .replace('\\', '/')
-    .lowercase()
-
-private fun String.containsPathPart(part: String): Boolean {
-    val normalized = replace('\\', '/')
-    return normalized.contains("/$part/") || normalized.contains(":$part/") ||
-        normalized.endsWith("/$part") || normalized.contains("/$part|")
-}
+private fun FileEntry.searchablePath(): String = FileClassifier.searchablePath(name, uri, parentUri)
 
 enum class MainSection {
     Browse,
@@ -233,6 +185,26 @@ data class FtpServerConfig(
 )
 
 data class FtpServerStatus(
+    val running: Boolean = false,
+    val starting: Boolean = false,
+    val endpoints: List<String> = emptyList(),
+    val port: Int = 0,
+    val username: String = "",
+    val password: String = "",
+    val rootLabel: String = "",
+    val readOnly: Boolean = true,
+    val clients: Int = 0,
+    val error: String? = null,
+)
+
+data class SftpServerConfig(
+    val port: Int = 2222,
+    val username: String = "aura",
+    val password: String,
+    val readOnly: Boolean = true,
+)
+
+data class SftpServerStatus(
     val running: Boolean = false,
     val starting: Boolean = false,
     val endpoints: List<String> = emptyList(),

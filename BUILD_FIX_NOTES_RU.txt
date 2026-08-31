@@ -1,0 +1,10 @@
+Aura Files 0.14.1 — Java resource merge fix
+
+Эта ревизия содержит предыдущие compile-fix'ы и дополнительно устраняет
+конфликты служебных META-INF ресурсов библиотек при mergeDebugJavaResource.
+
+Из APK исключаются только служебные/лицензионные метаданные, не используемые
+приложением во время выполнения: LICENSE/NOTICE/DEPENDENCIES, подписи JAR и
+вложенные OSGi MANIFEST.MF. META-INF/services не исключается.
+
+Если сборка снова остановится, пришлите BUILD_OUTPUT/build.log.

@@ -130,7 +130,7 @@ public final class PdfReflowParser {
 
         int minText = Math.max(40, Math.min(500, pages.size() * 6));
         if (totalTextChars < minText) {
-            throw new IOException("В PDF почти нет текстового слоя. Похоже, это скан. Для режима «Текст» здесь понадобится OCR; режим «Оригинал» продолжает работать.");
+            throw new IOException("В PDF почти нет текстового слоя. Похоже, это скан. Откройте документ в режиме «Оригинал».");
         }
 
         Set<String> repeatedEdges = new HashSet<>();

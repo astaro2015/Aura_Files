@@ -2,6 +2,7 @@ package com.aurafiles.app.index;
 
 import androidx.annotation.NonNull;
 import androidx.room.Entity;
+import androidx.room.ColumnInfo;
 import androidx.room.Index;
 import androidx.room.PrimaryKey;
 
@@ -16,7 +17,14 @@ import androidx.room.PrimaryKey;
                 @Index(value = {"size"}),
                 @Index(value = {"modifiedAt"}),
                 @Index(value = {"category"}),
-                @Index(value = {"sha256"})
+                @Index(value = {"sha256"}),
+                @Index(value = {"rootId", "category", "modifiedAt"}),
+                @Index(value = {"rootId", "sourceFolder", "modifiedAt"}),
+                @Index(value = {"rootId", "readerSupported", "modifiedAt"}),
+                @Index(value = {"rootId", "temporaryCandidate", "size"}),
+                @Index(value = {"rootId", "modifiedAt"}),
+                @Index(value = {"rootId", "size"}),
+                @Index(value = {"rootId", "size", "sha256"})
         }
 )
 public class IndexedFileEntity {
@@ -32,6 +40,8 @@ public class IndexedFileEntity {
     public long modifiedAt;
     @NonNull public String category;
     @NonNull public String sourceFolder;
+    @ColumnInfo(defaultValue = "0") public boolean readerSupported;
+    @ColumnInfo(defaultValue = "0") public boolean temporaryCandidate;
     public String sha256;
     public String quickHash;
     public long lastSeenScan;
@@ -47,6 +57,8 @@ public class IndexedFileEntity {
             long modifiedAt,
             @NonNull String category,
             @NonNull String sourceFolder,
+            boolean readerSupported,
+            boolean temporaryCandidate,
             String sha256,
             String quickHash,
             long lastSeenScan
@@ -61,6 +73,8 @@ public class IndexedFileEntity {
         this.modifiedAt = modifiedAt;
         this.category = category;
         this.sourceFolder = sourceFolder;
+        this.readerSupported = readerSupported;
+        this.temporaryCandidate = temporaryCandidate;
         this.sha256 = sha256;
         this.quickHash = quickHash;
         this.lastSeenScan = lastSeenScan;

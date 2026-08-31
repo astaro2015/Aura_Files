@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- AndroidKeyStore keys are device-bound; don't restore encrypted blobs without their keys. -->
+    <exclude domain="sharedpref" path="aura_credentials.xml" />
+    <exclude domain="sharedpref" path="aura_network_profiles.xml" />
+    <exclude domain="sharedpref" path="aura_ftp.xml" />
+</full-backup-content>

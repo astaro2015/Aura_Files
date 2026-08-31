@@ -6,6 +6,7 @@ enum class NetworkProtocol {
     FTP,
     FTPS,
     SMB,
+    SFTP,
 }
 
 data class NetworkProfile(
@@ -19,5 +20,9 @@ data class NetworkProfile(
     val smbShare: String = "",
     val smbDomain: String = "",
     val tls: Boolean = false,
+    val sftpFingerprint: String = "",
+    val sftpUseKey: Boolean = false,
+    val sftpPrivateKeySecretId: String? = null,
+    val sftpKeyPassphraseSecretId: String? = null,
+    val sftpInitialPath: String = "/",
 )
-

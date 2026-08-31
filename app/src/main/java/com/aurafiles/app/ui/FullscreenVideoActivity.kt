@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
@@ -63,6 +64,13 @@ class FullscreenVideoActivity : ComponentActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) WindowInsetsControllerCompat(window, window.decorView)
             .hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    override fun finish() {
+        val position = player?.currentPosition?.coerceAtLeast(0L)
+            ?: intent.getLongExtra(EXTRA_POSITION, 0L).coerceAtLeast(0L)
+        setResult(RESULT_OK, Intent().putExtra(EXTRA_POSITION, position))
+        super.finish()
     }
 
     override fun onDestroy() {

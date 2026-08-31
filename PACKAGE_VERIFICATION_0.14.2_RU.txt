@@ -1,0 +1,21 @@
+Aura Files 0.14.2 OPTIMIZED — проверка пакета
+Дата: 2026-08-29
+
+PASS: versionName=0.14.2, versionCode=21.
+PASS: исправлены три compile-ошибки, показанные реальной Windows Gradle-сборкой 0.14.1.
+PASS: AndroidManifest.xml и все XML app/src/main/res синтаксически разбираются.
+PASS: Gradle wrapper JAR присутствует и является корректным ZIP/JAR.
+PASS: Room schema v2 содержит MIGRATION_1_2.
+PASS: Migration SQL 1→2 выполнен на тестовой SQLite v1 schema без ошибок.
+PASS: EXPLAIN QUERY PLAN подтверждает использование новых составных индексов для category/books/temp/recent.
+PASS: старые N+1 вызовы findUnchanged()/duplicateSizes()/filesBySize() в рабочем коде отсутствуют.
+PASS: конфликт-маркеры в Kotlin/Java/XML отсутствуют.
+PASS: OCR engine dependencies (Tesseract/ML Kit Text Recognition/OpenCV) не добавлены.
+PASS: активные build/builder/README/Codex/workflow refs используют 0.14.2 / code 21.
+PASS: финальный ZIP проверяется после чистой распаковки по SOURCE_SHA256SUMS.txt.
+
+ВАЖНО:
+Полный Android Gradle assembleDebug именно 0.14.2 в этом контейнере НЕ заявляется как пройденный.
+На ПК пользователя ранее уже установлены/закэшированы JDK 17, Android SDK 36, NDK 28.2 и Gradle 9.5.
+Запуск: BUILD_ON_CLEAN_WINDOWS.bat
+Ожидаемый debug APK: BUILD_OUTPUT\\Aura_Files_0.14.2-debug.apk

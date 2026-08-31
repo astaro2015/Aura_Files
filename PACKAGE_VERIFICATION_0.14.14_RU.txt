@@ -1,0 +1,10 @@
+Проверка пакета Aura Files 0.14.14
+
+- Исправлена фактическая ошибка Kotlin-компиляции из Windows build.log 0.14.13:
+  DeleteEffect.kt:95:25 — drawContent() внутри clipRect() вызывался с неверным неявным receiver.
+- В 0.14.14 используется явный receiver: this@drawWithContent.drawContent().
+- versionName: 0.14.14
+- versionCode: 33
+- XML-ресурсы проверены на корректность.
+- Итоговый ZIP проверяется командой unzip -t после упаковки.
+- Полный Gradle assembleDebug в текущем контейнере не заявляется как выполненный, так как зависимости Gradle/Android здесь не гарантированно доступны по сети.

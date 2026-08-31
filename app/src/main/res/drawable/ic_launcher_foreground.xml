@@ -1,13 +1,4 @@
-<vector xmlns:android="http://schemas.android.com/apk/res/android"
-    android:width="108dp"
-    android:height="108dp"
-    android:viewportWidth="108"
-    android:viewportHeight="108">
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M24,34C24,29.58 27.58,26 32,26H48L55,34H76C80.42,34 84,37.58 84,42V72C84,77.52 79.52,82 74,82H34C28.48,82 24,77.52 24,72V34Z" />
-    <path
-        android:fillColor="#CFE5FF"
-        android:pathData="M24,43H84V72C84,77.52 79.52,82 74,82H34C28.48,82 24,77.52 24,72V43Z" />
-</vector>
-
+<?xml version="1.0" encoding="utf-8"?>
+<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
+    android:src="@drawable/aura_launcher_art"
+    android:gravity="fill" />

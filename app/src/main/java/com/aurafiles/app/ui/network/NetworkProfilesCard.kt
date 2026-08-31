@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Language
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material3.AlertDialog
@@ -29,6 +30,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,8 +39,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.aurafiles.app.model.DeleteAnimationMode
 import com.aurafiles.app.network.NetworkProfile
 import com.aurafiles.app.network.NetworkProtocol
+import com.aurafiles.app.ui.auraDeleteEffect
+import com.aurafiles.app.ui.preDeleteDelayMillis
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 @Composable
 internal fun NetworkProfilesCard(
@@ -47,8 +54,11 @@ internal fun NetworkProfilesCard(
     onTest: (NetworkProfile) -> Unit,
     onDuplicate: (NetworkProfile) -> Unit,
     onDelete: (NetworkProfile) -> Unit,
+    deleteAnimationMode: DeleteAnimationMode,
 ) {
     var pendingDelete by remember { mutableStateOf<NetworkProfile?>(null) }
+    var dissolvingProfileId by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
     Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
         Column(Modifier.padding(vertical = 8.dp)) {
             Text(
@@ -64,12 +74,23 @@ internal fun NetworkProfilesCard(
                     )
                 }
                 Row(
-                    modifier = Modifier.fillMaxWidth().clickable { onConnect(profile) }
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .auraDeleteEffect(
+                            active = dissolvingProfileId == profile.id,
+                            mode = deleteAnimationMode,
+                            seed = profile.id.hashCode(),
+                        )
+                        .clickable(enabled = dissolvingProfileId != profile.id) { onConnect(profile) }
                         .padding(start = 14.dp, top = 6.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     ProfileIcon(
-                        if (profile.protocol == NetworkProtocol.SMB) Icons.Rounded.Storage else Icons.Rounded.Language,
+                        when (profile.protocol) {
+                            NetworkProtocol.SMB -> Icons.Rounded.Storage
+                            NetworkProtocol.SFTP -> Icons.Rounded.Lock
+                            else -> Icons.Rounded.Language
+                        },
                     )
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
@@ -108,7 +129,19 @@ internal fun NetworkProfilesCard(
             title = { Text("Удалить подключение?") },
             text = { Text("${profile.name}\nПароль также будет удалён из защищённого хранилища.") },
             confirmButton = {
-                Button(onClick = { pendingDelete = null; onDelete(profile) }) { Text("Удалить") }
+                Button(onClick = {
+                    pendingDelete = null
+                    dissolvingProfileId = profile.id
+                    scope.launch {
+                        val wait = deleteAnimationMode.preDeleteDelayMillis()
+                        if (wait > 0L) delay(wait)
+                        onDelete(profile)
+                        // If deletion fails and the row stays on screen, restore it instead of
+                        // leaving a permanently invisible profile. A successful delete removes it first.
+                        delay(1200L)
+                        if (dissolvingProfileId == profile.id) dissolvingProfileId = null
+                    }
+                }) { Text("Удалить") }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } },
         )

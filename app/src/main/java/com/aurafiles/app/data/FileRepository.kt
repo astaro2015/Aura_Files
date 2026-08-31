@@ -1,5 +1,7 @@
 package com.aurafiles.app.data
 
+import com.aurafiles.app.util.toHexString
+
 import android.content.Context
 import android.content.ClipData
 import android.content.ContentValues
@@ -17,6 +19,7 @@ import android.provider.DocumentsContract
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.model.FileEntry
+import com.aurafiles.app.model.DeleteAnimationMode
 import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.CategorySummary
 import com.aurafiles.app.model.StorageSnapshot
@@ -25,6 +28,7 @@ import com.aurafiles.app.model.StorageVolumeInfo
 import com.aurafiles.app.model.StorageAccessMode
 import com.aurafiles.app.model.TrashRecord
 import com.aurafiles.app.model.matchesCategory
+import com.aurafiles.app.model.isTemporaryCandidate
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -99,13 +103,26 @@ class FileRepository(private val context: Context) {
     }
 
     fun listChildren(directory: DocumentFile): List<FileEntry> {
-        return directory.listFiles()
+        return FastDocumentListing.list(context, directory)
+            .asSequence()
             .filterNot { it.name == TRASH_FOLDER }
-            .map { it.toEntry(directory.uri) }
+            .map { info ->
+                FileEntry(
+                    document = info.document,
+                    name = info.name,
+                    uri = info.uri,
+                    isDirectory = info.isDirectory,
+                    mimeType = info.mimeType,
+                    size = info.size,
+                    modifiedAt = info.modifiedAt,
+                    parentUri = directory.uri,
+                )
+            }
             .sortedWith(
                 compareByDescending<FileEntry> { it.isDirectory }
                     .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
             )
+            .toList()
     }
 
     fun createFolder(parent: DocumentFile, requestedName: String): DocumentFile {
@@ -152,21 +169,39 @@ class FileRepository(private val context: Context) {
             originalUri = entry.uri,
             size = entry.size,
         )
-        saveTrashRecords(loadTrashMetadata() + record)
+        saveTrashMetadata(loadTrashMetadata() + record.toStoredTrashRecord())
         return record
     }
 
     fun listTrash(root: DocumentFile): List<TrashRecord> {
         val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory } ?: return emptyList()
-        val documents = trash.listFiles().associateBy { it.uri.toString() }
-        val valid = loadTrashMetadata().mapNotNull { record ->
-            val document = documents[record.entry.uri.toString()] ?: return@mapNotNull null
-            record.copy(entry = document.toEntry(trash.uri))
+        val documents = FastDocumentListing.list(context, trash).associateBy { it.uri.toString() }
+        val metadata = loadTrashMetadata()
+        val survivingMetadata = metadata.filter { it.uri.toString() in documents }
+        if (survivingMetadata.size != metadata.size) saveTrashMetadata(survivingMetadata)
+        return survivingMetadata.mapNotNull { stored ->
+            val info = documents[stored.uri.toString()] ?: return@mapNotNull null
+            TrashRecord(
+                entry = FileEntry(
+                    document = info.document,
+                    name = info.name,
+                    uri = info.uri,
+                    isDirectory = info.isDirectory,
+                    mimeType = info.mimeType,
+                    size = info.size,
+                    modifiedAt = info.modifiedAt,
+                    parentUri = trash.uri,
+                ),
+                originalParentUri = stored.originalParentUri,
+                originalName = stored.originalName,
+                deletedAt = stored.deletedAt,
+                originalUri = stored.originalUri,
+                size = stored.size.takeIf { it > 0L } ?: info.size,
+            )
         }.sortedByDescending(TrashRecord::deletedAt)
-        return valid
     }
 
-    fun restoreFromTrash(root: DocumentFile, record: TrashRecord): DocumentFile {
+    fun restoreFromTrash(root: DocumentFile, record: TrashRecord): FileEntry {
         val originalParent = documentFromUri(record.originalParentUri)
             ?.takeIf { it.exists() && it.isDirectory && it.canWrite() }
             ?: root
@@ -180,7 +215,7 @@ class FileRepository(private val context: Context) {
             }
         }
         removeTrashRecord(record.entry.uri)
-        return restored
+        return restored.toEntry(originalParent.uri)
     }
 
     fun permanentlyDelete(record: TrashRecord) {
@@ -189,12 +224,13 @@ class FileRepository(private val context: Context) {
     }
 
     fun emptyTrash(root: DocumentFile) {
-        val children = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory }?.listFiles().orEmpty()
+        val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory } ?: return
+        val children = FastDocumentListing.list(context, trash)
         val removedUris = children.map { it.uri }.toSet()
         children.forEach { child ->
-            require(child.delete()) { "Не удалось удалить ${child.name}" }
+            require(child.document.delete()) { "Не удалось удалить ${child.name}" }
         }
-        saveTrashRecords(loadTrashMetadata().filterNot { it.entry.uri in removedUris })
+        saveTrashMetadata(loadTrashMetadata().filterNot { it.uri in removedUris })
     }
 
     fun favoriteUris(): Set<Uri> {
@@ -251,7 +287,20 @@ class FileRepository(private val context: Context) {
         preferences.edit().putBoolean(KEY_FAVORITES_HOME, value).apply()
     }
 
-    fun batchRename(entries: List<FileEntry>, newNames: List<String>) {
+    fun deleteAnimationMode(): DeleteAnimationMode {
+        val raw = preferences.getString(KEY_DELETE_ANIMATION, DeleteAnimationMode.Dissolve.name)
+        // 0.14.18 removed the old Fast mode. A legacy stored "Fast" value simply falls back to
+        // Dissolve; write it back once so the preference is clean for future launches.
+        val parsed = runCatching { DeleteAnimationMode.valueOf(raw.orEmpty()) }.getOrDefault(DeleteAnimationMode.Dissolve)
+        if (raw != parsed.name) preferences.edit().putString(KEY_DELETE_ANIMATION, parsed.name).apply()
+        return parsed
+    }
+
+    fun setDeleteAnimationMode(value: DeleteAnimationMode) {
+        preferences.edit().putString(KEY_DELETE_ANIMATION, value.name).apply()
+    }
+
+    fun batchRename(entries: List<FileEntry>, newNames: List<String>): List<Uri> {
         require(entries.isNotEmpty() && entries.size == newNames.size) { "Некорректный список имён" }
         val cleaned = newNames.map(String::trim)
         require(cleaned.none(String::isBlank)) { "Новое имя не может быть пустым" }
@@ -271,21 +320,68 @@ class FileRepository(private val context: Context) {
         }
 
         val originals = entries.map(FileEntry::name)
+        val originalUris = entries.map(FileEntry::uri)
+        val favoriteSnapshot = favoriteUris()
+        val mutated = BooleanArray(entries.size)
         try {
-            entries.forEach { entry ->
+            entries.forEachIndexed { index, entry ->
                 require(entry.document.renameTo(".aura-${UUID.randomUUID()}")) {
                     "Не удалось подготовить ${entry.name} к переименованию"
                 }
+                mutated[index] = true
             }
             entries.zip(cleaned).forEach { (entry, requestedName) ->
-                val oldUri = entry.uri
                 require(entry.document.renameTo(requestedName)) { "Не удалось переименовать ${entry.name}" }
-                replaceFavoriteUri(oldUri, entry.document.uri)
             }
+            val finalUris = entries.map { it.document.uri }
+            val replacements = originalUris.zip(finalUris).toMap()
+            val updatedFavorites = favoriteSnapshot.map { replacements[it] ?: it }.map(Uri::toString).toSet()
+            preferences.edit().putStringSet(KEY_FAVORITES, updatedFavorites).apply()
+            return finalUris
         } catch (error: Throwable) {
-            entries.zip(originals).forEach { (entry, original) -> runCatching { entry.document.renameTo(original) } }
+            val rollbackFailures = rollbackBatchRename(entries, originals, mutated)
+            if (rollbackFailures.isNotEmpty()) {
+                throw IOException(
+                    buildString {
+                        append(error.message ?: "Пакетное переименование не завершено")
+                        append(". Не удалось вернуть исходные имена: ")
+                        append(rollbackFailures.joinToString())
+                    },
+                    error,
+                )
+            }
             throw error
         }
+    }
+
+    /**
+     * Rollback is also two-phase. First free every original name that may now be occupied by
+     * another selected file, then restore originals. This covers swaps and rename cycles.
+     */
+    private fun rollbackBatchRename(
+        entries: List<FileEntry>,
+        originals: List<String>,
+        mutated: BooleanArray,
+    ): List<String> {
+        entries.indices.filter { mutated[it] && entries[it].document.name != originals[it] }.forEach { index ->
+            runCatching { entries[index].document.renameTo(".aura-rollback-${UUID.randomUUID()}") }
+        }
+
+        var remaining = entries.indices
+            .filter { mutated[it] && entries[it].document.name != originals[it] }
+            .toMutableSet()
+        repeat(entries.size + 1) {
+            if (remaining.isEmpty()) return@repeat
+            var progressed = false
+            remaining.toList().forEach { index ->
+                if (runCatching { entries[index].document.renameTo(originals[index]) }.getOrDefault(false)) {
+                    remaining.remove(index)
+                    progressed = true
+                }
+            }
+            if (!progressed) return@repeat
+        }
+        return remaining.map { originals[it] }
     }
 
     fun sha256(entry: FileEntry): String = contentHash(entry)
@@ -443,12 +539,16 @@ class FileRepository(private val context: Context) {
             }
             .sortedByDescending { it.first().size * (it.size - 1) }
 
+        val temporary = files.filter(FileEntry::isTemporaryCandidate)
         return StorageAnalysis(
             files = files,
             totalBytes = files.sumOf(FileEntry::size),
             categories = categories,
             largeFiles = files.filter { it.size >= LARGE_FILE_BYTES }.sortedByDescending(FileEntry::size).take(50),
+            largeFileCount = files.count { it.size >= LARGE_FILE_BYTES },
             duplicateGroups = duplicateGroups,
+            temporaryFileCount = temporary.size,
+            temporaryBytes = temporary.sumOf(FileEntry::size),
             limitReached = limitReached,
             scannedAt = System.currentTimeMillis(),
         )
@@ -529,12 +629,16 @@ class FileRepository(private val context: Context) {
             val matching = files.filter { it.matchesCategory(category) }
             CategorySummary(category, matching.size, matching.sumOf(FileEntry::size))
         }
+        val temporary = files.filter(FileEntry::isTemporaryCandidate)
         StorageAnalysis(
             files = files,
             totalBytes = files.sumOf(FileEntry::size),
             categories = categories,
             largeFiles = files.filter { it.size >= LARGE_FILE_BYTES }.sortedByDescending(FileEntry::size).take(50),
+            largeFileCount = files.count { it.size >= LARGE_FILE_BYTES },
             duplicateGroups = duplicates,
+            temporaryFileCount = temporary.size,
+            temporaryBytes = temporary.sumOf(FileEntry::size),
             limitReached = payload.optBoolean("limitReached"),
             scannedAt = payload.optLong("scannedAt"),
         )
@@ -634,10 +738,8 @@ class FileRepository(private val context: Context) {
                     state = volume.state,
                 )
             }
-        if (mounted.isNotEmpty()) return mounted
-
         val usbManager = context.getSystemService(UsbManager::class.java)
-        return usbManager.deviceList.values
+        val hardware = usbManager.deviceList.values
             .filter { device ->
                 device.deviceClass == UsbConstants.USB_CLASS_MASS_STORAGE ||
                     (0 until device.interfaceCount).any { index ->
@@ -655,6 +757,9 @@ class FileRepository(private val context: Context) {
                     hardwareDetected = true,
                 )
             }
+        // StorageManager may expose an SD card or adopted volume while an unmounted USB stick
+        // is visible only through UsbManager. Keep both sources instead of returning early.
+        return (mounted + hardware).distinctBy(StorageVolumeInfo::id)
     }
 
     private fun copyDocument(
@@ -677,12 +782,20 @@ class FileRepository(private val context: Context) {
             val fileName = uniqueName(destination, preferredName ?: source.name ?: "Файл")
             val copiedFile = destination.createFile(source.type ?: "application/octet-stream", fileName)
                 ?: throw IOException("Не удалось создать файл $fileName")
-            val input = resolver.openInputStream(source.uri)
-                ?: throw IOException("Не удалось прочитать ${source.name}")
-            val output = resolver.openOutputStream(copiedFile.uri, "w")
-                ?: throw IOException("Не удалось записать $fileName")
             try {
+                val input = if (source.uri.scheme == "file") {
+                    File(requireNotNull(source.uri.path) { "Не удалось определить путь ${source.name}" }).inputStream()
+                } else {
+                    resolver.openInputStream(source.uri)
+                        ?: throw IOException("Не удалось прочитать ${source.name}")
+                }
                 input.use { sourceStream ->
+                    val output = if (copiedFile.uri.scheme == "file") {
+                        File(requireNotNull(copiedFile.uri.path) { "Не удалось определить путь $fileName" }).outputStream()
+                    } else {
+                        resolver.openOutputStream(copiedFile.uri, "w")
+                            ?: throw IOException("Не удалось записать $fileName")
+                    }
                     output.use { targetStream -> sourceStream.copyTo(targetStream) }
                 }
                 copiedFile
@@ -724,7 +837,7 @@ class FileRepository(private val context: Context) {
                 digest.update(buffer, 0, read)
             }
         }
-        return digest.digest().joinToString("") { "%02x".format(it) }
+        return digest.digest().toHexString()
     }
 
     @Suppress("DEPRECATION")
@@ -785,13 +898,7 @@ class FileRepository(private val context: Context) {
         return actual > 0L && kotlin.math.abs(actual - expected) <= TIMESTAMP_TOLERANCE_MILLIS
     }
 
-    private fun documentFromUri(uri: Uri): DocumentFile? {
-        return if (uri.scheme == "file") {
-            uri.path?.let(::File)?.let(DocumentFile::fromFile)
-        } else {
-            DocumentFile.fromSingleUri(context, uri)
-        }
-    }
+    private fun documentFromUri(uri: Uri): DocumentFile? = FastDocumentListing.resolve(context, uri)
 
     private fun externallyAccessibleUri(entry: FileEntry): Uri {
         if (entry.uri.scheme != "file") return entry.uri
@@ -803,37 +910,59 @@ class FileRepository(private val context: Context) {
         )
     }
 
-    private fun loadTrashMetadata(): List<TrashRecord> {
+    private data class StoredTrashRecord(
+        val uri: Uri,
+        val originalParentUri: Uri,
+        val originalName: String,
+        val deletedAt: Long,
+        val originalUri: Uri?,
+        val size: Long,
+    )
+
+    private fun TrashRecord.toStoredTrashRecord(): StoredTrashRecord = StoredTrashRecord(
+        uri = entry.uri,
+        originalParentUri = originalParentUri,
+        originalName = originalName,
+        deletedAt = deletedAt,
+        originalUri = originalUri,
+        size = size,
+    )
+
+    /**
+     * Trash metadata is intentionally parsed without resolving every URI. Resolving each
+     * DocumentFile here used to cause several provider IPC calls for every trash entry even
+     * when we only needed to append/remove one metadata row.
+     */
+    private fun loadTrashMetadata(): List<StoredTrashRecord> {
         val raw = preferences.getString(KEY_TRASH_RECORDS, null) ?: return emptyList()
         return runCatching {
             val array = JSONArray(raw)
             buildList {
                 for (index in 0 until array.length()) {
                     val item = array.getJSONObject(index)
-                    val uri = Uri.parse(item.getString("uri"))
-                    val record = runCatching {
-                        val document = documentFromUri(uri) ?: return@runCatching null
-                        TrashRecord(
-                            entry = document.toEntry(),
-                            originalParentUri = Uri.parse(item.getString("parent")),
-                            originalName = item.getString("name"),
-                            deletedAt = item.getLong("deletedAt"),
+                    val uri = item.optString("uri").takeIf(String::isNotBlank)?.let(Uri::parse) ?: continue
+                    val parent = item.optString("parent").takeIf(String::isNotBlank)?.let(Uri::parse) ?: continue
+                    add(
+                        StoredTrashRecord(
+                            uri = uri,
+                            originalParentUri = parent,
+                            originalName = item.optString("name"),
+                            deletedAt = item.optLong("deletedAt"),
                             originalUri = item.optString("originalUri").takeIf(String::isNotBlank)?.let(Uri::parse),
-                            size = item.optLong("size", document.length()),
+                            size = item.optLong("size", 0L).coerceAtLeast(0L),
                         )
-                    }.getOrNull()
-                    if (record != null) add(record)
+                    )
                 }
             }
         }.getOrDefault(emptyList())
     }
 
-    private fun saveTrashRecords(records: List<TrashRecord>) {
+    private fun saveTrashMetadata(records: List<StoredTrashRecord>) {
         val array = JSONArray()
         records.forEach { record ->
             array.put(
                 JSONObject()
-                    .put("uri", record.entry.uri.toString())
+                    .put("uri", record.uri.toString())
                     .put("parent", record.originalParentUri.toString())
                     .put("name", record.originalName)
                     .put("deletedAt", record.deletedAt)
@@ -845,7 +974,7 @@ class FileRepository(private val context: Context) {
     }
 
     private fun removeTrashRecord(uri: Uri) {
-        saveTrashRecords(loadTrashMetadata().filterNot { it.entry.uri == uri })
+        saveTrashMetadata(loadTrashMetadata().filterNot { it.uri == uri })
     }
 
     private fun uniqueName(parent: DocumentFile, original: String): String {
@@ -906,6 +1035,7 @@ class FileRepository(private val context: Context) {
         const val KEY_SHOW_THUMBNAIL_FILES = "show_thumbnail_files"
         const val KEY_GRID_THUMBNAILS = "grid_thumbnails"
         const val KEY_FAVORITES_HOME = "favorites_home"
+        const val KEY_DELETE_ANIMATION = "delete_animation_mode"
         const val ANALYSIS_CACHE_FILE = "analysis-index.json"
         const val ANALYSIS_CACHE_VERSION = 1
         const val TRASH_FOLDER = ".AuraTrash"

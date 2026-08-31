@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="workspace_title">Универсальные панели</string>
+    <string name="workspace_compare">Сравнить панели</string>
+    <string name="workspace_sync_right">Синхронизировать →</string>
+    <string name="workspace_sync_left">← Синхронизировать</string>
+    <string name="sftp_title">SFTP</string>
+    <string name="similar_photos_title">Похожие фотографии</string>
+    <string name="apk_info_title">Информация о приложении</string>
+    <string name="calculate_folder_size">Рассчитать размер</string>
+    <string name="advanced_settings_014">Возможности Aura 0.14</string>
+</resources>

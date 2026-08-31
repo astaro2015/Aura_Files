@@ -1,0 +1,10 @@
+Aura Files 0.14.1 — compile fixes after the first real Windows Gradle build
+
+Исправлено по build.log:
+1. ExtendedArchiveRepository.kt — API ZipArchiveInputStream.builder() доступен только в Commons Compress 1.29+, а проект использует 1.28.0. Использован совместимый конструктор и nextZipEntry.
+2. AuraFileManagerApp.kt — SettingsPage получил LocalContext.current для запуска AdvancedSettingsActivity.
+3. BackendWorkspaceActivity.kt — callback pause/resume приведён к () -> Unit.
+4. BackendWorkspaceActivity.kt — dragAndDropSource явно использует новый overload transferData = { Offset -> ... }.
+5. BackendWorkspaceActivity.kt — локальный formatBytes переименован в formatBackendBytes, чтобы не конфликтовать с package-level formatBytes из AuraFileManagerApp.kt.
+6. MediaPlayerActivity.kt — Intent.setClipData больше не используется в цепочке (метод возвращает Unit).
+7. Windows bootstrap — при исходной compile-ошибке Gradle больше не повторяет бесполезно сборку 12 раз; build.log очищается перед новой сборкой.

@@ -38,5 +38,18 @@ class TransferController {
         onPaused(false)
         if (cancelled.get()) throw CancellationException("Transfer cancelled")
     }
-}
 
+    /**
+     * SMBJ exposes blocking streams, so its progress callback cannot call the
+     * suspending checkpoint(). This variant is only for an already-IO thread.
+     */
+    fun checkpointBlocking(onPaused: (Boolean) -> Unit = {}) {
+        if (cancelled.get()) throw CancellationException("Transfer cancelled")
+        if (paused.get()) onPaused(true)
+        while (paused.get() && !cancelled.get()) {
+            Thread.sleep(80L)
+        }
+        onPaused(false)
+        if (cancelled.get()) throw CancellationException("Transfer cancelled")
+    }
+}

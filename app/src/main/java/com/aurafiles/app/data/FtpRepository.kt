@@ -18,6 +18,7 @@ import java.io.IOException
 import java.net.URLConnection
 import java.security.KeyStore
 import java.time.Duration
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -132,17 +133,28 @@ class FtpRepository(private val context: Context) {
                 ?: throw IOException("Не удалось открыть выбранный файл")
             require(document.isFile) { "Загрузка папок через системный выбор пока не поддерживается" }
             val name = safeName(document.name ?: "Файл")
-            withReconnect { ftp ->
-                val remoteName = uniqueRemoteName(ftp, currentPath, name)
-                val input = context.contentResolver.openInputStream(uri)
-                    ?: throw IOException("Не удалось прочитать $name")
-                input.use {
-                    if (!ftp.storeFile(childPath(currentPath, remoteName), it)) {
-                        throw IOException(replyMessage(ftp, "Не удалось загрузить $name"))
+            val remoteName = withReconnect { ftp -> uniqueRemoteName(ftp, currentPath, name) }
+            val finalPath = childPath(currentPath, remoteName)
+            val temporaryPath = childPath(currentPath, ".aura-part-${UUID.randomUUID()}")
+            try {
+                withReconnect { ftp ->
+                    runCatching { ftp.deleteFile(temporaryPath) }
+                    val input = context.contentResolver.openInputStream(uri)
+                        ?: throw IOException("Не удалось прочитать $name")
+                    input.use {
+                        if (!ftp.storeFile(temporaryPath, it)) {
+                            throw IOException(replyMessage(ftp, "Не удалось загрузить $name"))
+                        }
+                    }
+                    if (!ftp.rename(temporaryPath, finalPath)) {
+                        throw IOException(replyMessage(ftp, "Не удалось завершить загрузку $name"))
                     }
                 }
+                completed += 1
+            } catch (error: Throwable) {
+                runCatching { requireConnected().deleteFile(temporaryPath) }
+                throw error
             }
-            completed += 1
         }
         completed
     }

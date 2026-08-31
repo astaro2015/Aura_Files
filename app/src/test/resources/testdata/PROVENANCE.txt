@@ -1,0 +1,2 @@
+All binary/text fixtures in this testdata tree were generated specifically for Aura Files verification on 2026-08-28.
+They contain no third-party copyrighted documents. Files named corrupt/path_traversal are intentionally malformed/adversarial test fixtures.

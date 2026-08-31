@@ -1,0 +1,14 @@
+Проверка пакета Aura Files 0.14.18
+
+- versionName: 0.14.18
+- versionCode: 37
+- добавлен DeleteAnimationMode.Burn и режим «Сгорание» в настройках
+- «Быстрая» удалена из enum и UI; legacy-значение Fast автоматически переводится в Dissolve через fallback preferences
+- «Песчинки» и «Распад на пиксели» сохранены
+- burn-render: offscreen-композиция, неровная эрозия от всех внешних краёв к центру, тлеющая кромка, короткие вспышки, искры/пепел
+- DeleteEffect.kt проверен отдельной Kotlin-компиляцией с Compose-совместимыми stub API
+- XML: 13/13 ресурсов успешно разобраны перед упаковкой
+- итоговый ZIP проверяется тестом целостности
+
+Полный Android Gradle compile в контейнере не заявляется: Android/Gradle dependency cache здесь отсутствует.
+Окончательная компиляционная проверка выполняется BUILD_ON_CLEAN_WINDOWS.bat.

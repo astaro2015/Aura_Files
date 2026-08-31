@@ -52,3 +52,11 @@ Logging API and no-output runtime binding used by the reader/network dependencie
 ## AndroidX Room 2.8.4 — Apache License 2.0
 
 Used for the persistent, incremental storage index. Project: https://developer.android.com/jetpack/androidx/releases/room
+
+## SSHJ 0.40.0 — Apache License 2.0
+
+Used for SFTP/SSH client access. Project: https://github.com/hierynomus/sshj
+
+## Apache MINA SSHD 2.19.0 — Apache License 2.0
+
+Used for the embedded SFTP-only SSH server on the phone (`sshd-core` + `sshd-sftp`). Project: https://mina.apache.org/sshd-project/

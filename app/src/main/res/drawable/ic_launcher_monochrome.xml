@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Simplified silhouette of the new open-folder + microSD Aura icon for themed launchers. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M41,22 L67,22 L73,28 L73,53 L41,53 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M19,39 L45,39 L51,45 L89,45 Q94,45 94,50 L89,83 Q88,88 82,88 L24,88 Q18,88 17,82 L13,50 Q12,45 19,45 Z" />
+</vector>

@@ -3,7 +3,11 @@ package com.aurafiles.app.transfer
 import android.content.ContentResolver
 import android.content.Context
 import android.provider.DocumentsContract
+import android.os.SystemClock
+import com.aurafiles.app.data.FastDocumentListing
 import androidx.documentfile.provider.DocumentFile
+import com.aurafiles.app.backend.StorageBackendRegistry
+import java.io.File
 import java.io.IOException
 import java.util.ArrayDeque
 import java.util.UUID
@@ -18,15 +22,18 @@ import kotlinx.coroutines.withContext
 class TransferEngine(
     context: Context,
     private val smbGateway: SmbTransferGateway? = null,
+    private val backendRegistry: StorageBackendRegistry? = null,
 ) {
     private val appContext = context.applicationContext
     private val resolver: ContentResolver = appContext.contentResolver
+    private val backendCore = backendRegistry?.let(::BackendTransferCore)
     private val _progress = MutableStateFlow<TransferProgress?>(null)
     val progress: StateFlow<TransferProgress?> = _progress.asStateFlow()
     private val _conflict = MutableStateFlow<TransferConflict?>(null)
     val conflict: StateFlow<TransferConflict?> = _conflict.asStateFlow()
     private var conflictReply: CompletableDeferred<TransferConflictDecision>? = null
     private var applyToAllPolicy: TransferConflictPolicy? = null
+    private var lastProgressEmitAt = 0L
 
     fun resolveConflict(decision: TransferConflictDecision) {
         if (decision.applyToAll) applyToAllPolicy = decision.policy
@@ -36,6 +43,16 @@ class TransferEngine(
     suspend fun execute(request: TransferRequest, controller: TransferController): TransferResult =
         withContext(Dispatchers.IO) {
             require(request.sources.isNotEmpty()) { "Не выбраны источники операции" }
+            val usesBackend = request.sources.any { it is TransferSource.Backend } || request.destination is TransferDestination.Backend
+            if (usesBackend) {
+                val core = backendCore ?: throw IOException("Универсальные backend не подключены")
+                return@withContext core.execute(
+                    request = request,
+                    controller = controller,
+                    resolveConflict = { conflict -> awaitBackendConflict(conflict, controller) },
+                    onProgress = { progress -> publishProgress(progress) },
+                )
+            }
             applyToAllPolicy = null
             val stats = RuntimeStats(request.id)
             _progress.value = TransferProgress(operationId = request.id, state = TransferState.PREPARING)
@@ -47,6 +64,7 @@ class TransferEngine(
                         val measured = measure(document, controller, stats)
                         stats.sourceSizes[source.uri.toString()] = measured
                     }
+                    is TransferSource.Backend -> throw IOException("Backend-источник должен обрабатываться универсальным ядром")
                     is TransferSource.Smb -> {
                         stats.totalItems += 1
                         stats.totalBytes += source.size.coerceAtLeast(0L)
@@ -88,16 +106,37 @@ class TransferEngine(
             ?: throw IOException("Не выбрана SMB-папка назначения")
         request.sources.forEach { raw ->
             val source = raw as? TransferSource.Local ?: throw IOException("Для загрузки нужен локальный файл")
+            val measured = stats.sourceSizes[source.uri.toString()]
+                ?: SourceMeasure(1, source.size.coerceAtLeast(0L))
             stats.currentItemBytes = 0L
             stats.currentItemTotalBytes = source.size.coerceAtLeast(0L)
-            gateway.upload(source, destination, controller) { name, delta, total ->
+
+            var activeFile = false
+            var observedFiles = 0
+            gateway.upload(source, destination, controller) { name, delta, total, started ->
+                if (started) {
+                    if (activeFile) {
+                        stats.completedItems += 1
+                        observedFiles += 1
+                    }
+                    activeFile = true
+                    stats.currentItemBytes = 0L
+                    stats.currentItemTotalBytes = total.coerceAtLeast(0L)
+                }
                 stats.currentName = name
                 stats.currentItemBytes += delta
                 stats.currentItemTotalBytes = total.coerceAtLeast(0L)
                 stats.processedBytes += delta
                 emit(stats, name, TransferState.RUNNING)
             }
-            stats.completedItems += 1
+            if (activeFile) {
+                stats.completedItems += 1
+                observedFiles += 1
+            }
+            // measure() counts files and directories; progress callbacks describe files.
+            stats.completedItems += (measured.items - observedFiles).coerceAtLeast(0)
+            stats.currentItemBytes = 0L
+            stats.currentItemTotalBytes = 0L
             emit(stats, source.name, TransferState.RUNNING)
         }
     }
@@ -114,14 +153,29 @@ class TransferEngine(
             val source = raw as? TransferSource.Smb ?: throw IOException("Для скачивания нужен SMB-объект")
             stats.currentItemBytes = 0L
             stats.currentItemTotalBytes = source.size.coerceAtLeast(0L)
-            gateway.download(source, destination, controller) { name, delta, total ->
+
+            var activeFile = false
+            gateway.download(source, destination, controller) { name, delta, total, started ->
+                if (started) {
+                    if (activeFile) stats.completedItems += 1
+                    activeFile = true
+                    stats.currentItemBytes = 0L
+                    stats.currentItemTotalBytes = total.coerceAtLeast(0L)
+                    if (source.isDirectory) {
+                        stats.totalItems += 1
+                        stats.totalBytes += total.coerceAtLeast(0L)
+                    }
+                }
                 stats.currentName = name
                 stats.currentItemBytes += delta
                 stats.currentItemTotalBytes = total.coerceAtLeast(0L)
                 stats.processedBytes += delta
                 emit(stats, name, TransferState.RUNNING)
             }
-            stats.completedItems += 1
+            if (activeFile) stats.completedItems += 1
+            if (source.isDirectory || !activeFile) stats.completedItems += 1
+            stats.currentItemBytes = 0L
+            stats.currentItemTotalBytes = 0L
             emit(stats, source.name, TransferState.RUNNING)
         }
     }
@@ -240,10 +294,18 @@ class TransferEngine(
         stats.currentItemBytes = 0L
         stats.currentItemTotalBytes = source.length().coerceAtLeast(0L)
         try {
-            val input = resolver.openInputStream(source.uri)
-                ?: throw IOException("Не удалось прочитать ${source.name}")
-            val output = resolver.openOutputStream(temporary.uri, "w")
-                ?: throw IOException("Не удалось записать $finalName")
+            val input = if (source.uri.scheme == ContentResolver.SCHEME_FILE) {
+                File(requireNotNull(source.uri.path) { "Не удалось определить путь ${source.name}" }).inputStream()
+            } else {
+                resolver.openInputStream(source.uri)
+                    ?: throw IOException("Не удалось прочитать ${source.name}")
+            }
+            val output = if (temporary.uri.scheme == ContentResolver.SCHEME_FILE) {
+                File(requireNotNull(temporary.uri.path) { "Не удалось определить путь $finalName" }).outputStream()
+            } else {
+                resolver.openOutputStream(temporary.uri, "w")
+                    ?: throw IOException("Не удалось записать $finalName")
+            }
             input.buffered(BUFFER_SIZE).use { sourceStream ->
                 output.buffered(BUFFER_SIZE).use { targetStream ->
                     val buffer = ByteArray(BUFFER_SIZE)
@@ -366,13 +428,27 @@ class TransferEngine(
     }
 
     private fun TransferSource.Local.document(): DocumentFile =
-        runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
-            ?: runCatching { DocumentFile.fromSingleUri(appContext, uri) }.getOrNull()
-            ?: throw IOException("Источник $name недоступен")
+        documentFromUri(uri) ?: throw IOException("Источник $name недоступен")
 
-    private fun documentFromUri(uri: android.net.Uri): DocumentFile? =
-        runCatching { DocumentFile.fromTreeUri(appContext, uri) }.getOrNull()
-            ?: runCatching { DocumentFile.fromSingleUri(appContext, uri) }.getOrNull()
+    private fun documentFromUri(uri: android.net.Uri): DocumentFile? = FastDocumentListing.resolve(appContext, uri)
+
+    private suspend fun awaitBackendConflict(
+        conflict: TransferConflict,
+        controller: TransferController,
+    ): TransferConflictDecision {
+        controller.checkpoint { paused -> updatePaused(paused) }
+        val reply = CompletableDeferred<TransferConflictDecision>()
+        conflictReply = reply
+        _conflict.value = conflict
+        return try {
+            reply.await().also { decision ->
+                if (decision.applyToAll) applyToAllPolicy = decision.policy
+            }
+        } finally {
+            _conflict.value = null
+            conflictReply = null
+        }
+    }
 
     private fun updatePaused(paused: Boolean) {
         val current = _progress.value ?: return
@@ -382,8 +458,20 @@ class TransferEngine(
 
     private fun emit(stats: RuntimeStats, name: String, state: TransferState) {
         stats.currentName = name
+        val now = SystemClock.elapsedRealtime()
+        val force = state != TransferState.RUNNING
+        if (!force && now - lastProgressEmitAt < PROGRESS_EMIT_INTERVAL_MS) return
+        lastProgressEmitAt = now
         stats.recordSpeed()
         _progress.value = currentProgress(stats, state, null)
+    }
+
+    private fun publishProgress(progress: TransferProgress) {
+        val now = SystemClock.elapsedRealtime()
+        val force = progress.state != TransferState.RUNNING
+        if (!force && now - lastProgressEmitAt < PROGRESS_EMIT_INTERVAL_MS) return
+        lastProgressEmitAt = now
+        _progress.value = progress
     }
 
     private fun currentProgress(stats: RuntimeStats, state: TransferState, error: String?): TransferProgress {
@@ -437,5 +525,6 @@ class TransferEngine(
     companion object {
         private const val BUFFER_SIZE = 1024 * 1024
         private const val SPEED_WINDOW_MS = 4_000L
+        private const val PROGRESS_EMIT_INTERVAL_MS = 100L
     }
 }
