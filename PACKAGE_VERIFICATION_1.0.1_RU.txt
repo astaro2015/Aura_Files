@@ -1,0 +1,20 @@
+Aura Files 1.0.1 — локальная проверка пакета
+Дата: 2026-09-04
+База: GitHub astaro2015/Aura_Files commit 63773f432aa700d042b57b8f98ad3091e209ea4d
+
+Проверено в текущей среде:
+- versionName 1.0.1 / versionCode 101 / compileSdk 36 / NDK 28.2.13676358.
+- Kotlin PSI syntax: 67 файлов, 0 ошибок.
+- Java compiler parse-only syntax: 44 файла, 0 ошибок.
+- Android XML: 14 файлов, 0 ошибок разбора.
+- Room DAO SQL: 36 @Query; 35 скалярных/обычных запросов проверены через SQLite EXPLAIN, 0 ошибок; deleteUris с IN(:uris) пропущен из-за list-binding в чистом sqlite3.
+- SQL миграции Room 3→4 (одноразовая очистка индекс-кэша): проверен, выполняется.
+- git diff --check: OK.
+- пользовательские строки «учётная запись Windows», «Настройки 0.14» и «Расширенные возможности 0.14» в актуальном UI отсутствуют.
+- существующие packaging excludes META-INF/LICENSE* из GitHub 1.0 сохранены.
+- OCR-движок/зависимость не добавлялись; упоминания OCR в DjVu относятся только к чтению уже встроенного hidden-text/OCR слоя файла.
+
+Полный Android Gradle build 1.0.1 в текущем контейнере НЕ заявляется пройденным:
+services.gradle.org не разрешается через DNS, поэтому Gradle wrapper не может скачать Gradle 9.5.0.
+Это ограничение среды, но не доказательство успешной компиляции изменённой версии.
+Контрольную сборку следует выполнить BUILD_ON_CLEAN_WINDOWS.bat; staging теперь предварительно проверяет SOURCE_SHA256SUMS.txt и игнорирует лишние старые файлы.

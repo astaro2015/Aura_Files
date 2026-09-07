@@ -1,0 +1,20 @@
+Aura Files 1.2.5 CLOUD UI — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.2.5, versionCode = 125.
+- Новый StandardBackendBrowser подключён для single-pane backend режима.
+- Он повторно использует общие компоненты Aura: BrowserHeader, BrowserControls, AuraSearchField, EmptyFolder, NameDialog.
+- Cloud clipboard реализован через BackendTransferCore/TransferRequest.
+- Яндекс delete остаётся provider-trash операцией: permanently=false.
+- Неподдерживаемые локальные действия (Избранное, Изменить дату, Архивировать/Распаковать, системный звук) в StandardBackendBrowser отсутствуют.
+- На время активной backend-операции переход в dual-pane, создание папки, файловые клики и выход кнопкой Назад блокируются; управление операцией остаётся через progress/pause/stop.
+- Kotlin/KTS PSI syntax scan: 120 файлов, 0 syntax errors.
+- Android XML parse: 13 файлов, 0 ошибок.
+- Изолированно проверены Kotlin comparator/property-reference выражения нового UI — компилируются Kotlin 1.9.0.
+
+Полная Gradle-компиляция в текущем контейнере НЕ выполнена: wrapper требует Gradle 9.5.0 и пытается скачать
+https://services.gradle.org/distributions/gradle-9.5.0-bin.zip,
+но среда не разрешает DNS для services.gradle.org (UnknownHostException). Это ограничение среды проверки, а не диагностированная ошибка исходников.
+
+Перед упаковкой SOURCE_SHA256SUMS.txt пересчитан последним шагом; ZIP проверяется командой unzip -t.

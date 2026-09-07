@@ -7,6 +7,10 @@ import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aurafiles.app.archive.ExtendedArchiveRepository
+import com.aurafiles.app.cloud.CloudProfile
+import com.aurafiles.app.cloud.CloudProfileRepository
+import com.aurafiles.app.cloud.CloudProvider
+import com.aurafiles.app.cloud.google.GoogleIdentityAuthorization
 import com.aurafiles.app.data.FileRepository
 import com.aurafiles.app.data.FtpRepository
 import com.aurafiles.app.data.LanDiscoveryRepository
@@ -20,6 +24,8 @@ import com.aurafiles.app.index.StorageIndexer
 import com.aurafiles.app.network.NetworkProfile
 import com.aurafiles.app.network.NetworkProfileRepository
 import com.aurafiles.app.network.NetworkProtocol
+import com.aurafiles.app.network.normalizedSmbProfile
+import com.aurafiles.app.network.smbUserMessage
 import com.aurafiles.app.model.ClipboardMode
 import com.aurafiles.app.model.DeleteAnimationMode
 import com.aurafiles.app.model.FileClipboard
@@ -28,6 +34,7 @@ import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.FileCollectionGroup
 import com.aurafiles.app.model.FileSortMode
 import com.aurafiles.app.model.FileViewMode
+import com.aurafiles.app.model.ImageSourceFilter
 import com.aurafiles.app.model.FolderCrumb
 import com.aurafiles.app.model.FtpEntry
 import com.aurafiles.app.model.FtpProfile
@@ -42,6 +49,7 @@ import com.aurafiles.app.model.SmbProfile
 import com.aurafiles.app.model.SftpProfile
 import com.aurafiles.app.model.SystemSoundType
 import com.aurafiles.app.model.TrashRecord
+import com.aurafiles.app.model.category
 import com.aurafiles.app.model.isTemporaryCandidate
 import com.aurafiles.app.model.isThumbnailCache
 import com.aurafiles.app.model.matchesCategory
@@ -77,6 +85,7 @@ private const val LARGE_FILE_BYTES = 50L * 1024L * 1024L
 private data class CategoryCollectionCacheEntry(
     val rootUri: String,
     val scannedAt: Long,
+    val showHidden: Boolean,
     val showThumbnailFiles: Boolean,
     val items: List<FileEntry>,
     val groups: List<FileCollectionGroup>,
@@ -95,6 +104,10 @@ data class FileManagerUiState(
     val secondaryLoading: Boolean = false,
     val collectionTitle: String? = null,
     val collectionGroups: List<FileCollectionGroup> = emptyList(),
+    val collectionTotalCount: Int = 0,
+    val collectionLoadingMore: Boolean = false,
+    val imageSourceFilter: ImageSourceFilter = ImageSourceFilter.All,
+    val imageQuery: String = "",
     val duplicateOriginalUris: Set<Uri> = emptySet(),
     val recentItems: List<FileEntry> = emptyList(),
     val favoriteItems: List<FileEntry> = emptyList(),
@@ -136,13 +149,21 @@ data class FileManagerUiState(
     val lanDevices: List<LanDevice> = emptyList(),
     val lanScanning: Boolean = false,
     val networkProfiles: List<NetworkProfile> = emptyList(),
+    val cloudProfiles: List<CloudProfile> = emptyList(),
     val smbProfile: SmbProfile? = null,
     val smbConnected: Boolean = false,
+    // True while the main SMB screen is showing the server's share list instead of one share.
+    // Keep this separate from smbProfile.share so returning to the share list does not erase
+    // the last successfully selected share from the saved profile.
+    val smbBrowsingShares: Boolean = false,
     val smbShares: List<String> = emptyList(),
     val smbPath: String = "/",
     val smbItems: List<SmbEntry> = emptyList(),
     val smbLoading: Boolean = false,
     val smbTransferLabel: String? = null,
+    // Distinguishes byte transfers (pause/cancel/progress) from short SMB mutations which use
+    // the same label slot only to lock the UI while the server operation is in flight.
+    val smbTransferActive: Boolean = false,
     val message: String? = null,
 )
 
@@ -159,6 +180,8 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     )
     private val storageIndexer = StorageIndexer(application)
     private val networkProfileRepository = NetworkProfileRepository(application)
+    private val cloudProfileRepository = CloudProfileRepository(application)
+    private val googleIdentityAuthorization = GoogleIdentityAuthorization(application)
     private val _state = MutableStateFlow(
         FileManagerUiState(
             storage = repository.storageSnapshot(),
@@ -192,7 +215,17 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         val initialFtp = initialProfiles
             .firstOrNull { it.protocol == NetworkProtocol.FTP || it.protocol == NetworkProtocol.FTPS }
             ?.let(networkProfileRepository::ftp)
-        _state.update { it.copy(ftpProfile = initialFtp, networkProfiles = initialProfiles) }
+        val initialSmb = initialProfiles
+            .firstOrNull { it.protocol == NetworkProtocol.SMB }
+            ?.let { saved -> runCatching { networkProfileRepository.smb(saved) }.getOrNull() }
+        _state.update {
+            it.copy(
+                ftpProfile = initialFtp,
+                smbProfile = initialSmb,
+                networkProfiles = initialProfiles,
+                cloudProfiles = cloudProfileRepository.profiles(),
+            )
+        }
         viewModelScope.launch {
             var lastTransferUiAt = 0L
             transferEngine.progress.collect { progress ->
@@ -201,9 +234,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 if (!terminal && now - lastTransferUiAt < 100L) return@collect
                 lastTransferUiAt = now
                 _state.update { state ->
-                    val networkLabel = if (state.smbTransferLabel != null) {
+                    val networkLabel = if (state.smbTransferActive) {
                         progress?.let(::transferLabel) ?: state.smbTransferLabel
-                    } else null
+                    } else {
+                        // A local transfer must never overwrite the label of an unrelated SMB
+                        // mkdir/rename/delete operation.
+                        state.smbTransferLabel
+                    }
                     state.copy(
                         transferProgress = progress,
                         transferPaused = progress?.state == TransferState.PAUSED,
@@ -245,6 +282,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             }
         }
         restoreRoot()
+        refreshMetadata()
     }
 
     fun attachRoot(uri: Uri) {
@@ -252,7 +290,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             runCatching {
                 withContext(Dispatchers.IO) { repository.attachRoot(uri) }
             }.onSuccess { root ->
-                val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
+                val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles) }
                 _state.update {
                     it.copy(
                         rootConnected = true,
@@ -292,7 +330,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             }
             runCatching { withContext(Dispatchers.IO) { repository.attachFullRoot() } }
                 .onSuccess { root ->
-                    val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
+                    val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles) }
                     _state.update {
                         it.copy(
                             rootConnected = true,
@@ -443,7 +481,19 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         val current = _state.value
         if (!current.browserOpen) return false
         if (current.collectionTitle != null) {
-            _state.update { it.copy(browserOpen = false, collectionTitle = null, collectionGroups = emptyList(), duplicateOriginalUris = emptySet()) }
+            collectionLoadJob?.cancel()
+            _state.update {
+                it.copy(
+                    browserOpen = false,
+                    collectionTitle = null,
+                    collectionGroups = emptyList(),
+                    collectionTotalCount = 0,
+                    collectionLoadingMore = false,
+                    imageQuery = "",
+                    duplicateOriginalUris = emptySet(),
+                    loading = false,
+                )
+            }
         } else if (current.folderStack.size > 1) {
             _state.update { it.copy(folderStack = it.folderStack.dropLast(1)) }
             refreshCurrentFolder()
@@ -507,7 +557,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 val refreshedAnalysis = withContext(Dispatchers.IO) {
                     storageIndexer.removeUris(root, uris)
                     repository.clearAnalysisCache()
-                    storageIndexer.load(root)
+                    storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
                 }
                 if (refreshedAnalysis != null) {
                     _state.update { current ->
@@ -532,6 +582,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     /** Reconcile the visible local view after another app may have changed the storage. */
     fun onAppResumed() {
         refreshStorageVolumes()
+        refreshMetadata()
         val snapshot = _state.value
         val root = snapshot.folderStack.firstOrNull()?.document ?: return
         if (snapshot.operationInProgress || snapshot.analyzing) return
@@ -541,7 +592,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             if (snapshot.activeSection == MainSection.Recent) {
                 viewModelScope.launch {
                     val (recent, refreshed) = withContext(Dispatchers.IO) {
-                        storageIndexer.recentEntries(root, 500).take(12) to storageIndexer.load(root)
+                        storageIndexer.recentEntries(root, 500, _state.value.showHidden, _state.value.showThumbnailFiles).take(12) to storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
                     }
                     if (_state.value.activeSection != MainSection.Recent || _state.value.browserOpen) return@launch
                     _state.update {
@@ -584,8 +635,8 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             val refreshed = withContext(Dispatchers.IO) {
                 // Resolving the category also prunes Room rows deleted by another app.
-                storageIndexer.categoryEntries(root, category)
-                storageIndexer.load(root)
+                storageIndexer.categoryEntries(root, category, showHidden = _state.value.showHidden, showThumbnails = _state.value.showThumbnailFiles)
+                storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
             }
             if (_state.value.collectionTitle != title) return@launch
             if (refreshed != null) {
@@ -751,12 +802,26 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         restoreTrashRecords(listOf(record), successMessage = "${record.originalName} восстановлен")
     }
 
-    fun permanentlyDelete(record: TrashRecord) = runFileOperation(
-        label = "Безвозвратное удаление",
-        deleteUris = setOf(record.entry.uri),
-    ) {
-        repository.permanentlyDelete(record)
-        "${record.originalName} удалён безвозвратно"
+    fun restoreTrash(records: List<TrashRecord>) {
+        if (records.isEmpty()) return
+        restoreTrashRecords(
+            records.distinctBy { it.entry.uri },
+            successMessage = if (records.size == 1) "${records.first().originalName} восстановлен" else "Восстановлено: ${records.size}",
+        )
+    }
+
+    fun permanentlyDelete(record: TrashRecord) = permanentlyDelete(listOf(record))
+
+    fun permanentlyDelete(records: List<TrashRecord>) {
+        val unique = records.distinctBy { it.entry.uri }
+        if (unique.isEmpty()) return
+        runFileOperation(
+            label = "Безвозвратное удаление",
+            deleteUris = unique.map { it.entry.uri }.toSet(),
+        ) {
+            unique.forEach(repository::permanentlyDelete)
+            if (unique.size == 1) "${unique.first().originalName} удалён безвозвратно" else "Удалено безвозвратно: ${unique.size}"
+        }
     }
 
     fun emptyTrash() {
@@ -770,15 +835,62 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun toggleFavorites(entries: List<FileEntry>) {
         if (entries.isEmpty()) return
-        viewModelScope.launch {
-            val uris = withContext(Dispatchers.IO) { repository.toggleFavorites(entries) }
-            val favorites = withContext(Dispatchers.IO) { repository.favoriteEntries() }
+        if (entries.any(FileEntry::isDirectory)) {
+            _state.update { it.copy(message = "Папки пока нельзя помещать в защищённое Избранное") }
+            return
+        }
+        val requested = entries.distinctBy(FileEntry::uri)
+        val movedUris = linkedSetOf<Uri>()
+        operationJob?.cancel()
+        operationJob = viewModelScope.launch {
             _state.update {
                 it.copy(
-                    favoriteUris = uris,
-                    favoriteItems = favorites,
-                    message = if (entries.all { entry -> entry.uri in uris }) "Добавлено в избранное" else "Удалено из избранного",
+                    operationInProgress = true,
+                    operationLabel = "Перемещение в Избранное",
+                    operationProgress = 0f,
+                    operationCancelable = false,
                 )
+            }
+            try {
+                requested.forEachIndexed { index, entry ->
+                    withContext(Dispatchers.IO) { repository.moveToFavorite(entry) }
+                    movedUris += entry.uri
+                    _state.update { it.copy(operationProgress = (index + 1f) / requested.size) }
+                }
+                if (movedUris.isNotEmpty()) applyExternalDeletions(movedUris)
+                val favorites = withContext(Dispatchers.IO) { repository.favoriteEntries() }
+                _state.update {
+                    it.copy(
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationProgress = 1f,
+                        operationCancelable = false,
+                        favoriteItems = favorites,
+                        favoriteUris = favorites.map(FileEntry::uri).toSet(),
+                        message = if (requested.size == 1) {
+                            "${requested.first().name} перемещён в защищённое Избранное"
+                        } else {
+                            "В защищённое Избранное перемещено: ${requested.size}"
+                        },
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                if (movedUris.isNotEmpty()) applyExternalDeletions(movedUris)
+                _state.update { it.copy(operationInProgress = false, operationLabel = null, operationCancelable = false) }
+                throw cancelled
+            } catch (error: Throwable) {
+                if (movedUris.isNotEmpty()) applyExternalDeletions(movedUris)
+                val favorites = runCatching { withContext(Dispatchers.IO) { repository.favoriteEntries() } }.getOrDefault(emptyList())
+                _state.update {
+                    it.copy(
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationCancelable = false,
+                        favoriteItems = favorites,
+                        favoriteUris = favorites.map(FileEntry::uri).toSet(),
+                    )
+                }
+                showFailure(error)
             }
         }
     }
@@ -890,6 +1002,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 sortAscending = mode == FileSortMode.Name || mode == FileSortMode.Type,
             )
         }
+        val snapshot = _state.value
+        if (snapshot.collectionTitle == "Изображения") {
+            _state.update { it.copy(loading = true, collectionLoadingMore = false, collectionTotalCount = 0) }
+            val root = snapshot.folderStack.firstOrNull()?.document ?: return
+            val scannedAt = snapshot.analysis?.scannedAt ?: return
+            reloadImageCollection(root, scannedAt, snapshot.imageSourceFilter, snapshot.imageQuery)
+        }
     }
 
     fun setViewMode(mode: FileViewMode) {
@@ -897,14 +1016,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun toggleHiddenFiles() {
-        val value = !_state.value.showHidden
-        repository.setShowHiddenFiles(value)
-        _state.update { it.copy(showHidden = value) }
+        setShowHiddenFiles(!_state.value.showHidden)
     }
 
     fun setShowHiddenFiles(value: Boolean) {
         repository.setShowHiddenFiles(value)
         _state.update { it.copy(showHidden = value) }
+        refreshAnalysisForVisibility()
     }
 
     fun setShowThumbnailFiles(value: Boolean) {
@@ -914,13 +1032,14 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             current.copy(
                 showThumbnailFiles = value,
                 items = if (current.collectionTitle != null) visibleItems else current.items,
-                collectionGroups = if (current.collectionTitle != null) buildSourceGroups(visibleItems) else current.collectionGroups,
+                collectionGroups = when (current.collectionTitle) {
+                    "Изображения" -> emptyList()
+                    null -> current.collectionGroups
+                    else -> buildSourceGroups(visibleItems)
+                },
             )
         }
-        invalidateCategoryCollectionCache()
-        val root = _state.value.folderStack.firstOrNull()?.document
-        val analysis = _state.value.analysis
-        if (root != null && analysis != null) warmCategoryCollectionCache(root, analysis)
+        refreshAnalysisForVisibility()
     }
 
     fun setShowGridThumbnails(value: Boolean) {
@@ -956,12 +1075,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                     operationProgress = 0f,
                 )
             }
-            runCatching { withContext(Dispatchers.IO) { storageIndexer.scan(root) } }
+            runCatching { withContext(Dispatchers.IO) { storageIndexer.scan(root, _state.value.showHidden, _state.value.showThumbnailFiles) } }
                 .onSuccess { analysis ->
                     val pendingCategory = categoryToOpenAfterAnalysis
                     categoryToOpenAfterAnalysis = null
                     val indexedCount = storageIndexer.progress.value.filesCount
-                    val recent = withContext(Dispatchers.IO) { storageIndexer.recentEntries(root, 12) }
+                    val skippedProtected = storageIndexer.skippedProtectedDirectoryCount
+                    val recent = withContext(Dispatchers.IO) { storageIndexer.recentEntries(root, 12, _state.value.showHidden, _state.value.showThumbnailFiles) }
                     _state.update {
                         it.copy(
                             analyzing = false,
@@ -970,7 +1090,11 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                             operationCancelable = false,
                             analysis = analysis,
                             recentItems = recent,
-                            message = "Анализ завершён: $indexedCount файлов",
+                            message = if (skippedProtected > 0) {
+                                "Анализ завершён: $indexedCount файлов · защищённых папок пропущено: $skippedProtected"
+                            } else {
+                                "Анализ завершён: $indexedCount файлов"
+                            },
                         )
                     }
                     warmCategoryCollectionCache(root, analysis)
@@ -1000,6 +1124,10 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             analyzeStorage()
             return
         }
+        if (category == FileCategory.Images) {
+            openImageCollection(resetFilters = true)
+            return
+        }
         val title = when (category) {
             FileCategory.Images -> "Изображения"
             FileCategory.Video -> "Видео"
@@ -1013,10 +1141,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             FileCategory.Other -> "Другие файлы"
         }
         val root = _state.value.folderStack.firstOrNull()?.document ?: return
+        val showHidden = _state.value.showHidden
         val showThumbnails = _state.value.showThumbnailFiles
+        val expectedCount = analysis.categories.firstOrNull { it.category == category }?.count ?: 0
         val cached = categoryCollectionCache[category]?.takeIf { entry ->
             entry.rootUri == root.uri.toString() &&
                 entry.scannedAt == analysis.scannedAt &&
+                entry.showHidden == showHidden &&
                 entry.showThumbnailFiles == showThumbnails
         }
 
@@ -1031,6 +1162,8 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                     items = cached.items,
                     collectionGroups = cached.groups,
                     duplicateOriginalUris = emptySet(),
+                    message = if (expectedCount > cached.items.size)
+                        "Показано ${cached.items.size} из $expectedCount файлов в категории" else it.message,
                 )
             }
             return
@@ -1040,11 +1173,14 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         // on screen immediately, then replace it with the complete Room result in the background.
         // Limiting this to 120 entries keeps the tap path tiny even when the index contains thousands.
         val previewItems = analysis.files.asSequence()
-            .filter { file -> file.matchesCategory(category) && (showThumbnails || !file.isThumbnailCache()) }
+            .filter { file ->
+                file.matchesCategory(category) &&
+                    (showHidden || !file.name.startsWith('.')) &&
+                    (showThumbnails || !file.isThumbnailCache())
+            }
             .take(120)
             .toList()
         val previewGroups = buildSourceGroups(previewItems)
-        val expectedCount = analysis.categories.firstOrNull { it.category == category }?.count ?: 0
         _state.update {
             it.copy(
                 loading = previewItems.isEmpty() && expectedCount > 0,
@@ -1059,25 +1195,233 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         collectionLoadJob?.cancel()
         collectionLoadJob = viewModelScope.launch {
             val matching = withContext(Dispatchers.IO) {
-                storageIndexer.categoryEntries(root, category)
-                    .filter { file -> showThumbnails || !file.isThumbnailCache() }
+                storageIndexer.categoryEntries(root, category, showHidden = showHidden, showThumbnails = showThumbnails)
             }
             val groups = withContext(Dispatchers.Default) { buildSourceGroups(matching) }
             val currentAnalysis = _state.value.analysis
             if (currentAnalysis?.scannedAt == analysis.scannedAt &&
                 _state.value.folderStack.firstOrNull()?.document?.uri == root.uri &&
+                _state.value.showHidden == showHidden &&
                 _state.value.showThumbnailFiles == showThumbnails
             ) {
                 categoryCollectionCache[category] = CategoryCollectionCacheEntry(
                     rootUri = root.uri.toString(),
                     scannedAt = analysis.scannedAt,
+                    showHidden = showHidden,
                     showThumbnailFiles = showThumbnails,
                     items = matching,
                     groups = groups,
                 )
             }
             if (_state.value.collectionTitle != title || !_state.value.browserOpen) return@launch
-            _state.update { it.copy(loading = false, items = matching, collectionGroups = groups) }
+            _state.update { current ->
+                current.copy(
+                    loading = false,
+                    items = matching,
+                    collectionGroups = groups,
+                    message = if (expectedCount > matching.size)
+                        "Показано ${matching.size} из $expectedCount файлов в категории" else current.message,
+                )
+            }
+        }
+    }
+
+    private fun openImageCollection(resetFilters: Boolean) {
+        val snapshot = _state.value
+        val analysis = snapshot.analysis ?: return
+        val root = snapshot.folderStack.firstOrNull()?.document ?: return
+        val filter = if (resetFilters) ImageSourceFilter.All else snapshot.imageSourceFilter
+        val query = if (resetFilters) "" else snapshot.imageQuery
+        _state.update {
+            it.copy(
+                browserOpen = true,
+                activeSection = MainSection.Browse,
+                collectionTitle = "Изображения",
+                collectionGroups = emptyList(),
+                duplicateOriginalUris = emptySet(),
+                loading = true,
+                items = emptyList(),
+                imageSourceFilter = filter,
+                imageQuery = query,
+                collectionTotalCount = 0,
+                collectionLoadingMore = false,
+                sortMode = if (resetFilters) FileSortMode.Modified else it.sortMode,
+                sortAscending = if (resetFilters) false else it.sortAscending,
+            )
+        }
+        reloadImageCollection(root, analysis.scannedAt, filter, query)
+    }
+
+    fun setImageSourceFilter(filter: ImageSourceFilter) {
+        val snapshot = _state.value
+        if (snapshot.collectionTitle != "Изображения" || snapshot.imageSourceFilter == filter) return
+        _state.update {
+            it.copy(
+                imageSourceFilter = filter,
+                loading = true,
+                collectionLoadingMore = false,
+                collectionTotalCount = 0,
+            )
+        }
+        val root = snapshot.folderStack.firstOrNull()?.document ?: return
+        val scannedAt = snapshot.analysis?.scannedAt ?: return
+        reloadImageCollection(root, scannedAt, filter, snapshot.imageQuery)
+    }
+
+    fun setImageQuery(query: String) {
+        val snapshot = _state.value
+        if (snapshot.collectionTitle != "Изображения" || snapshot.imageQuery == query) return
+        _state.update {
+            it.copy(
+                imageQuery = query,
+                loading = true,
+                collectionLoadingMore = false,
+                collectionTotalCount = 0,
+            )
+        }
+        val root = snapshot.folderStack.firstOrNull()?.document ?: return
+        val scannedAt = snapshot.analysis?.scannedAt ?: return
+        reloadImageCollection(root, scannedAt, snapshot.imageSourceFilter, query, debounceMillis = 180L)
+    }
+
+    fun loadMoreImageCollection() {
+        val snapshot = _state.value
+        if (snapshot.collectionTitle != "Изображения" || snapshot.collectionLoadingMore || snapshot.loading) return
+        if (snapshot.items.size >= snapshot.collectionTotalCount) return
+        val root = snapshot.folderStack.firstOrNull()?.document ?: return
+        val scannedAt = snapshot.analysis?.scannedAt ?: return
+        val rootUri = root.uri.toString()
+        val filter = snapshot.imageSourceFilter
+        val query = snapshot.imageQuery
+        val sortMode = snapshot.sortMode
+        val ascending = snapshot.sortAscending
+        val showHidden = snapshot.showHidden
+        val showThumbnails = snapshot.showThumbnailFiles
+        val offset = snapshot.items.size
+        collectionLoadJob?.cancel()
+        _state.update { it.copy(collectionLoadingMore = true) }
+        collectionLoadJob = viewModelScope.launch {
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    storageIndexer.imageEntriesPage(
+                        root = root,
+                        sourceFilter = filter,
+                        query = query,
+                        sortMode = sortMode,
+                        ascending = ascending,
+                        offset = offset,
+                        showHidden = showHidden,
+                        showThumbnails = showThumbnails,
+                    )
+                }
+                val total = withContext(Dispatchers.IO) {
+                    storageIndexer.imageEntryCount(root, filter, query, showHidden, showThumbnails)
+                }
+                val current = _state.value
+                if (current.collectionTitle != "Изображения" || !current.browserOpen ||
+                    current.folderStack.firstOrNull()?.document?.uri?.toString() != rootUri ||
+                    current.analysis?.scannedAt != scannedAt ||
+                    current.imageSourceFilter != filter || current.imageQuery != query ||
+                    current.sortMode != sortMode || current.sortAscending != ascending ||
+                    current.showHidden != showHidden || current.showThumbnailFiles != showThumbnails
+                ) return@launch
+                val merged = (current.items + page).distinctBy(FileEntry::uri)
+                _state.update {
+                    it.copy(
+                        items = merged,
+                        collectionGroups = emptyList(),
+                        collectionTotalCount = total,
+                        collectionLoadingMore = false,
+                        loading = false,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (_state.value.collectionTitle == "Изображения" && _state.value.browserOpen) {
+                    _state.update { it.copy(collectionLoadingMore = false, loading = false) }
+                    showFailure(error)
+                }
+            }
+        }
+    }
+
+    private fun reloadImageCollection(
+        root: DocumentFile,
+        scannedAt: Long,
+        filter: ImageSourceFilter,
+        query: String,
+        debounceMillis: Long = 0L,
+    ) {
+        val rootUri = root.uri.toString()
+        val snapshot = _state.value
+        val sortMode = snapshot.sortMode
+        val ascending = snapshot.sortAscending
+        val showHidden = snapshot.showHidden
+        val showThumbnails = snapshot.showThumbnailFiles
+        collectionLoadJob?.cancel()
+        collectionLoadJob = viewModelScope.launch {
+            try {
+                if (debounceMillis > 0L) delay(debounceMillis)
+                val beforeLoad = _state.value
+                if (beforeLoad.collectionTitle != "Изображения" || !beforeLoad.browserOpen ||
+                    beforeLoad.folderStack.firstOrNull()?.document?.uri?.toString() != rootUri ||
+                    beforeLoad.analysis?.scannedAt != scannedAt ||
+                    beforeLoad.imageSourceFilter != filter || beforeLoad.imageQuery != query ||
+                    beforeLoad.sortMode != sortMode || beforeLoad.sortAscending != ascending ||
+                    beforeLoad.showHidden != showHidden || beforeLoad.showThumbnailFiles != showThumbnails
+                ) return@launch
+                _state.update {
+                    it.copy(
+                        loading = true,
+                        collectionLoadingMore = false,
+                        items = emptyList(),
+                        collectionGroups = emptyList(),
+                        collectionTotalCount = 0,
+                    )
+                }
+                val result = withContext(Dispatchers.IO) {
+                    // Resolve/prune the page first so the count does not include stale SAF rows
+                    // that disappeared while Aura was in the background.
+                    val page = storageIndexer.imageEntriesPage(
+                        root = root,
+                        sourceFilter = filter,
+                        query = query,
+                        sortMode = sortMode,
+                        ascending = ascending,
+                        offset = 0,
+                        showHidden = showHidden,
+                        showThumbnails = showThumbnails,
+                    )
+                    val total = storageIndexer.imageEntryCount(root, filter, query, showHidden, showThumbnails)
+                    total to page
+                }
+                val current = _state.value
+                if (current.collectionTitle != "Изображения" || !current.browserOpen ||
+                    current.folderStack.firstOrNull()?.document?.uri?.toString() != rootUri ||
+                    current.analysis?.scannedAt != scannedAt ||
+                    current.imageSourceFilter != filter || current.imageQuery != query ||
+                    current.sortMode != sortMode || current.sortAscending != ascending ||
+                    current.showHidden != showHidden || current.showThumbnailFiles != showThumbnails
+                ) return@launch
+                _state.update {
+                    it.copy(
+                        loading = false,
+                        items = result.second,
+                        collectionGroups = emptyList(),
+                        collectionTotalCount = result.first,
+                        collectionLoadingMore = false,
+                        message = null,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (_state.value.collectionTitle == "Изображения") {
+                    _state.update { it.copy(loading = false, collectionLoadingMore = false) }
+                    showFailure(error)
+                }
+            }
         }
     }
 
@@ -1116,10 +1460,18 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         }
         collectionLoadJob?.cancel()
         collectionLoadJob = viewModelScope.launch {
-            val temporary = withContext(Dispatchers.IO) { storageIndexer.temporaryEntries(root) }
+            val temporary = withContext(Dispatchers.IO) { storageIndexer.temporaryEntries(root, showHidden = _state.value.showHidden, showThumbnails = _state.value.showThumbnailFiles) }
             val groups = withContext(Dispatchers.Default) { buildSourceGroups(temporary) }
             if (_state.value.collectionTitle != title || !_state.value.browserOpen) return@launch
-            _state.update { it.copy(loading = false, items = temporary, collectionGroups = groups) }
+            _state.update { current ->
+                current.copy(
+                    loading = false,
+                    items = temporary,
+                    collectionGroups = groups,
+                    message = if (analysis.temporaryFileCount > temporary.size)
+                        "Показано ${temporary.size} из ${analysis.temporaryFileCount} временных файлов" else current.message,
+                )
+            }
         }
     }
 
@@ -1146,9 +1498,17 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         }
         collectionLoadJob?.cancel()
         collectionLoadJob = viewModelScope.launch {
-            val files = withContext(Dispatchers.IO) { storageIndexer.largeEntries(root) }
+            val files = withContext(Dispatchers.IO) { storageIndexer.largeEntries(root, showHidden = _state.value.showHidden, showThumbnails = _state.value.showThumbnailFiles) }
             if (_state.value.collectionTitle != title || !_state.value.browserOpen) return@launch
-            _state.update { it.copy(loading = false, items = files, collectionGroups = emptyList()) }
+            _state.update { current ->
+                current.copy(
+                    loading = false,
+                    items = files,
+                    collectionGroups = emptyList(),
+                    message = if (analysis.largeFileCount > files.size)
+                        "Показано ${files.size} из ${analysis.largeFileCount} крупных файлов" else current.message,
+                )
+            }
         }
     }
 
@@ -1353,30 +1713,36 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
 
     fun connectFtp(profile: FtpProfile, save: Boolean = true) {
         if (_state.value.ftpLoading) return
+        val normalized = profile.copy(
+            name = profile.name.trim().ifBlank { profile.host.trim() },
+            host = profile.host.trim(),
+            username = profile.username.trim(),
+        )
         viewModelScope.launch {
-            _state.update { it.copy(ftpLoading = true, ftpProfile = profile) }
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    if (save) networkProfileRepository.save(profile)
-                    ftpRepository.connect(profile)
+            _state.update { it.copy(ftpLoading = true, ftpProfile = normalized) }
+            runCatching { withContext(Dispatchers.IO) { ftpRepository.connect(normalized) } }
+                .onSuccess { (path, items) ->
+                    val connectedProfile = if (save) {
+                        withContext(Dispatchers.IO) {
+                            networkProfileRepository.ftp(networkProfileRepository.save(normalized))
+                        }
+                    } else normalized
+                    _state.update {
+                        it.copy(
+                            ftpProfile = connectedProfile,
+                            ftpConnected = true,
+                            ftpLoading = false,
+                            ftpPath = path,
+                            ftpItems = items,
+                            networkProfiles = networkProfileRepository.profiles(),
+                            message = "FTP подключён: ${connectedProfile.name}",
+                        )
+                    }
+                    startFtpKeepAlive()
+                }.onFailure { error ->
+                    _state.update { it.copy(ftpConnected = false, ftpLoading = false, ftpItems = emptyList()) }
+                    showFailure(error)
                 }
-            }.onSuccess { (path, items) ->
-                _state.update {
-                    it.copy(
-                        ftpProfile = profile,
-                        ftpConnected = true,
-                        ftpLoading = false,
-                        ftpPath = path,
-                        ftpItems = items,
-                        networkProfiles = networkProfileRepository.profiles(),
-                        message = "FTP подключён: ${profile.name}",
-                    )
-                }
-                startFtpKeepAlive()
-            }.onFailure { error ->
-                _state.update { it.copy(ftpConnected = false, ftpLoading = false, ftpItems = emptyList()) }
-                showFailure(error)
-            }
         }
     }
 
@@ -1544,120 +1910,219 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun connectSmb(profile: SmbProfile) {
-        if (_state.value.smbLoading) return
+        val snapshot = _state.value
+        if (snapshot.smbLoading) return
+        if (snapshot.smbTransferLabel != null) {
+            _state.update { it.copy(message = "Сначала дождитесь завершения SMB-передачи") }
+            return
+        }
+        val normalized = runCatching { profile.normalizedSmbProfile() }.getOrElse { error ->
+            showSmbFailure(error)
+            return
+        }
+        // Latch before launching the coroutine: two fast taps must never start two authentication
+        // attempts against the same repository/session.
+        _state.update {
+            it.copy(
+                smbLoading = true,
+                smbProfile = normalized,
+                smbBrowsingShares = normalized.share.isBlank(),
+                smbShares = emptyList(),
+                smbItems = emptyList(),
+            )
+        }
         viewModelScope.launch {
-            val normalized = profile.copy(share = profile.share.trim().trim('/', '\\'))
-            withContext(Dispatchers.IO) { networkProfileRepository.save(normalized) }
-            _state.update {
-                it.copy(
-                    smbLoading = true,
-                    smbProfile = normalized,
-                    smbShares = emptyList(),
-                    smbItems = emptyList(),
-                    networkProfiles = networkProfileRepository.profiles(),
-                )
-            }
             if (normalized.share.isBlank()) {
                 runCatching { withContext(Dispatchers.IO) { smbRepository.discoverShares(normalized) } }
                     .onSuccess { shares ->
+                        val persisted = runCatching {
+                            withContext(Dispatchers.IO) {
+                                networkProfileRepository.smb(networkProfileRepository.save(normalized))
+                            }
+                        }.getOrNull()
+                        val connectedProfile = persisted ?: normalized
                         _state.update {
                             it.copy(
                                 smbLoading = false,
                                 smbConnected = true,
+                                smbProfile = connectedProfile,
+                                smbBrowsingShares = true,
                                 smbShares = shares,
                                 smbPath = "/",
-                                message = if (shares.isEmpty()) {
-                                    "SMB подключён, но обычные общие папки не найдены. Можно указать шару в расширенных настройках."
-                                } else null,
+                                networkProfiles = networkProfileRepository.profiles(),
+                                message = when {
+                                    persisted == null -> "SMB подключён, но профиль не удалось сохранить"
+                                    shares.isEmpty() -> "SMB подключён, но обычные общие папки не найдены. Можно указать шару в расширенных настройках."
+                                    else -> null
+                                },
                             )
                         }
                     }
                     .onFailure { error ->
                         _state.update { it.copy(smbLoading = false, smbConnected = false, smbShares = emptyList()) }
-                        showFailure(error)
+                        showSmbFailure(error)
                     }
             } else {
                 runCatching { withContext(Dispatchers.IO) { smbRepository.connect(normalized) } }
                     .onSuccess { (path, items) ->
+                        val persisted = runCatching {
+                            withContext(Dispatchers.IO) {
+                                networkProfileRepository.smb(networkProfileRepository.save(normalized))
+                            }
+                        }.getOrNull()
+                        val connectedProfile = persisted ?: normalized
                         _state.update {
                             it.copy(
                                 smbLoading = false,
                                 smbConnected = true,
+                                smbProfile = connectedProfile,
+                                smbBrowsingShares = false,
                                 smbPath = path,
                                 smbItems = items,
-                                message = "SMB подключён: ${normalized.name}",
+                                networkProfiles = networkProfileRepository.profiles(),
+                                message = if (persisted == null) {
+                                    "SMB подключён, но профиль не удалось сохранить"
+                                } else {
+                                    "SMB подключён: ${connectedProfile.name}"
+                                },
                             )
                         }
                     }
                     .onFailure { error ->
                         _state.update { it.copy(smbLoading = false, smbConnected = false, smbItems = emptyList()) }
-                        showFailure(error)
+                        showSmbFailure(error)
                     }
             }
         }
     }
 
     fun selectSmbShare(shareName: String) {
-        if (_state.value.smbLoading) return
+        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
+        _state.update { it.copy(smbLoading = true) }
         viewModelScope.launch {
-            _state.update { it.copy(smbLoading = true) }
             runCatching { withContext(Dispatchers.IO) { smbRepository.connectShare(shareName) } }
                 .onSuccess { (path, items) ->
+                    val selected = _state.value.smbProfile?.copy(share = shareName)?.normalizedSmbProfile()
+                    val persisted = selected?.let { profile ->
+                        runCatching {
+                            withContext(Dispatchers.IO) {
+                                networkProfileRepository.smb(networkProfileRepository.save(profile))
+                            }
+                        }.getOrNull()
+                    }
                     _state.update {
                         it.copy(
                             smbLoading = false,
                             smbConnected = true,
-                            smbProfile = it.smbProfile?.copy(share = shareName),
+                            smbProfile = persisted ?: selected ?: it.smbProfile?.copy(share = shareName),
+                            smbBrowsingShares = false,
                             smbPath = path,
                             smbItems = items,
+                            networkProfiles = networkProfileRepository.profiles(),
+                            message = if (selected != null && persisted == null) {
+                                "SMB подключён, но выбранную шару не удалось сохранить в профиль"
+                            } else null,
                         )
                     }
                 }
                 .onFailure { error ->
                     _state.update { it.copy(smbLoading = false, smbItems = emptyList()) }
-                    showFailure(error)
+                    showSmbFailure(error)
                 }
         }
     }
 
     fun disconnectSmb() {
+        val snapshot = _state.value
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) {
+            _state.update { it.copy(message = "Нельзя отключить SMB во время текущей операции") }
+            return
+        }
+        _state.update { it.copy(smbLoading = true) }
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { smbRepository.disconnect() }
-            _state.update {
-                it.copy(
-                    smbConnected = false,
-                    smbShares = emptyList(),
-                    smbItems = emptyList(),
-                    smbPath = "/",
-                    message = "SMB отключён",
-                )
-            }
+            runCatching { withContext(Dispatchers.IO) { smbRepository.disconnect() } }
+                .onSuccess {
+                    _state.update {
+                        it.copy(
+                            smbLoading = false,
+                            smbConnected = false,
+                            smbBrowsingShares = false,
+                            smbShares = emptyList(),
+                            smbItems = emptyList(),
+                            smbPath = "/",
+                            message = "SMB отключён",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(smbLoading = false) }
+                    showSmbFailure(error)
+                }
         }
     }
 
     fun refreshSmb() {
-        val profile = _state.value.smbProfile ?: return
-        if (profile.share.isBlank()) connectSmb(profile) else loadSmbPath(_state.value.smbPath)
+        val snapshot = _state.value
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) return
+        val profile = snapshot.smbProfile ?: return
+        if (snapshot.smbBrowsingShares) refreshSmbShares(profile) else loadSmbPath(snapshot.smbPath)
+    }
+
+    private fun refreshSmbShares(profile: SmbProfile) {
+        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
+        _state.update { it.copy(smbLoading = true) }
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { smbRepository.discoverShares(profile.copy(share = "")) } }
+                .onSuccess { shares ->
+                    _state.update {
+                        it.copy(
+                            smbLoading = false,
+                            smbConnected = true,
+                            smbBrowsingShares = true,
+                            smbShares = shares,
+                            smbItems = emptyList(),
+                            smbPath = "/",
+                            message = if (shares.isEmpty()) {
+                                "SMB подключён, но обычные общие папки не найдены. Можно указать шару в параметрах."
+                            } else null,
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(smbLoading = false, smbConnected = false) }
+                    showSmbFailure(error)
+                }
+        }
     }
 
     fun openSmbEntry(entry: SmbEntry) {
+        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
         if (entry.isDirectory) loadSmbPath(entry.path)
     }
 
     fun navigateSmbBack(): Boolean {
-        val path = _state.value.smbPath.trimEnd('/')
+        val snapshot = _state.value
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) return false
+        val path = snapshot.smbPath.trimEnd('/')
         if (path.isBlank()) {
-            val state = _state.value
-            if (state.smbProfile?.share.isNullOrBlank() || state.smbShares.isEmpty()) return false
+            if (snapshot.smbBrowsingShares || snapshot.smbShares.isEmpty()) return false
+            _state.update { it.copy(smbLoading = true) }
             viewModelScope.launch {
-                withContext(Dispatchers.IO) { smbRepository.returnToShareList() }
-                _state.update {
-                    it.copy(
-                        smbProfile = it.smbProfile?.copy(share = ""),
-                        smbItems = emptyList(),
-                        smbPath = "/",
-                    )
-                }
+                runCatching { withContext(Dispatchers.IO) { smbRepository.returnToShareList() } }
+                    .onSuccess {
+                        _state.update {
+                            it.copy(
+                                smbLoading = false,
+                                smbBrowsingShares = true,
+                                smbItems = emptyList(),
+                                smbPath = "/",
+                            )
+                        }
+                    }
+                    .onFailure { error ->
+                        _state.update { it.copy(smbLoading = false) }
+                        showSmbFailure(error)
+                    }
             }
             return true
         }
@@ -1681,7 +2146,13 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun uploadToSmb(uris: List<Uri>) {
-        if (uris.isEmpty() || _state.value.smbTransferLabel != null) return
+        val snapshot = _state.value
+        if (uris.isEmpty()) return
+        if (!snapshot.smbConnected || snapshot.smbBrowsingShares || snapshot.smbProfile?.share.isNullOrBlank()) {
+            _state.update { it.copy(message = "Сначала откройте общую папку SMB") }
+            return
+        }
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) return
         val sources = uris.mapNotNull { uri ->
             val document = runCatching { DocumentFile.fromTreeUri(getApplication(), uri) }.getOrNull()
                 ?: runCatching { DocumentFile.fromSingleUri(getApplication(), uri) }.getOrNull()
@@ -1705,7 +2176,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             request = TransferRequest(
                 type = TransferType.UPLOAD,
                 sources = sources,
-                destination = TransferDestination.Smb(_state.value.smbPath),
+                destination = TransferDestination.Smb(snapshot.smbPath),
                 conflictPolicy = TransferConflictPolicy.KEEP_BOTH,
             ),
             initialLabel = "Подготовка загрузки",
@@ -1715,12 +2186,17 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun downloadFromSmb(entry: SmbEntry) {
-        val destination = _state.value.folderStack.lastOrNull()?.document
+        val snapshot = _state.value
+        if (!snapshot.smbConnected || snapshot.smbBrowsingShares || snapshot.smbProfile?.share.isNullOrBlank()) {
+            _state.update { it.copy(message = "Сначала откройте общую папку SMB") }
+            return
+        }
+        val destination = snapshot.folderStack.lastOrNull()?.document
         if (destination == null) {
             _state.update { it.copy(message = "Сначала подключите локальную папку для скачивания") }
             return
         }
-        if (_state.value.smbTransferLabel != null) return
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) return
         runNetworkTransfer(
             request = TransferRequest(
                 type = TransferType.DOWNLOAD,
@@ -1731,6 +2207,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                         size = entry.size,
                         modifiedAt = entry.modifiedAt,
                         isDirectory = entry.isDirectory,
+                        isReparsePoint = entry.isReparsePoint,
                     )
                 ),
                 destination = TransferDestination.Local(destination.uri),
@@ -1750,30 +2227,84 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         refreshSmb: Boolean,
         refreshLocal: Boolean = false,
     ) {
+        val snapshot = _state.value
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) return
+        if (snapshot.operationInProgress) {
+            _state.update { it.copy(message = "Сначала дождитесь текущей файловой операции") }
+            return
+        }
+        // Latch synchronously before launching the coroutine so a fast double tap cannot start
+        // two SMB transfers and overwrite transferController before Compose recomposes.
+        _state.update {
+            it.copy(
+                smbTransferLabel = initialLabel,
+                smbTransferActive = true,
+                operationInProgress = true,
+                operationLabel = initialLabel,
+                operationProgress = 0f,
+                operationCancelable = true,
+                transferPaused = false,
+            )
+        }
         val controller = TransferController()
         transferController = controller
-        operationJob = viewModelScope.launch {
-            _state.update { it.copy(smbTransferLabel = initialLabel) }
+        val job = viewModelScope.launch {
             try {
                 withContext(Dispatchers.IO) { transferEngine.execute(request, controller) }
-                _state.update { it.copy(smbTransferLabel = null, message = successMessage) }
+                _state.update {
+                    it.copy(
+                        smbTransferLabel = null,
+                        smbTransferActive = false,
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationProgress = 1f,
+                        operationCancelable = false,
+                        transferPaused = false,
+                        message = successMessage,
+                    )
+                }
                 if (refreshSmb) loadSmbPath(_state.value.smbPath)
                 if (refreshLocal) refreshCurrentFolder()
             } catch (_: CancellationException) {
-                _state.update { it.copy(smbTransferLabel = null, message = "Передача остановлена") }
+                _state.update {
+                    it.copy(
+                        smbTransferLabel = null,
+                        smbTransferActive = false,
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationCancelable = false,
+                        transferPaused = false,
+                        message = "Передача остановлена",
+                    )
+                }
             } catch (error: Throwable) {
-                _state.update { it.copy(smbTransferLabel = null) }
-                showFailure(error)
+                _state.update {
+                    it.copy(
+                        smbTransferLabel = null,
+                        smbTransferActive = false,
+                        operationInProgress = false,
+                        operationLabel = null,
+                        operationCancelable = false,
+                        transferPaused = false,
+                    )
+                }
+                showSmbFailure(error)
             } finally {
-                transferController = null
+                // Do not let a finishing old transfer clear a controller/job already installed
+                // by a newer one after the UI observed the terminal state.
+                if (transferController === controller) {
+                    transferController = null
+                    operationJob = null
+                }
             }
         }
+        operationJob = job
     }
 
     private fun loadSmbPath(path: String) {
-        if (_state.value.smbLoading) return
+        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
+        _state.update { it.copy(smbLoading = true) }
         viewModelScope.launch {
-            _state.update { it.copy(smbLoading = true) }
             runCatching { withContext(Dispatchers.IO) { smbRepository.list(path) } }
                 .onSuccess { (actualPath, items) ->
                     _state.update {
@@ -1782,7 +2313,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 }
                 .onFailure { error ->
                     _state.update { it.copy(smbConnected = false, smbLoading = false) }
-                    showFailure(error)
+                    showSmbFailure(error)
                 }
         }
     }
@@ -1791,15 +2322,24 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         label: String,
         block: suspend () -> Pair<String, List<SmbEntry>>,
     ) {
-        if (_state.value.smbLoading || _state.value.smbTransferLabel != null) return
+        val snapshot = _state.value
+        if (snapshot.smbLoading || snapshot.smbTransferLabel != null) {
+            _state.update { it.copy(message = "Сначала дождитесь текущей SMB-операции") }
+            return
+        }
+        if (snapshot.operationInProgress) {
+            _state.update { it.copy(message = "Сначала дождитесь текущей файловой операции") }
+            return
+        }
+        _state.update { it.copy(smbLoading = true, smbTransferLabel = label, smbTransferActive = false) }
         viewModelScope.launch {
-            _state.update { it.copy(smbLoading = true, smbTransferLabel = label) }
             runCatching { withContext(Dispatchers.IO) { block() } }
                 .onSuccess { (path, items) ->
                     _state.update {
                         it.copy(
                             smbLoading = false,
                             smbTransferLabel = null,
+                            smbTransferActive = false,
                             smbPath = path,
                             smbItems = items,
                             message = "$label завершено",
@@ -1807,8 +2347,38 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 }
                 .onFailure { error ->
-                    _state.update { it.copy(smbLoading = false, smbTransferLabel = null) }
-                    showFailure(error)
+                    _state.update { it.copy(smbLoading = false, smbTransferLabel = null, smbTransferActive = false) }
+                    showSmbFailure(error)
+                }
+        }
+    }
+
+    fun refreshCloudProfiles() {
+        val profiles = cloudProfileRepository.profiles()
+        _state.update { it.copy(cloudProfiles = profiles) }
+    }
+
+    fun deleteCloudProfile(profile: CloudProfile) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val revokeWarning = if (profile.provider == CloudProvider.GOOGLE_DRIVE && profile.accountLabel.isNotBlank()) {
+                runCatching { googleIdentityAuthorization.revoke(profile.accountLabel) }.exceptionOrNull()?.message
+            } else null
+            runCatching { cloudProfileRepository.delete(profile.id) }
+                .onSuccess {
+                    val profiles = cloudProfileRepository.profiles()
+                    val suffix = revokeWarning
+                        ?.takeIf(String::isNotBlank)
+                        ?.let { " (локально удалено; отзыв доступа Google не подтверждён: $it)" }
+                        .orEmpty()
+                    _state.update {
+                        it.copy(
+                            cloudProfiles = profiles,
+                            message = "Облачное подключение «${profile.name}» удалено$suffix",
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(message = error.message ?: "Не удалось удалить облачное подключение") }
                 }
         }
     }
@@ -1834,17 +2404,37 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             NetworkProtocol.FTPS -> connectFtp(networkProfileRepository.ftp(profile), save = false)
             NetworkProtocol.SMB -> connectSmb(networkProfileRepository.smb(profile))
             NetworkProtocol.SFTP -> _state.update {
-                it.copy(message = "SFTP-профиль доступен в «Расширенные возможности 0.14» → универсальные панели")
+                it.copy(message = "SFTP-профиль доступен в расширенных возможностях → универсальные панели")
             }
         }
     }
 
     fun deleteNetworkProfile(profile: NetworkProfile) {
+        val snapshot = _state.value
+        val deletingActiveSmb = profile.protocol == NetworkProtocol.SMB && snapshot.smbProfile?.id == profile.id
+        if (deletingActiveSmb && (snapshot.smbLoading || snapshot.smbTransferLabel != null || snapshot.operationInProgress)) {
+            _state.update { it.copy(message = "Сначала завершите текущую SMB-операцию") }
+            return
+        }
+        if (deletingActiveSmb) _state.update { it.copy(smbLoading = true) }
         viewModelScope.launch {
+            if (deletingActiveSmb) withContext(Dispatchers.IO) { smbRepository.disconnect() }
             withContext(Dispatchers.IO) { networkProfileRepository.delete(profile.id) }
-            _state.update {
-                it.copy(
-                    networkProfiles = networkProfileRepository.profiles(),
+            val profiles = networkProfileRepository.profiles()
+            val replacementSmb = if (deletingActiveSmb) {
+                profiles.firstOrNull { it.protocol == NetworkProtocol.SMB }
+                    ?.let { saved -> runCatching { networkProfileRepository.smb(saved) }.getOrNull() }
+            } else null
+            _state.update { current ->
+                current.copy(
+                    networkProfiles = profiles,
+                    smbLoading = if (deletingActiveSmb) false else current.smbLoading,
+                    smbConnected = if (deletingActiveSmb) false else current.smbConnected,
+                    smbBrowsingShares = if (deletingActiveSmb) false else current.smbBrowsingShares,
+                    smbShares = if (deletingActiveSmb) emptyList() else current.smbShares,
+                    smbItems = if (deletingActiveSmb) emptyList() else current.smbItems,
+                    smbPath = if (deletingActiveSmb) "/" else current.smbPath,
+                    smbProfile = if (deletingActiveSmb) replacementSmb else current.smbProfile,
                     message = "Подключение «${profile.name}» удалено",
                 )
             }
@@ -1903,7 +2493,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             val root = runCatching {
                 withContext(Dispatchers.IO) { repository.restoreRoot() }
             }.getOrNull() ?: return@launch
-            val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root) }
+            val cachedAnalysis = withContext(Dispatchers.IO) { storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles) }
 
             _state.update {
                 it.copy(
@@ -1937,10 +2527,14 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun refreshMetadata() {
-        val root = _state.value.folderStack.firstOrNull()?.document ?: return
+        val root = _state.value.folderStack.firstOrNull()?.document
         viewModelScope.launch {
-            val trash = runCatching { withContext(Dispatchers.IO) { repository.listTrash(root) } }.getOrDefault(emptyList())
             val favorites = runCatching { withContext(Dispatchers.IO) { repository.favoriteEntries() } }.getOrDefault(emptyList())
+            val trash = if (root != null) {
+                runCatching { withContext(Dispatchers.IO) { repository.listTrash(root) } }.getOrDefault(emptyList())
+            } else {
+                _state.value.trashRecords
+            }
             _state.update {
                 it.copy(
                     trashRecords = trash,
@@ -2003,7 +2597,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 restored.map { (record, entry) -> (record.originalUri ?: entry.uri) to entry },
             )
             repository.clearAnalysisCache()
-            storageIndexer.load(root)
+            storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
         }
         invalidateCategoryCollectionCache()
         val restoredTrashUris = restored.map { it.first.entry.uri }.toSet()
@@ -2039,7 +2633,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         val refreshedAnalysis = withContext(Dispatchers.IO) {
             storageIndexer.removeUris(root, removedUris)
             repository.clearAnalysisCache()
-            storageIndexer.load(root)
+            storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
         }
         invalidateCategoryCollectionCache()
         _state.update { current ->
@@ -2078,7 +2672,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun updateAnalysisFromIndex(root: DocumentFile): StorageAnalysis? {
-        val refreshed = storageIndexer.load(root)
+        val refreshed = storageIndexer.load(root, _state.value.showHidden, _state.value.showThumbnailFiles)
         if (refreshed != null) {
             _state.update {
                 it.copy(
@@ -2097,6 +2691,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
             "Крупные файлы" -> openLargeFiles()
             "Дубликаты" -> openDuplicates()
             "Избранное" -> openFavorites()
+            "Изображения" -> openImageCollection(resetFilters = false)
             else -> categoryForCollectionTitle(title)?.let(::openCategory)
         }
     }
@@ -2178,6 +2773,39 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    private fun refreshAnalysisForVisibility() {
+        invalidateCategoryCollectionCache()
+        val snapshot = _state.value
+        val root = snapshot.folderStack.firstOrNull()?.document ?: return
+        if (snapshot.analysis == null || snapshot.analyzing) return
+        val showHidden = snapshot.showHidden
+        val showThumbnails = snapshot.showThumbnailFiles
+        val openTitle = snapshot.collectionTitle
+        viewModelScope.launch {
+            val refreshed = withContext(Dispatchers.IO) {
+                storageIndexer.load(root, showHidden, showThumbnails)
+            } ?: return@launch
+            val current = _state.value
+            if (current.folderStack.firstOrNull()?.document?.uri != root.uri ||
+                current.showHidden != showHidden || current.showThumbnailFiles != showThumbnails
+            ) return@launch
+            _state.update { state ->
+                state.copy(
+                    analysis = refreshed,
+                    recentItems = refreshed.files.sortedByDescending(FileEntry::modifiedAt).take(12),
+                )
+            }
+            warmCategoryCollectionCache(root, refreshed)
+            when (openTitle) {
+                "Крупные файлы" -> openLargeFiles()
+                "Временные файлы" -> openTemporaryFiles()
+                "Дубликаты" -> openDuplicates()
+                "Изображения" -> openImageCollection(resetFilters = false)
+                else -> categoryForCollectionTitle(openTitle)?.let(::openCategory)
+            }
+        }
+    }
+
     private fun invalidateCategoryCollectionCache() {
         categoryCacheWarmJob?.cancel()
         categoryCacheWarmJob = null
@@ -2191,6 +2819,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         categoryCacheWarmJob?.cancel()
         val rootUri = root.uri.toString()
         val scannedAt = analysis.scannedAt
+        val showHidden = _state.value.showHidden
         val showThumbnails = _state.value.showThumbnailFiles
         val counts = analysis.categories.associate { it.category to it.count }
         val priority = listOf(
@@ -2208,28 +2837,33 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         categoryCacheWarmJob = viewModelScope.launch {
             for (category in priority) {
                 ensureActive()
+                // Images use an on-demand paged query with source filters; preloading the whole
+                // category would recreate the old 5,000-item bottleneck and waste memory.
+                if (category == FileCategory.Images) continue
                 if ((counts[category] ?: 0) <= 0) continue
                 if (categoryCollectionCache[category]?.let { cached ->
                         cached.rootUri == rootUri &&
                             cached.scannedAt == scannedAt &&
+                            cached.showHidden == showHidden &&
                             cached.showThumbnailFiles == showThumbnails
                     } == true
                 ) continue
 
                 val files = withContext(Dispatchers.IO) {
-                    storageIndexer.categoryEntries(root, category)
-                        .filter { file -> showThumbnails || !file.isThumbnailCache() }
+                    storageIndexer.categoryEntries(root, category, showHidden = showHidden, showThumbnails = showThumbnails)
                 }
                 val groups = withContext(Dispatchers.Default) { buildSourceGroups(files) }
                 ensureActive()
                 val current = _state.value
                 if (current.folderStack.firstOrNull()?.document?.uri?.toString() != rootUri ||
                     current.analysis?.scannedAt != scannedAt ||
+                    current.showHidden != showHidden ||
                     current.showThumbnailFiles != showThumbnails
                 ) return@launch
                 categoryCollectionCache[category] = CategoryCollectionCacheEntry(
                     rootUri = rootUri,
                     scannedAt = scannedAt,
+                    showHidden = showHidden,
                     showThumbnailFiles = showThumbnails,
                     items = files,
                     groups = groups,
@@ -2241,6 +2875,20 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
     private fun showFailure(error: Throwable) {
         _state.update {
             it.copy(message = error.message ?: "Операция не выполнена")
+        }
+    }
+
+    private fun showSmbFailure(error: Throwable) {
+        val profile = _state.value.smbProfile
+        _state.update {
+            it.copy(
+                message = smbUserMessage(
+                    error = error,
+                    host = profile?.host,
+                    share = profile?.share,
+                    guestMode = profile?.username?.isBlank(),
+                )
+            )
         }
     }
 
@@ -2308,12 +2956,21 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
                 bytes = (summary.bytes - removedInCategory.sumOf { it.size.coerceAtLeast(0L) }).coerceAtLeast(0L),
             )
         }
+        val updatedStorageCategories = storageCategories.map { summary ->
+            val removedInCategory = removedEntries.filter { it.category() == summary.category }
+            summary.copy(
+                count = (summary.count - removedInCategory.size).coerceAtLeast(0),
+                bytes = (summary.bytes - removedInCategory.sumOf { it.size.coerceAtLeast(0L) }).coerceAtLeast(0L),
+            )
+        }
         return copy(
             files = remaining,
             // `files` is intentionally only a Recent cache (max 2,000 items), so recomputing
             // totals from it produced the stale/incorrect second lines in Cleanup.
+            totalFileCount = (totalFileCount - removedEntries.size).coerceAtLeast(0),
             totalBytes = (totalBytes - removedBytes).coerceAtLeast(0L),
             categories = updatedCategories,
+            storageCategories = updatedStorageCategories,
             largeFiles = largeFiles.filterNot { it.uri in removedUris },
             largeFileCount = (largeFileCount - removedEntries.count { it.size >= LARGE_FILE_BYTES }).coerceAtLeast(0),
             duplicateGroups = remainingDuplicates,

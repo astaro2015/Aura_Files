@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$SkipConsent
 )
 
@@ -326,6 +326,77 @@ function Configure-Environment {
                 $env:PATH
 }
 
+function Ensure-DebugKeystore {
+    if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        Write-Host 'USERPROFILE is unavailable; Gradle will manage its debug keystore normally.' -ForegroundColor Yellow
+        return
+    }
+
+    $AndroidUserDir = Join-Path $env:USERPROFILE '.android'
+    $DebugKeystore = Join-Path $AndroidUserDir 'debug.keystore'
+    $Keytool = Join-Path $JdkRoot 'bin\keytool.exe'
+    if (-not (Test-Path -LiteralPath $Keytool)) {
+        Write-Host "keytool was not found at $Keytool; Gradle will manage its debug keystore normally." -ForegroundColor Yellow
+        return
+    }
+
+    Ensure-Directory $AndroidUserDir
+    if (-not (Test-Path -LiteralPath $DebugKeystore)) {
+        Write-Step 'Creating persistent Android debug signing key'
+        & $Keytool `
+            -genkeypair `
+            -keystore $DebugKeystore `
+            -storepass android `
+            -alias androiddebugkey `
+            -keypass android `
+            -dname 'CN=Android Debug,O=Android,C=US' `
+            -keyalg RSA `
+            -keysize 2048 `
+            -storetype JKS `
+            -validity 10000 `
+            -noprompt
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to create the persistent Android debug keystore.' }
+    }
+
+    # Android Gradle Plugin uses %USERPROFILE%\.android\debug.keystore for debug builds.
+    # Keeping this file outside the extracted source makes the signing SHA-1 stable across
+    # clean Aura source folders on the same Windows account, which is required by Google OAuth.
+    $KeyInfo = (& $Keytool -list -v -alias androiddebugkey -keystore $DebugKeystore -storepass android -keypass android 2>&1 | Out-String)
+    $ShaMatch = [regex]::Match($KeyInfo, 'SHA1:\s*([0-9A-Fa-f:]+)')
+    Write-Host ''
+    Write-Host 'Google Drive Android OAuth identity for this debug APK:' -ForegroundColor Cyan
+    Write-Host '  Package: com.aurafiles.app'
+    if ($ShaMatch.Success) {
+        Write-Host ("  SHA-1:   {0}" -f $ShaMatch.Groups[1].Value.ToUpperInvariant())
+    } else {
+        Write-Host '  SHA-1:   could not parse automatically; run SHOW_GOOGLE_OAUTH_SHA1.bat' -ForegroundColor Yellow
+    }
+    Write-Host ("  Key:     {0}" -f $DebugKeystore)
+    Write-Host 'Register this package + SHA-1 as an Android OAuth client in the SAME Google Cloud project where Google Drive API is enabled.' -ForegroundColor Yellow
+
+    Ensure-Directory $OutputRoot
+    $GoogleSetupPath = Join-Path $OutputRoot 'GOOGLE_OAUTH_SETUP.txt'
+    $ShaText = if ($ShaMatch.Success) { $ShaMatch.Groups[1].Value.ToUpperInvariant() } else { 'could not parse automatically' }
+    @(
+        'Aura Files Google Drive OAuth setup',
+        '',
+        'Package: com.aurafiles.app',
+        ("SHA-1:   {0}" -f $ShaText),
+        ("Debug keystore: {0}" -f $DebugKeystore),
+        '',
+        'In ONE Google Cloud project:',
+        '1. Enable Google Drive API.',
+        '2. Configure Google Auth Platform / OAuth consent screen.',
+        '3. Add scope https://www.googleapis.com/auth/drive.',
+        '4. If the app is in Testing, add the Google account under Test users.',
+        '5. Create OAuth Client ID -> Android with the package and SHA-1 above.',
+        '',
+        'If Aura reports UNREGISTERED_ON_API_CONSOLE, this package/SHA-1 is not registered',
+        'for the installed APK, or it was registered in a different Cloud project.'
+    ) | Set-Content -LiteralPath $GoogleSetupPath -Encoding UTF8
+    Write-Host ("  Setup file: {0}" -f $GoogleSetupPath)
+}
+
 function Android-PackagesReady {
     return (
         (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-36\android.jar')) -and
@@ -370,7 +441,7 @@ function Install-AndroidPackages {
 }
 
 function Stage-Project {
-    Write-Step 'Staging project into an ASCII-only build path'
+    Write-Step 'Staging verified project into an ASCII-only build path'
     $SourceFull = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
     $StageFull = [IO.Path]::GetFullPath($StageRoot).TrimEnd('\')
 
@@ -379,30 +450,50 @@ function Stage-Project {
         return
     }
 
+    $ManifestPath = Join-Path $ProjectRoot 'SOURCE_SHA256SUMS.txt'
+    if (-not (Test-Path -LiteralPath $ManifestPath)) {
+        throw "SOURCE_SHA256SUMS.txt is missing. Refusing to stage an unverified/mixed source tree."
+    }
+
     Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction SilentlyContinue
     Ensure-Directory $StageRoot
 
-    $ExcludedDirs = @(
-        (Join-Path $ProjectRoot '.git'),
-        (Join-Path $ProjectRoot '.gradle'),
-        (Join-Path $ProjectRoot 'build'),
-        (Join-Path $ProjectRoot 'app\build'),
-        (Join-Path $ProjectRoot 'BUILD_OUTPUT')
-    )
-
-    $RoboArgs = @(
-        $ProjectRoot,
-        $StageRoot,
-        '/MIR', '/R:2', '/W:1', '/NFL', '/NDL', '/NJH', '/NJS', '/NP',
-        '/XF', 'local.properties',
-        '/XD'
-    ) + $ExcludedDirs
-
-    & robocopy.exe @RoboArgs | Out-Null
-    $RoboCode = $LASTEXITCODE
-    if ($RoboCode -gt 7) {
-        throw "robocopy failed with exit code $RoboCode"
+    $Copied = 0
+    foreach ($Line in Get-Content -LiteralPath $ManifestPath) {
+        if ([string]::IsNullOrWhiteSpace($Line)) { continue }
+        # Accept normal sha256sum output: <64 hex><two spaces><relative path>.
+        # Older Aura packages sometimes used a leading "./"; keep that compatible too.
+        # Dot-files/directories such as .gitignore and .github are normal relative paths.
+        if ($Line -notmatch '^([0-9a-fA-F]{64})[ \t]{2,}(.+)$') {
+            throw "Invalid SOURCE_SHA256SUMS.txt line: $Line"
+        }
+        $Expected = $Matches[1].ToLowerInvariant()
+        $RelativeText = $Matches[2].Trim()
+        if ($RelativeText.StartsWith('./')) { $RelativeText = $RelativeText.Substring(2) }
+        if ([string]::IsNullOrWhiteSpace($RelativeText)) {
+            throw "Invalid empty path in SOURCE_SHA256SUMS.txt line: $Line"
+        }
+        $Relative = $RelativeText.Replace('/', '\')
+        if ([IO.Path]::IsPathRooted($Relative) -or $Relative -match '(^|\\)\.\.(\\|$)') {
+            throw "Unsafe path in SOURCE_SHA256SUMS.txt: $RelativeText"
+        }
+        $Source = Join-Path $ProjectRoot $Relative
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+            throw "Manifest file is missing from source tree: $Relative"
+        }
+        $Actual = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($Actual -ne $Expected) {
+            throw "Source checksum mismatch: $Relative`nExpected: $Expected`nActual:   $Actual`nRe-extract the current Aura Files source package instead of overlaying partial files."
+        }
+        $Destination = Join-Path $StageRoot $Relative
+        Ensure-Directory (Split-Path -Parent $Destination)
+        Copy-Item -LiteralPath $Source -Destination $Destination -Force
+        $Copied += 1
     }
+
+    # The manifest cannot hash itself, but keep a copy in staging for diagnostics/provenance.
+    Copy-Item -LiteralPath $ManifestPath -Destination (Join-Path $StageRoot 'SOURCE_SHA256SUMS.txt') -Force
+    Write-Host "Verified and staged $Copied manifest files. Extra files in the source folder were ignored."
 }
 
 function Write-LocalProperties {
@@ -515,6 +606,7 @@ try {
     Write-Step 'JDK check'
     & (Join-Path $JdkRoot 'bin\java.exe') -version
     if ($LASTEXITCODE -ne 0) { throw 'java -version failed.' }
+    Ensure-DebugKeystore
 
     Install-AndroidCommandLineTools
     Configure-Environment

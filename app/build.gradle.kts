@@ -19,6 +19,14 @@ val releaseStoreFile = releaseSetting("storeFile", "AURA_KEYSTORE_FILE")
 val releaseStorePassword = releaseSetting("storePassword", "AURA_KEYSTORE_PASSWORD")
 val releaseKeyAlias = releaseSetting("keyAlias", "AURA_KEY_ALIAS")
 val releaseKeyPassword = releaseSetting("keyPassword", "AURA_KEY_PASSWORD")
+
+val yandexOAuthClientId = providers.gradleProperty("AURA_YANDEX_CLIENT_ID").orNull
+    ?.trim()?.takeIf(String::isNotEmpty)
+    ?: System.getenv("AURA_YANDEX_CLIENT_ID")?.trim()?.takeIf(String::isNotEmpty)
+    ?: ""
+
+fun buildConfigString(value: String): String =
+    "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 val hasReleaseSigning = listOf(
     releaseStoreFile,
     releaseStorePassword,
@@ -34,8 +42,9 @@ android {
         applicationId = "com.aurafiles.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 100
-        versionName = "1.0"
+        versionCode = 131
+        versionName = "1.3.1"
+        buildConfigField("String", "YANDEX_OAUTH_CLIENT_ID", buildConfigString(yandexOAuthClientId))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -140,6 +149,7 @@ dependencies {
     implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-savedstate:2.10.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
     implementation("androidx.media3:media3-exoplayer:1.11.0")
     implementation("androidx.media3:media3-ui:1.11.0")
@@ -157,6 +167,7 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.85")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
     implementation("org.apache.commons:commons-compress:1.28.0")
+    implementation("com.google.android.gms:play-services-auth:21.6.0")
     implementation("org.tukaani:xz:1.10")
     implementation("com.github.junrar:junrar:8.1.0")
     runtimeOnly("org.slf4j:slf4j-nop:2.0.18")

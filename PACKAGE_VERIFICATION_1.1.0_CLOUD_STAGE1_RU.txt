@@ -1,0 +1,26 @@
+Aura Files 1.1.0 CLOUD — проверка этапа 1
+Дата: 2026-09-06
+
+База:
+- Aura_Files_1.0.4_GITHUB_BASE_FIXED.zip
+- SHA-256: 446e35368b9f8a859005d08f3ccda81c8f0ec9d1bac3ed52633fc2619afc1905
+
+Проверено в контейнере:
+- pure Kotlin cloud model (`CloudProfile.kt` + `CloudAuthTokens.kt`) реально скомпилирован kotlinc: OK;
+- smoke-проверки fallback имени, provider storage key и token expiry: OK;
+- Kotlin PSI parse: 90 Kotlin-файлов, 0 синтаксических ошибок;
+- Android XML parse: 14 файлов, 0 ошибок;
+- whitespace audit изменённых файлов: 0 проблем;
+- cloud token SharedPreferences исключён из cloud backup и device transfer;
+- cloud profile SharedPreferences также исключён, чтобы после переноса не оставались аккаунты без device-bound Keystore key;
+- accessToken/refreshToken сериализуются только внутри зашифрованного CloudTokenStore payload; CloudProfileRepository хранит только метаданные;
+- encrypted blob использует AES-GCM, случайный IV и AAD с profile ID;
+- app versionName/versionCode не повышались: ветка ещё не является финальным 1.1.0.
+
+Полный Android Gradle build НЕ заявляется пройденным:
+- `./gradlew --version` попытался получить `gradle-9.5.0-bin.zip`;
+- среда не разрешает `services.gradle.org` (UnknownHostException), поэтому wrapper не смог развернуть Gradle.
+- это ограничение среды, а не обнаруженная ошибка компиляции проекта.
+
+Следующая контрольная сборка на Windows/CI:
+  gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon

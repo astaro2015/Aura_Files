@@ -1,8 +1,12 @@
 package com.aurafiles.app.ui
 
+import android.app.Activity
 import android.app.Application
+import android.app.PendingIntent
+import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.aurafiles.app.backend.BackendFactory
 import com.aurafiles.app.backend.BackendPath
@@ -11,6 +15,21 @@ import com.aurafiles.app.backend.StorageBackendDescriptor
 import com.aurafiles.app.backend.StorageBackendKind
 import com.aurafiles.app.backend.StorageBackendRegistry
 import com.aurafiles.app.backend.StorageItem
+import com.aurafiles.app.cloud.CloudProfile
+import com.aurafiles.app.cloud.CloudProfileRepository
+import com.aurafiles.app.cloud.CloudProvider
+import com.aurafiles.app.cloud.google.GoogleAuthorizationStep
+import com.aurafiles.app.cloud.google.GoogleDriveApiClient
+import com.aurafiles.app.cloud.google.GoogleDriveApiException
+import com.aurafiles.app.cloud.google.GoogleDriveFailureKind
+import com.aurafiles.app.cloud.google.GoogleIdentityAuthorization
+import com.aurafiles.app.cloud.google.userMessageForGoogleDriveFailure
+import com.aurafiles.app.cloud.yandex.YandexAuthService
+import com.aurafiles.app.cloud.yandex.YandexDeviceCode
+import com.aurafiles.app.cloud.yandex.YandexDeviceTokenPoll
+import com.aurafiles.app.cloud.yandex.YandexOAuthSettingsStore
+import com.aurafiles.app.cloud.yandex.userMessageForYandexFailure
+import com.aurafiles.app.cloud.yandex.YandexApiException
 import com.aurafiles.app.data.FileRepository
 import com.aurafiles.app.model.SftpHostKeyException
 import com.aurafiles.app.model.SftpProfile
@@ -32,8 +51,11 @@ import com.aurafiles.app.transfer.TransferProgress
 import com.aurafiles.app.transfer.TransferRequest
 import com.aurafiles.app.transfer.TransferSource
 import com.aurafiles.app.transfer.TransferType
+import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,8 +84,47 @@ internal data class PendingHostKey(
     val paneLeft: Boolean,
 )
 
+internal data class BackendOpenFileRequest(
+    val absolutePath: String,
+    val displayName: String,
+    val mimeType: String?,
+)
+
+internal data class BackendClipboard(
+    val sourceBackendId: String,
+    val items: List<StorageItem>,
+    val move: Boolean,
+)
+
+internal sealed interface YandexAuthUiState {
+    data object Idle : YandexAuthUiState
+    data class Configuring(val clientId: String) : YandexAuthUiState
+    data class Requesting(val clientId: String) : YandexAuthUiState
+    data class AwaitingApproval(
+        val clientId: String,
+        val userCode: String,
+        val verificationUrl: String,
+        val expiresAtEpochMs: Long,
+        val status: String = "Жду подтверждения входа в браузере…",
+        val autoOpenVerification: Boolean = false,
+    ) : YandexAuthUiState
+    data class Error(val clientId: String, val message: String) : YandexAuthUiState
+}
+
+internal sealed interface GoogleAuthUiState {
+    data object Idle : GoogleAuthUiState
+    data object Requesting : GoogleAuthUiState
+    data class NeedsResolution(val pendingIntent: PendingIntent) : GoogleAuthUiState
+    data object AwaitingUser : GoogleAuthUiState
+    data object Finalizing : GoogleAuthUiState
+    data class Error(val message: String) : GoogleAuthUiState
+}
+
 internal data class WorkspaceState(
     val backends: List<StorageBackendDescriptor> = emptyList(),
+    val cloudProfiles: List<CloudProfile> = emptyList(),
+    val yandexAuth: YandexAuthUiState = YandexAuthUiState.Idle,
+    val googleAuth: GoogleAuthUiState = GoogleAuthUiState.Idle,
     val left: BackendPaneState = BackendPaneState(),
     val right: BackendPaneState = BackendPaneState(),
     val transfer: TransferProgress? = null,
@@ -73,13 +134,23 @@ internal data class WorkspaceState(
     val pendingHostKey: PendingHostKey? = null,
     val busyLabel: String? = null,
     val message: String? = null,
+    val reopenBackendId: String? = null,
+    val openFileRequest: BackendOpenFileRequest? = null,
+    val clipboard: BackendClipboard? = null,
 )
 
-internal class BackendWorkspaceViewModel(application: Application) : AndroidViewModel(application) {
+internal class BackendWorkspaceViewModel(
+    application: Application,
+    private val savedStateHandle: SavedStateHandle,
+) : AndroidViewModel(application) {
     private val fileRepository = FileRepository(application)
     private val profileRepository = NetworkProfileRepository(application)
+    private val cloudProfileRepository = CloudProfileRepository(application)
+    private val yandexSettings = YandexOAuthSettingsStore(application)
+    private val yandexAuthService = YandexAuthService(cloudProfileRepository)
+    private val googleIdentity = GoogleIdentityAuthorization(application)
     private val registry = StorageBackendRegistry()
-    private val factory = BackendFactory(application, profileRepository)
+    private val factory = BackendFactory(application, profileRepository, cloudProfileRepository, yandexSettings)
     private val transferEngine = TransferEngine(application, smbGateway = null, backendRegistry = registry)
     private val comparator = DirectoryComparator()
     private val syncExecutor = DirectorySyncExecutor()
@@ -91,6 +162,10 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
     private var rightRefreshJob: Job? = null
     private var leftRefreshGeneration = 0L
     private var rightRefreshGeneration = 0L
+    private var yandexAuthJob: Job? = null
+    private var googleAuthJob: Job? = null
+    // Persist interactive Google authorization state so Activity/process recreation cannot discard a valid result.
+    private var googleAuthorizationActive: Boolean = savedStateHandle[KEY_GOOGLE_AUTH_ACTIVE] ?: false
 
     init {
         rebuildBackends()
@@ -100,17 +175,23 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
         viewModelScope.launch {
             transferEngine.conflict.collect { conflict -> _state.update { it.copy(conflict = conflict) } }
         }
+        restorePendingYandexAuthorization()
+        if (googleAuthorizationActive) {
+            _state.update { it.copy(googleAuth = GoogleAuthUiState.AwaitingUser) }
+        }
     }
 
     override fun onCleared() {
         operation?.cancel()
         leftRefreshJob?.cancel()
         rightRefreshJob?.cancel()
+        yandexAuthJob?.cancel()
+        googleAuthJob?.cancel()
         registry.close()
         super.onCleared()
     }
 
-    fun rebuildBackends() {
+    fun rebuildBackends(preferredBackendId: String? = null) {
         invalidateRefresh(true)
         invalidateRefresh(false)
         val oldIds = registry.descriptors().map { it.id }
@@ -122,25 +203,444 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
             if (profile.protocol == NetworkProtocol.SMB && profile.smbShare.isBlank()) return@forEach
             runCatching { registry.register(factory.network(profile)) }
         }
+        val cloudProfiles = cloudProfileRepository.profiles()
+        val cloudRegistrationErrors = mutableListOf<String>()
+        cloudProfiles
+            .filter { profile ->
+                when (profile.provider) {
+                    CloudProvider.YANDEX_DISK -> cloudProfileRepository.hasStoredTokens(profile.id)
+                    CloudProvider.GOOGLE_DRIVE -> profile.accountLabel.isNotBlank()
+                }
+            }
+            .forEach { profile ->
+                runCatching { registry.register(factory.cloud(profile)) }
+                    .onFailure { error ->
+                        cloudRegistrationErrors += "${profile.provider.displayName}: ${error.message ?: error::class.java.simpleName}"
+                    }
+            }
         val descriptors = registry.descriptors()
         val validBackendIds = descriptors.mapTo(hashSetOf(), StorageBackendDescriptor::id)
         _state.update { state ->
-            val first = descriptors.firstOrNull { it.kind == StorageBackendKind.LOCAL } ?: descriptors.firstOrNull()
+            val local = descriptors.firstOrNull { it.kind == StorageBackendKind.LOCAL }
+            val first = local ?: descriptors.firstOrNull()
             val second = descriptors.firstOrNull { it.id != first?.id } ?: first
+            val preferred = preferredBackendId?.let { id -> descriptors.firstOrNull { it.id == id } }
+            val preferredPeer = local?.takeIf { it.id != preferred?.id }
+                ?: descriptors.firstOrNull { it.id != preferred?.id }
             state.copy(
                 backends = descriptors,
-                left = state.left.takeIf { pane -> pane.backendId in validBackendIds }
-                    ?.copy(items = emptyList(), loading = false, selected = emptySet())
-                    ?: BackendPaneState(backendId = first?.id, path = first?.rootPath ?: "/"),
-                right = state.right.takeIf { pane -> pane.backendId in validBackendIds }
-                    ?.copy(items = emptyList(), loading = false, selected = emptySet())
-                    ?: BackendPaneState(backendId = second?.id, path = second?.rootPath ?: "/"),
+                cloudProfiles = cloudProfiles,
+                left = if (preferred != null) {
+                    BackendPaneState(backendId = preferred.id, path = preferred.rootPath)
+                } else {
+                    state.left.takeIf { pane -> pane.backendId in validBackendIds }
+                        ?.copy(items = emptyList(), loading = false, selected = emptySet())
+                        ?: BackendPaneState(backendId = first?.id, path = first?.rootPath ?: "/")
+                },
+                right = if (preferred != null && preferredPeer != null) {
+                    BackendPaneState(backendId = preferredPeer.id, path = preferredPeer.rootPath)
+                } else {
+                    state.right.takeIf { pane -> pane.backendId in validBackendIds }
+                        ?.copy(items = emptyList(), loading = false, selected = emptySet())
+                        ?: BackendPaneState(backendId = second?.id, path = second?.rootPath ?: "/")
+                },
                 comparison = null,
                 syncPlan = null,
+                message = when {
+                    preferredBackendId != null && preferred == null ->
+                        "Облачный backend $preferredBackendId не зарегистрирован. ${cloudRegistrationErrors.joinToString("; ")}".trim()
+                    cloudRegistrationErrors.isNotEmpty() && state.message.isNullOrBlank() ->
+                        "Не удалось зарегистрировать облачное подключение: ${cloudRegistrationErrors.joinToString("; ")}"
+                    else -> state.message
+                },
             )
         }
         refresh(true)
         refresh(false)
+    }
+
+    fun showAddYandexDialog() {
+        if (yandexAuthJob?.isActive == true) return
+        val clientId = yandexSettings.configuredClientId()
+        val clientSecret = yandexSettings.configuredClientSecret(clientId)
+        if (clientId.isBlank() || clientSecret.isBlank()) {
+            _state.update { it.copy(yandexAuth = YandexAuthUiState.Configuring(clientId)) }
+        } else {
+            startYandexAuthorization(clientId, clientSecret)
+        }
+    }
+
+    fun dismissYandexDialog() {
+        yandexAuthJob?.cancel()
+        yandexAuthJob = null
+        clearPendingYandexAuthorization()
+        _state.update { it.copy(yandexAuth = YandexAuthUiState.Idle) }
+    }
+
+    fun startYandexAuthorization(clientId: String, clientSecret: String) {
+        val normalizedClientId = clientId.trim()
+        if (normalizedClientId.isBlank()) {
+            _state.update { it.copy(yandexAuth = YandexAuthUiState.Error(clientId, "Укажите Yandex OAuth Client ID приложения.")) }
+            return
+        }
+        // The password field intentionally stays visually empty after an error. Reuse the
+        // encrypted Keystore copy when the user simply presses Retry/Login again.
+        val normalizedClientSecret = clientSecret.trim().ifBlank {
+            yandexSettings.configuredClientSecret(normalizedClientId)
+        }
+        if (normalizedClientSecret.isBlank()) {
+            _state.update { it.copy(yandexAuth = YandexAuthUiState.Error(normalizedClientId, "Укажите Yandex OAuth Client Secret (пароль приложения).")) }
+            return
+        }
+        yandexAuthJob?.cancel()
+        clearPendingYandexAuthorization()
+        yandexAuthJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                yandexSettings.rememberClientId(normalizedClientId)
+                yandexSettings.rememberClientSecret(normalizedClientId, normalizedClientSecret)
+                val config = yandexSettings.config(normalizedClientId, normalizedClientSecret)
+                _state.update { it.copy(yandexAuth = YandexAuthUiState.Requesting(normalizedClientId)) }
+                val code = yandexAuthService.startDeviceAuthorization(config)
+                persistPendingYandexAuthorization(normalizedClientId, code)
+                _state.update {
+                    it.copy(
+                        yandexAuth = YandexAuthUiState.AwaitingApproval(
+                            clientId = normalizedClientId,
+                            userCode = code.userCode,
+                            verificationUrl = code.verificationUrl,
+                            expiresAtEpochMs = code.expiresAtEpochMs,
+                            autoOpenVerification = true,
+                        )
+                    )
+                }
+                pollYandexAuthorization(config, code)
+            } catch (_: CancellationException) {
+                // User closed the dialog.
+            } catch (error: Throwable) {
+                clearPendingYandexAuthorization()
+                val message = if (error is YandexApiException) error.message ?: userMessageForYandexFailure(error.kind)
+                    else error.message ?: "Не удалось войти через Яндекс"
+                _state.update { it.copy(yandexAuth = YandexAuthUiState.Error(normalizedClientId, message)) }
+            } finally {
+                yandexAuthJob = null
+            }
+        }
+    }
+
+    private suspend fun pollYandexAuthorization(
+        config: com.aurafiles.app.cloud.yandex.YandexOAuthConfig,
+        code: YandexDeviceCode,
+    ) {
+        var intervalSeconds = code.intervalSeconds.coerceAtLeast(1)
+        while (kotlin.coroutines.coroutineContext.isActive) {
+            val remaining = code.expiresAtEpochMs - System.currentTimeMillis()
+            if (remaining <= 0L) throw YandexApiException(com.aurafiles.app.cloud.yandex.YandexFailureKind.AUTH_EXPIRED)
+            delay((intervalSeconds * 1000L).coerceAtMost(remaining))
+            val pollResult = try {
+                yandexAuthService.pollDeviceAuthorization(config, code)
+            } catch (error: YandexApiException) {
+                if (error.kind == com.aurafiles.app.cloud.yandex.YandexFailureKind.NETWORK ||
+                    error.kind == com.aurafiles.app.cloud.yandex.YandexFailureKind.SERVER
+                ) {
+                    _state.update { state ->
+                        val current = state.yandexAuth as? YandexAuthUiState.AwaitingApproval
+                        if (current == null) state else state.copy(
+                            yandexAuth = current.copy(
+                                status = (error.message ?: userMessageForYandexFailure(error.kind)) +
+                                    "\nПовторю автоматически…"
+                            )
+                        )
+                    }
+                    intervalSeconds = maxOf(intervalSeconds, 5)
+                    continue
+                }
+                throw error
+            }
+            val (poll, account) = pollResult
+            when (poll) {
+                YandexDeviceTokenPoll.Pending -> _state.update { state ->
+                    val current = state.yandexAuth as? YandexAuthUiState.AwaitingApproval
+                    if (current == null) state else state.copy(yandexAuth = current.copy(status = "Жду подтверждения входа в браузере…"))
+                }
+                is YandexDeviceTokenPoll.SlowDown -> {
+                    intervalSeconds += poll.extraDelaySeconds.coerceAtLeast(1)
+                    _state.update { state ->
+                        val current = state.yandexAuth as? YandexAuthUiState.AwaitingApproval
+                        if (current == null) state else state.copy(yandexAuth = current.copy(status = "Яндекс попросил снизить частоту запросов. Жду…"))
+                    }
+                }
+                is YandexDeviceTokenPoll.Granted -> {
+                    val authenticated = requireNotNull(account)
+                    clearPendingYandexAuthorization()
+                    val backendId = "yandex:${authenticated.profileId}"
+                    rebuildBackends(preferredBackendId = backendId)
+                    ensurePreferredBackendSelected(backendId, "Яндекс.Диск")
+                    _state.update {
+                        it.copy(
+                            yandexAuth = YandexAuthUiState.Idle,
+                            message = "Яндекс.Диск подключён${authenticated.accountLabel.takeIf(String::isNotBlank)?.let { label -> ": $label" }.orEmpty()}",
+                            reopenBackendId = backendId,
+                        )
+                    }
+                    return
+                }
+            }
+        }
+    }
+
+    fun markYandexVerificationOpened() {
+        _state.update { state ->
+            val current = state.yandexAuth as? YandexAuthUiState.AwaitingApproval
+            if (current == null || !current.autoOpenVerification) state
+            else state.copy(yandexAuth = current.copy(autoOpenVerification = false))
+        }
+    }
+
+    private fun persistPendingYandexAuthorization(clientId: String, code: YandexDeviceCode) {
+        savedStateHandle[KEY_YANDEX_CLIENT_ID] = clientId
+        savedStateHandle[KEY_YANDEX_DEVICE_CODE] = code.deviceCode
+        savedStateHandle[KEY_YANDEX_USER_CODE] = code.userCode
+        savedStateHandle[KEY_YANDEX_VERIFICATION_URL] = code.verificationUrl
+        savedStateHandle[KEY_YANDEX_INTERVAL_SECONDS] = code.intervalSeconds
+        savedStateHandle[KEY_YANDEX_EXPIRES_AT] = code.expiresAtEpochMs
+    }
+
+    private fun clearPendingYandexAuthorization() {
+        savedStateHandle.remove<String>(KEY_YANDEX_CLIENT_ID)
+        savedStateHandle.remove<String>(KEY_YANDEX_DEVICE_CODE)
+        savedStateHandle.remove<String>(KEY_YANDEX_USER_CODE)
+        savedStateHandle.remove<String>(KEY_YANDEX_VERIFICATION_URL)
+        savedStateHandle.remove<Int>(KEY_YANDEX_INTERVAL_SECONDS)
+        savedStateHandle.remove<Long>(KEY_YANDEX_EXPIRES_AT)
+    }
+
+    private fun restorePendingYandexAuthorization() {
+        val clientId = savedStateHandle.get<String>(KEY_YANDEX_CLIENT_ID)?.trim().orEmpty()
+        val deviceCode = savedStateHandle.get<String>(KEY_YANDEX_DEVICE_CODE).orEmpty()
+        val userCode = savedStateHandle.get<String>(KEY_YANDEX_USER_CODE).orEmpty()
+        val verificationUrl = savedStateHandle.get<String>(KEY_YANDEX_VERIFICATION_URL).orEmpty()
+        val intervalSeconds = savedStateHandle.get<Int>(KEY_YANDEX_INTERVAL_SECONDS) ?: return
+        val expiresAt = savedStateHandle.get<Long>(KEY_YANDEX_EXPIRES_AT) ?: return
+        if (clientId.isBlank() || deviceCode.isBlank() || userCode.isBlank() || verificationUrl.isBlank()) {
+            clearPendingYandexAuthorization()
+            return
+        }
+        val code = runCatching {
+            YandexDeviceCode(deviceCode, userCode, verificationUrl, intervalSeconds, expiresAt)
+        }.getOrElse {
+            clearPendingYandexAuthorization()
+            return
+        }
+        if (code.isExpired()) {
+            clearPendingYandexAuthorization()
+            return
+        }
+        val config = runCatching { yandexSettings.config(clientId) }.getOrElse {
+            clearPendingYandexAuthorization()
+            return
+        }
+        _state.update {
+            it.copy(
+                yandexAuth = YandexAuthUiState.AwaitingApproval(
+                    clientId = clientId,
+                    userCode = code.userCode,
+                    verificationUrl = code.verificationUrl,
+                    expiresAtEpochMs = code.expiresAtEpochMs,
+                    status = "Продолжаю ожидать подтверждение Яндекса…",
+                    autoOpenVerification = false,
+                )
+            )
+        }
+        yandexAuthJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                pollYandexAuthorization(config, code)
+            } catch (_: CancellationException) {
+                // SavedStateHandle retains the pending code across Activity/process recreation.
+            } catch (error: Throwable) {
+                clearPendingYandexAuthorization()
+                val message = if (error is YandexApiException) error.message ?: userMessageForYandexFailure(error.kind)
+                    else error.message ?: "Не удалось завершить вход через Яндекс"
+                _state.update { it.copy(yandexAuth = YandexAuthUiState.Error(clientId, message)) }
+            } finally {
+                yandexAuthJob = null
+            }
+        }
+    }
+
+    fun showAddGoogleDialog() {
+        if (googleAuthorizationActive || googleAuthJob?.isActive == true) return
+        setGoogleAuthorizationActive(true)
+        googleAuthJob = viewModelScope.launch {
+            _state.update { it.copy(googleAuth = GoogleAuthUiState.Requesting) }
+            try {
+                when (val step = googleIdentity.authorize(selectAccount = true)) {
+                    is GoogleAuthorizationStep.Granted -> finishGoogleAuthorization(step.accessToken)
+                    is GoogleAuthorizationStep.NeedsResolution -> {
+                        _state.update { it.copy(googleAuth = GoogleAuthUiState.NeedsResolution(step.pendingIntent)) }
+                    }
+                }
+            } catch (_: CancellationException) {
+                setGoogleAuthorizationActive(false)
+                _state.update { it.copy(googleAuth = GoogleAuthUiState.Idle) }
+            } catch (error: Throwable) {
+                setGoogleAuthError(error)
+            } finally {
+                googleAuthJob = null
+            }
+        }
+    }
+
+    fun markGoogleResolutionLaunched() {
+        _state.update { state ->
+            if (state.googleAuth is GoogleAuthUiState.NeedsResolution) {
+                state.copy(googleAuth = GoogleAuthUiState.AwaitingUser)
+            } else state
+        }
+    }
+
+    fun completeGoogleAuthorization(data: Intent?, resultCode: Int) {
+        if (!googleAuthorizationActive) setGoogleAuthorizationActive(true)
+        googleAuthJob?.cancel()
+        googleAuthJob = viewModelScope.launch {
+            _state.update { it.copy(googleAuth = GoogleAuthUiState.Finalizing) }
+            try {
+                val resultWasOk = resultCode == Activity.RESULT_OK
+                // Prefer the AuthorizationResult returned by Google Play services when it exists.
+                // Some vendor/Play-services combinations return RESULT_CANCELED or a null/empty
+                // Intent even after the user granted the requested scope. Do not treat resultCode
+                // as the source of truth: AuthorizationClient can immediately verify an already
+                // granted scope without opening another window.
+                val returnedResult = data?.let { intent ->
+                    runCatching { googleIdentity.authorizationResultFromIntent(intent) }
+                }
+                val granted = returnedResult?.getOrNull()
+                if (granted != null) {
+                    finishGoogleAuthorization(granted.accessToken)
+                } else {
+                    when (val verified = googleIdentity.authorize(selectAccount = false)) {
+                        is GoogleAuthorizationStep.Granted -> finishGoogleAuthorization(verified.accessToken)
+                        is GoogleAuthorizationStep.NeedsResolution -> {
+                            val returnedError = returnedResult?.exceptionOrNull()?.message?.takeIf(String::isNotBlank)
+                            val message = when {
+                                returnedError != null -> "Google не подтвердил результат системного окна: $returnedError"
+                                resultWasOk -> "Google закрыл окно авторизации, но доступ к Drive не подтвердился."
+                                else -> "Подключение Google Drive не подтверждено (resultCode=$resultCode). Если ты разрешил доступ, проверь настройку Android OAuth client и Drive API."
+                            }
+                            throw GoogleDriveApiException(
+                                kind = GoogleDriveFailureKind.REAUTHORIZATION_REQUIRED,
+                                message = message,
+                            )
+                        }
+                    }
+                }
+            } catch (_: CancellationException) {
+                setGoogleAuthorizationActive(false)
+                _state.update { it.copy(googleAuth = GoogleAuthUiState.Idle) }
+            } catch (error: Throwable) {
+                setGoogleAuthError(error)
+            } finally {
+                googleAuthJob = null
+            }
+        }
+    }
+
+    fun cancelGoogleAuthorization() {
+        setGoogleAuthorizationActive(false)
+        googleAuthJob?.cancel()
+        googleAuthJob = null
+        _state.update { it.copy(googleAuth = GoogleAuthUiState.Idle) }
+    }
+
+    private suspend fun finishGoogleAuthorization(accessToken: String) {
+        val about = withContext(Dispatchers.IO) { GoogleDriveApiClient(accessToken).about() }
+        val email = about.user.emailAddress.trim()
+        if (email.isBlank()) {
+            runCatching { googleIdentity.clearToken(accessToken) }
+            throw GoogleDriveApiException(
+                kind = GoogleDriveFailureKind.BAD_RESPONSE,
+                message = "Google Drive не вернул e-mail аккаунта. Подключение не сохранено.",
+            )
+        }
+        val accountId = about.user.permissionId.trim()
+        val existing = cloudProfileRepository.profiles().firstOrNull { profile ->
+            profile.provider == CloudProvider.GOOGLE_DRIVE && (
+                accountId.isNotBlank() && profile.accountId == accountId ||
+                    profile.accountLabel.equals(email, ignoreCase = true)
+                )
+        }
+        val now = System.currentTimeMillis()
+        val saved = cloudProfileRepository.save(
+            CloudProfile(
+                id = existing?.id ?: UUID.randomUUID().toString(),
+                name = existing?.name?.takeIf(String::isNotBlank) ?: "Google Drive — $email",
+                provider = CloudProvider.GOOGLE_DRIVE,
+                accountId = accountId.ifBlank { existing?.accountId.orEmpty() },
+                accountLabel = email,
+                createdAtEpochMs = existing?.createdAtEpochMs ?: now,
+                updatedAtEpochMs = now,
+            )
+        )
+        com.aurafiles.app.cloud.google.GoogleAccessTokenMemoryCache.put(email, accessToken)
+        val backendId = "google:${saved.id}"
+        rebuildBackends(preferredBackendId = backendId)
+        ensurePreferredBackendSelected(backendId, "Google Drive")
+        setGoogleAuthorizationActive(false)
+        _state.update {
+            it.copy(
+                googleAuth = GoogleAuthUiState.Idle,
+                message = "Google Drive подключён: $email",
+                reopenBackendId = backendId,
+            )
+        }
+    }
+
+    private fun setGoogleAuthError(error: Throwable) {
+        setGoogleAuthorizationActive(false)
+        val message = if (error is GoogleDriveApiException) {
+            error.message ?: userMessageForGoogleDriveFailure(error.kind)
+        } else error.message ?: "Не удалось подключить Google Drive"
+        _state.update { it.copy(googleAuth = GoogleAuthUiState.Error(message)) }
+    }
+
+    private fun ensurePreferredBackendSelected(backendId: String, providerName: String) {
+        val state = _state.value
+        if (state.backends.none { it.id == backendId }) {
+            throw IllegalStateException("$providerName авторизован, но backend не зарегистрирован. Закройте и снова откройте раздел «Сеть».")
+        }
+        if (state.left.backendId != backendId) {
+            throw IllegalStateException("$providerName зарегистрирован, но облачная панель не была выбрана.")
+        }
+    }
+
+    private fun setGoogleAuthorizationActive(active: Boolean) {
+        googleAuthorizationActive = active
+        if (active) savedStateHandle[KEY_GOOGLE_AUTH_ACTIVE] = true
+        else savedStateHandle.remove<Boolean>(KEY_GOOGLE_AUTH_ACTIVE)
+    }
+
+    fun consumeReopenBackendRequest() {
+        _state.update { state ->
+            if (state.reopenBackendId == null) state else state.copy(reopenBackendId = null)
+        }
+    }
+
+    fun deleteCloudProfile(profile: CloudProfile) {
+        yandexAuthJob?.cancel()
+        googleAuthJob?.cancel()
+        viewModelScope.launch(Dispatchers.IO) {
+            val revokeWarning = if (profile.provider == CloudProvider.GOOGLE_DRIVE && profile.accountLabel.isNotBlank()) {
+                runCatching { googleIdentity.revoke(profile.accountLabel) }.exceptionOrNull()?.message
+            } else null
+            runCatching { cloudProfileRepository.delete(profile.id) }
+                .onSuccess {
+                    rebuildBackends()
+                    val suffix = revokeWarning?.let { " (локально удалено; отзыв доступа Google не подтверждён: $it)" }.orEmpty()
+                    _state.update { it.copy(message = "Облачное подключение «${profile.name}» удалено$suffix") }
+                }
+                .onFailure { error ->
+                    _state.update { it.copy(message = error.message ?: "Не удалось удалить облачное подключение") }
+                }
+        }
     }
 
     fun selectBackend(left: Boolean, backendId: String) {
@@ -150,7 +650,11 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
     }
 
     fun openBackendFromNetwork(backendId: String) {
-        val descriptor = _state.value.backends.firstOrNull { it.id == backendId } ?: return
+        val descriptor = _state.value.backends.firstOrNull { it.id == backendId }
+        if (descriptor == null) {
+            _state.update { it.copy(message = "Подключение $backendId сохранено, но cloud backend не зарегистрирован. Переподключи аккаунт; если ошибка повторится, пришли build.log/скрин сообщения Aura.") }
+            return
+        }
         val local = _state.value.backends.firstOrNull { it.kind == StorageBackendKind.LOCAL && it.id != backendId }
         updatePane(true) { BackendPaneState(backendId = backendId, path = descriptor.rootPath) }
         if (local != null) {
@@ -172,6 +676,52 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
             )
         }
         refresh(left)
+    }
+
+    fun openOrPreview(left: Boolean, item: StorageItem) {
+        if (item.isDirectory) {
+            open(left, item)
+            return
+        }
+        if (operation?.isActive == true) return
+        val backendId = pane(left).backendId ?: return
+        val backend = registry.get(backendId) ?: run {
+            _state.update { it.copy(message = "Источник недоступен") }
+            return
+        }
+        operation = viewModelScope.launch {
+            _state.update { it.copy(busyLabel = "Открываю ${item.name}") }
+            try {
+                val target = withContext(Dispatchers.IO) {
+                    val directory = File(getApplication<Application>().cacheDir, "backend-open").apply { mkdirs() }
+                    directory.listFiles()?.filter { file -> System.currentTimeMillis() - file.lastModified() > OPEN_CACHE_MAX_AGE_MS }
+                        ?.forEach { file -> runCatching { file.deleteRecursively() } }
+                    val safeName = item.name.replace(Regex("[\\/:*?\"<>|]"), "_").ifBlank { "file" }
+                    val file = File(directory, "${UUID.randomUUID()}-$safeName")
+                    backend.openRead(item.path).use { handle ->
+                        file.outputStream().buffered().use { output -> handle.input.copyTo(output, DEFAULT_COPY_BUFFER) }
+                    }
+                    file
+                }
+                _state.update {
+                    it.copy(
+                        openFileRequest = BackendOpenFileRequest(target.absolutePath, item.name, item.mimeType),
+                        message = null,
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                _state.update { it.copy(message = error.message ?: "Не удалось открыть ${item.name}") }
+            } finally {
+                operation = null
+                _state.update { it.copy(busyLabel = null) }
+            }
+        }
+    }
+
+    fun consumeOpenFileRequest() {
+        _state.update { it.copy(openFileRequest = null) }
     }
 
     fun back(left: Boolean) {
@@ -208,6 +758,89 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
 
     fun clearSelection(left: Boolean) = updatePane(left) { it.copy(selected = emptySet()) }
 
+    fun setClipboard(left: Boolean, move: Boolean) {
+        val pane = pane(left)
+        val backendId = pane.backendId ?: return
+        val selected = pane.items.filter { it.path in pane.selected }
+        setClipboardItems(left, selected, move)
+    }
+
+    fun setClipboardItem(left: Boolean, item: StorageItem, move: Boolean) {
+        setClipboardItems(left, listOf(item), move)
+    }
+
+    private fun setClipboardItems(left: Boolean, selected: List<StorageItem>, move: Boolean) {
+        val pane = pane(left)
+        val backendId = pane.backendId ?: return
+        if (selected.isEmpty()) {
+            _state.update { it.copy(message = "Выберите файлы или папки") }
+            return
+        }
+        _state.update {
+            it.copy(
+                clipboard = BackendClipboard(
+                    sourceBackendId = backendId,
+                    items = selected,
+                    move = move,
+                )
+            )
+        }
+        clearSelection(left)
+    }
+
+    fun clearClipboard() {
+        _state.update { it.copy(clipboard = null) }
+    }
+
+    fun pasteClipboard(left: Boolean) {
+        if (operation?.isActive == true) return
+        val clipboard = _state.value.clipboard ?: return
+        val destinationPane = pane(left)
+        val destinationBackend = destinationPane.backendId ?: return
+        val request = TransferRequest(
+            type = if (clipboard.move) TransferType.MOVE else TransferType.COPY,
+            sources = clipboard.items.map { item ->
+                TransferSource.Backend(
+                    backendId = clipboard.sourceBackendId,
+                    path = item.path,
+                    name = item.name,
+                    size = item.size,
+                    modifiedAt = item.modifiedAt,
+                    isDirectory = item.isDirectory,
+                    mimeType = item.mimeType,
+                )
+            },
+            destination = TransferDestination.Backend(destinationBackend, destinationPane.path),
+            conflictPolicy = TransferConflictPolicy.ASK,
+            preserveModifiedTime = true,
+        )
+        controller = TransferController()
+        val activeController = requireNotNull(controller)
+        operation = viewModelScope.launch {
+            _state.update {
+                it.copy(busyLabel = if (clipboard.move) "Перемещение" else "Копирование")
+            }
+            try {
+                val result = withContext(Dispatchers.IO) { transferEngine.execute(request, activeController) }
+                _state.update {
+                    it.copy(
+                        clipboard = if (clipboard.move) null else it.clipboard,
+                        message = (if (clipboard.move) "Перемещение завершено" else "Копирование завершено") + result.warningSuffix(),
+                    )
+                }
+            } catch (_: CancellationException) {
+                _state.update { it.copy(message = "Передача остановлена") }
+            } catch (error: Throwable) {
+                _state.update { it.copy(message = error.message ?: "Ошибка передачи") }
+            } finally {
+                controller = null
+                operation = null
+                _state.update { it.copy(busyLabel = null) }
+                refresh(left, preserveMessage = true)
+            }
+        }
+    }
+
     fun createFolder(left: Boolean, requestedName: String) {
         val name = requestedName.trim()
         if (name.isBlank()) {
@@ -232,7 +865,15 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
             _state.update { it.copy(message = "Введите новое имя") }
             return
         }
-        val item = selected.single()
+        renameItem(left, selected.single(), name)
+    }
+
+    fun renameItem(left: Boolean, item: StorageItem, requestedName: String) {
+        val name = requestedName.trim()
+        if (name.isBlank()) {
+            _state.update { it.copy(message = "Введите новое имя") }
+            return
+        }
         mutatePane(left, "Переименование") { backend, _ ->
             backend.rename(item.path, name)
             "${item.name} переименован в $name"
@@ -242,13 +883,18 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
     fun deleteSelected(left: Boolean) {
         val pane = pane(left)
         val selected = pane.items.filter { it.path in pane.selected }
+        deleteItems(left, selected)
+    }
+
+    fun deleteItems(left: Boolean, selected: List<StorageItem>) {
         if (selected.isEmpty()) {
             _state.update { it.copy(message = "Выберите объекты для удаления") }
             return
         }
         mutatePane(left, "Удаление объектов") { backend, _ ->
-            // Network backends have no common trash semantics. Recursive deletion is explicit
-            // and is only called after the UI confirmation dialog.
+            // Trash semantics are owned by each backend: Yandex/Google move to provider trash,
+            // while protocols without trash support may delete permanently. UI explains this
+            // before calling here. Recursive deletion is only used after that confirmation.
             selected.forEach { backend.delete(it.path, recursive = it.isDirectory) }
             "Удалено объектов: ${selected.size}"
         }
@@ -597,7 +1243,16 @@ internal class BackendWorkspaceViewModel(application: Application) : AndroidView
         if (isEmpty()) "" else "\nВнимание: ${distinct().joinToString("; ")}"
 
     companion object {
+        private const val KEY_YANDEX_CLIENT_ID = "yandex_auth_client_id"
+        private const val KEY_YANDEX_DEVICE_CODE = "yandex_auth_device_code"
+        private const val KEY_YANDEX_USER_CODE = "yandex_auth_user_code"
+        private const val KEY_YANDEX_VERIFICATION_URL = "yandex_auth_verification_url"
+        private const val KEY_YANDEX_INTERVAL_SECONDS = "yandex_auth_interval_seconds"
+        private const val KEY_YANDEX_EXPIRES_AT = "yandex_auth_expires_at"
+        private const val KEY_GOOGLE_AUTH_ACTIVE = "google_auth_active"
         private const val HISTORY_LIMIT = 80
+        private const val OPEN_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
+        private const val DEFAULT_COPY_BUFFER = 1024 * 1024
         private const val RECENT_LIMIT = 20
     }
 }

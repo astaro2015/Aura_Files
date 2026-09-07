@@ -68,6 +68,7 @@ class MediaPlayerActivity : ComponentActivity() {
     private lateinit var currentUri: Uri
     private var parentUri: Uri? = null
     private var currentName: String = ""
+    private var sessionMedia: List<MediaSibling> = emptyList()
     private val positionStore by lazy { getSharedPreferences(PREFS, MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,6 +77,7 @@ class MediaPlayerActivity : ComponentActivity() {
         parentUri = intent.getStringExtra(EXTRA_PARENT)?.takeIf(String::isNotBlank)?.let(Uri::parse)
         currentName = intent.getStringExtra(EXTRA_NAME).orEmpty()
         audioOnly = intent.getBooleanExtra(EXTRA_AUDIO, false)
+        sessionMedia = intent.getStringExtra(EXTRA_SESSION)?.let(MediaPlayerSessions::take).orEmpty()
         if (!audioOnly) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR
         WindowCompat.setDecorFitsSystemWindows(window, false)
         buildUi()
@@ -219,7 +221,11 @@ class MediaPlayerActivity : ComponentActivity() {
         attached.prepare()
         attached.playWhenReady = true
         lifecycleScope.launch {
-            val items = withContext(Dispatchers.IO) { neighboringMedia(parentUri, openedUri, currentName, audioOnly) }
+            val items = if (sessionMedia.isNotEmpty()) {
+                sessionMedia.map { item -> mediaItem(item.uri, item.name) }
+            } else {
+                withContext(Dispatchers.IO) { neighboringMedia(parentUri, openedUri, currentName, audioOnly) }
+            }
             if (items.size <= 1 || player !== attached) return@launch
             if (attached.currentMediaItem?.mediaId != openedUri.toString()) return@launch
             val position = attached.currentPosition.coerceAtLeast(0L)
@@ -423,18 +429,56 @@ class MediaPlayerActivity : ComponentActivity() {
         private const val EXTRA_PARENT = "media_parent"
         private const val EXTRA_NAME = "media_name"
         private const val EXTRA_AUDIO = "media_audio"
+        private const val EXTRA_SESSION = "media_session"
         private const val PREFS = "aura_media_positions"
 
-        fun start(context: Context, entry: FileEntry, audioOnly: Boolean) {
+        fun start(
+            context: Context,
+            entry: FileEntry,
+            audioOnly: Boolean,
+            siblings: List<FileEntry> = emptyList(),
+        ) {
+            val extensions = if (audioOnly) AUDIO_EXTENSIONS else VIDEO_EXTENSIONS
+            val candidates = siblings.asSequence()
+                .filterNot(FileEntry::isDirectory)
+                .filter { sibling ->
+                    val extension = sibling.name.substringAfterLast('.', "").lowercase()
+                    val mime = sibling.mimeType.orEmpty()
+                    extension in extensions || if (audioOnly) mime.startsWith("audio/") else mime.startsWith("video/")
+                }
+                .distinctBy { it.uri.toString() }
+                .map { MediaSibling(it.uri, it.name) }
+                .toMutableList()
+            if (candidates.none { it.uri == entry.uri }) {
+                candidates.add(0, MediaSibling(entry.uri, entry.name))
+            }
+            val session = if (candidates.size > 1) MediaPlayerSessions.put(candidates) else null
             context.startActivity(
                 Intent(context, MediaPlayerActivity::class.java)
                     .putExtra(EXTRA_URI, entry.uri.toString())
                     .putExtra(EXTRA_PARENT, entry.parentUri?.toString().orEmpty())
                     .putExtra(EXTRA_NAME, entry.name)
                     .putExtra(EXTRA_AUDIO, audioOnly)
+                    .putExtra(EXTRA_SESSION, session)
             )
         }
     }
+}
+
+private data class MediaSibling(val uri: Uri, val name: String)
+
+private object MediaPlayerSessions {
+    private var sequence = 0L
+    private val sessions = LinkedHashMap<String, List<MediaSibling>>()
+
+    @Synchronized fun put(items: List<MediaSibling>): String {
+        val key = "media-${++sequence}-${System.nanoTime()}"
+        sessions[key] = items
+        while (sessions.size > 3) sessions.remove(sessions.keys.first())
+        return key
+    }
+
+    @Synchronized fun take(key: String): List<MediaSibling>? = sessions.remove(key)
 }
 
 private sealed interface GestureAction {

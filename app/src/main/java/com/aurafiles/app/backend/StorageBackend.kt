@@ -14,6 +14,9 @@ data class StorageItem(
     val size: Long = 0L,
     val modifiedAt: Long = 0L,
     val mimeType: String? = null,
+    // True for link-like backend objects that must not be traversed recursively.
+    // Other backends default to false until they expose reliable link metadata.
+    val isLink: Boolean = false,
 )
 
 data class StorageBackendDescriptor(
@@ -28,6 +31,8 @@ enum class StorageBackendKind {
     SMB,
     FTP,
     SFTP,
+    YANDEX_DISK,
+    GOOGLE_DRIVE,
 }
 
 interface StorageReadHandle : Closeable {
@@ -51,6 +56,14 @@ interface StorageBackend : Closeable {
     suspend fun stat(path: String): StorageItem?
     suspend fun openRead(path: String): StorageReadHandle
     suspend fun openWrite(path: String, replace: Boolean = false): StorageWriteHandle
+
+    /**
+     * Optional size-aware write hook. Existing backends keep their current behaviour;
+     * cloud backends can use the known source size for fixed-length HTTP streaming.
+     */
+    suspend fun openWrite(path: String, replace: Boolean, expectedSize: Long?): StorageWriteHandle =
+        openWrite(path, replace)
+
     suspend fun mkdir(path: String): StorageItem
     suspend fun rename(path: String, newName: String): StorageItem
     suspend fun move(path: String, destinationDirectory: String): StorageItem

@@ -45,6 +45,7 @@ import java.util.zip.ZipOutputStream
 class FileRepository(private val context: Context) {
     private val resolver = context.contentResolver
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+    private val vault = AuraVault(context)
 
     fun restoreRoot(): DocumentFile? {
         if (currentAccessMode() == StorageAccessMode.Full) {
@@ -105,7 +106,7 @@ class FileRepository(private val context: Context) {
     fun listChildren(directory: DocumentFile): List<FileEntry> {
         return FastDocumentListing.list(context, directory)
             .asSequence()
-            .filterNot { it.name == TRASH_FOLDER }
+            .filterNot { it.name == TRASH_FOLDER || it.name == AuraVault.VAULT_FOLDER }
             .map { info ->
                 FileEntry(
                     document = info.document,
@@ -233,35 +234,42 @@ class FileRepository(private val context: Context) {
         saveTrashMetadata(loadTrashMetadata().filterNot { it.uri in removedUris })
     }
 
-    fun favoriteUris(): Set<Uri> {
-        return preferences.getStringSet(KEY_FAVORITES, emptySet()).orEmpty().map(Uri::parse).toSet()
+    /**
+     * Legacy favourites used to be URI bookmarks. Since 1.3.1 the visible "Избранное" is a
+     * device-bound encrypted vault, so normal storage entries are never considered already
+     * favourited: moving a file there removes the original.
+     */
+    fun favoriteUris(): Set<Uri> = emptySet()
+
+    fun moveToFavorite(entry: FileEntry): FileEntry {
+        require(!entry.isDirectory) { "Папки пока нельзя помещать в защищённое Избранное" }
+        val moved = vault.moveInto(entry)
+        // Old URI bookmarks are intentionally discarded only after the new vault is actually
+        // used; upgrading the app never moves a user's files without an explicit action.
+        preferences.edit().remove(KEY_FAVORITES).apply()
+        return vault.toFileEntry(moved)
     }
 
+    fun moveToFavorites(entries: List<FileEntry>): List<FileEntry> {
+        require(entries.isNotEmpty()) { "Нет файлов для перемещения" }
+        require(entries.none(FileEntry::isDirectory)) {
+            "Папки пока нельзя помещать в защищённое Избранное"
+        }
+        entries.forEach(::moveToFavorite)
+        return favoriteEntries()
+    }
+
+    /** Compatibility entry point for older UI code; "toggle" now always means move into vault. */
     fun toggleFavorites(entries: List<FileEntry>): Set<Uri> {
-        val current = favoriteUris().toMutableSet()
-        val shouldRemove = entries.all { it.uri in current }
-        entries.forEach { entry -> if (shouldRemove) current.remove(entry.uri) else current.add(entry.uri) }
-        preferences.edit().putStringSet(KEY_FAVORITES, current.map(Uri::toString).toSet()).apply()
-        return current
+        moveToFavorites(entries)
+        return emptySet()
     }
 
-    private fun replaceFavoriteUri(oldUri: Uri, newUri: Uri) {
-        if (oldUri == newUri) return
-        val current = favoriteUris().toMutableSet()
-        if (current.remove(oldUri)) {
-            current.add(newUri)
-            preferences.edit().putStringSet(KEY_FAVORITES, current.map(Uri::toString).toSet()).apply()
-        }
-    }
+    private fun replaceFavoriteUri(oldUri: Uri, newUri: Uri) = Unit
 
-    fun favoriteEntries(): List<FileEntry> {
-        val valid = favoriteUris().mapNotNull { uri ->
-            runCatching { documentFromUri(uri)?.takeIf { it.exists() }?.toEntry() }.getOrNull()
-        }
-        val validUris = valid.map { it.uri.toString() }.toSet()
-        preferences.edit().putStringSet(KEY_FAVORITES, validUris).apply()
-        return valid.sortedBy { it.name.lowercase() }
-    }
+    fun favoriteEntries(): List<FileEntry> = vault.list().items.map(vault::toFileEntry)
+
+    fun vaultUnreadableCount(): Int = vault.list().unreadableCount
 
     fun showHiddenFiles(): Boolean = preferences.getBoolean(KEY_SHOW_HIDDEN, false)
 
@@ -655,6 +663,7 @@ class FileRepository(private val context: Context) {
         val resolvedMime = when (extension) {
             "djvu", "djv" -> "image/vnd.djvu"
             "apk" -> "application/vnd.android.package-archive"
+            "apks" -> "application/vnd.aurafiles.apks+zip"
             else -> entry.mimeType ?: "*/*"
         }
         return Intent(Intent.ACTION_VIEW).apply {

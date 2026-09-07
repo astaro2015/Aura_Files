@@ -250,7 +250,7 @@ class ExtendedArchiveRepository(private val context: Context) {
             else -> openInput(entry).buffered(1024 * 1024).use { raw ->
                 ZipArchiveInputStream(raw).use { archive ->
                     while (true) {
-                        val item = archive.nextZipEntry ?: break
+                        val item = archive.nextEntry ?: break
                         if (!item.isUnixSymlink) add(item.name, item.isDirectory, item.size)
                     }
                 }
@@ -357,7 +357,7 @@ class ExtendedArchiveRepository(private val context: Context) {
     private fun extractZipSingle(input: InputStream, wanted: String, target: File) {
         ZipArchiveInputStream(input).use { archive ->
             while (true) {
-                val item = archive.nextZipEntry ?: break
+                val item = archive.nextEntry ?: break
                 if (item.isDirectory || item.isUnixSymlink) continue
                 if (normalizedArchivePath(item.name) == wanted) {
                     require(item.size < 0L || item.size <= MAX_SINGLE_ENTRY_BYTES) { "Файл внутри ZIP слишком велик" }
@@ -532,7 +532,7 @@ class ExtendedArchiveRepository(private val context: Context) {
 
     private fun extractZip(input: InputStream, root: DocumentFile) {
         ZipArchiveInputStream(input).use { archive ->
-            extractSequential(root) { archive.nextZipEntry to archive }
+            extractSequential(root) { archive.nextEntry to archive }
         }
     }
 

@@ -4,6 +4,7 @@ import com.aurafiles.app.backend.BackendPath
 import com.aurafiles.app.backend.StorageBackend
 import com.aurafiles.app.backend.StorageBackendKind
 import com.aurafiles.app.backend.StorageItem
+import java.io.IOException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
@@ -71,6 +72,12 @@ class DirectoryComparator {
             backend.list(directoryPath).forEach { item ->
                 currentCoroutineContext().ensureActive()
                 val relative = if (relativeDirectory.isBlank()) item.name else "$relativeDirectory/${item.name}"
+                if (result.containsKey(relative)) {
+                    throw IOException(
+                        "Нельзя сравнить/синхронизировать каталог: в хранилище «${backend.descriptor.title}» " +
+                            "есть несколько объектов с одинаковым путём $relative"
+                    )
+                }
                 result[relative] = item
                 onProgress(relative)
                 if (recursive && item.isDirectory) walk(item.path, relative)

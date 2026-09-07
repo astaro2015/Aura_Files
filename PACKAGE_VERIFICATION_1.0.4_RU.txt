@@ -1,0 +1,22 @@
+Aura Files 1.0.4 — локальная проверка пакета
+Дата: 2026-09-04
+
+База:
+- GitHub astaro2015/Aura_Files, commit 63773f432aa700d042b57b8f98ad3091e209ea4d (Aura Files 1.0)
+- поверх базы сохранены исправления 1.0.1–1.0.3 и выполнен отдельный SMB-аудит 1.0.4.
+
+Проверено в контейнере:
+- versionName 1.0.4 / versionCode 104;
+- Kotlin PSI parse: 85 Kotlin-файлов, 0 синтаксических ошибок;
+- отдельная реальная kotlinc-компиляция чистого SMB helper SmbSupport.kt со smoke-проверками target/identity/error/reconnect: OK;
+- Android XML parse: 14 файлов, 0 ошибок;
+- git diff --check: PASS;
+- в пользовательском коде отсутствует старая подсказка «учётная запись Windows»;
+- FILE_ATTRIBUTE_HIDDEN не используется для SMB upload;
+- explicit SMB credentials не имеют fallback на Guest/Anonymous; Guest/Anonymous остаются только для пустого username;
+- raw jCIFS `Failed to connect: 0.0.0.0<00>/...` преобразуется в пользовательское сообщение;
+- recursive SMB copy/download/delete перечитывают metadata перед обходом и не следуют reparse-point/junction;
+- transport reconnect отделён от semantic SMB errors; write/mutation не replay-ятся автоматически;
+- SHA256-манифест сформирован заново после всех правок и проверяется отдельно после упаковки.
+
+Полный Android Gradle build в этом контейнере НЕ заявляется пройденным: Gradle wrapper пытается получить gradle-9.5.0-bin.zip, но DNS services.gradle.org в среде недоступен (UnknownHostException). Итоговый пакет требует контрольной сборки на Windows/CI.

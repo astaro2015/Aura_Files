@@ -44,6 +44,8 @@ sealed interface TransferSource {
         override val size: Long,
         override val modifiedAt: Long,
         val isDirectory: Boolean,
+        /** True for SMB reparse-point objects (junctions/symlinks). Never follow recursively. */
+        val isReparsePoint: Boolean = false,
     ) : TransferSource
 
     data class Backend(

@@ -1,0 +1,19 @@
+Aura Files 1.2.9 APPS — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.2.9, versionCode = 129.
+- CleanupScreen содержит вход «Приложения» и не зависит от выполнения анализа хранилища.
+- InstalledAppsActivity зарегистрирован в AndroidManifest.xml как non-exported.
+- Для Android 11+ объявлен QUERY_ALL_PACKAGES, чтобы getInstalledApplications не возвращал урезанный package-visibility список.
+- Список фильтрует обычные system packages, оставляя пользовательские и updated-system приложения.
+- Тип установки определяется по ApplicationInfo.splitSourceDirs.
+- Single APK: ApplicationInfo.sourceDir -> cache/shares -> FileProvider -> ACTION_SEND chooser.
+- SPLIT: кнопка single-APK share не показывается; метка содержит общее количество base + splits.
+- Existing file_paths.xml уже разрешает cache/shares/ через temporary_shares.
+- Android XML parse: 14 файлов, 0 ошибок.
+- Kotlin parser-level pass изменённых InstalledAppsActivity.kt и AuraFileManagerApp.kt: ошибок expecting/unexpected/unclosed нет. Полная semantic Android-компиляция этим тестом не подтверждается.
+
+Полная Gradle-компиляция в текущем контейнере НЕ выполнена: gradle-wrapper требует Gradle 9.5.0, локальной полной distribution нет, а загрузка services.gradle.org в этой среде недоступна.
+
+SOURCE_SHA256SUMS.txt формируется последним шагом и затем сверяется отдельно с деревом исходников и ZIP.

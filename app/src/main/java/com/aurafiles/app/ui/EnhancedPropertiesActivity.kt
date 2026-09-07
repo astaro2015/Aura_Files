@@ -86,7 +86,7 @@ class EnhancedPropertiesActivity : ComponentActivity() {
                     val root = repo.restoreRoot()
                     if (root?.uri == document.uri) {
                         StorageIndexer(this@EnhancedPropertiesActivity).load(root)?.let { analysis ->
-                            analysis.totalBytes to analysis.files.size.toLong()
+                            analysis.totalBytes to analysis.totalFileCount.toLong()
                         }
                     } else null
                 }

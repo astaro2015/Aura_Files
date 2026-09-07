@@ -1,0 +1,54 @@
+> **ИСТОРИЧЕСКИЙ ДОКУМЕНТ.** Cloud OAuth из этой версии заменён исправлением 1.2.2. Для Яндекса актуальный flow требует Client ID + Client Secret; для Google актуальна диагностика Android OAuth package/SHA-1 и обязательная проверка Drive API.
+
+Aura Files 1.2.1 CLOUD AUTH FIX — проверка пакета
+Дата: 2026-09-06
+
+Цель исправления
+- Реальный Android-тест 1.2.0 показал сброс Yandex device-code flow после браузера.
+- После Google AuthorizationClient flow пользователь видел две локальные панели вместо Google Drive.
+
+Исправления Yandex
+- Device-code protocol повторно сверён с актуальной документацией Яндекс OAuth:
+  POST /token, grant_type=device_code, code=<device_code>.
+- Pending login сохраняется через SavedStateHandle: clientId/deviceCode/userCode/verificationUrl/interval/expiry.
+- После Activity/process recreation восстанавливается тот же pending flow и продолжается polling.
+- Восстановленный flow не переоткрывает браузер автоматически.
+- Pending state очищается при успехе, отмене, expiry/error.
+- После успеха Yandex backend регистрируется и выбирается в панели атомарно.
+
+Исправления Google Drive
+- Незавершённый AuthorizationClient flow помечается в SavedStateHandle.
+- ActivityResult после пересоздания Activity/ViewModel больше не теряется.
+- После успеха Google backend регистрируется и сразу выбирается в левой/верхней панели; локальный backend — во второй.
+- Добавлен process-only GoogleAccessTokenMemoryCache для первого открытия Drive после интерактивного OAuth.
+- Google token cache не пишется на диск, очищается при invalidate/revoke и исчезает с процессом.
+- Backend registration/selection после OAuth проверяется явным invariant-check.
+
+AndroidX lifecycle API
+- Добавлена явная зависимость lifecycle-viewmodel-savedstate:2.10.0.
+- SavedStateHandle get/set/remove и SavedStateViewModelFactory(Application, SavedStateRegistryOwner) сверены с актуальным AndroidX API.
+
+Статические проверки
+- Kotlin/KTS PSI parser: 119 файлов, 0 syntax errors.
+- Android XML parser: 14 файлов, 0 errors.
+- versionName: 1.2.1.
+- versionCode: 121.
+
+Cloud compile/regression smoke из текущего дерева
+- Google core + GIS wrapper kotlinc compile со строгими public-API stubs: OK.
+- Local-like -> Google transfer: OK; completed=1; invalidations=1; expectedSize=12.
+- Google duplicate-name compare/sync guard: OK.
+- Yandex backend/core kotlinc compile: OK.
+- Yandex fixed-size upload smoke: OK; expectedSize=77.
+
+Ограничение проверки
+- Полный Android Gradle build именно 1.2.1 в контейнере не выполнялся: Android SDK/Gradle distribution отсутствуют.
+- Пользовательский Windows build environment ранее подтверждённо собрал исходную 1.0.4 до assembleDebug на Gradle 9.5.0.
+- После распаковки этого пакета в новую папку финально запустить:
+  BUILD_ON_CLEAN_WINDOWS.bat
+  либо .\gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon
+
+Упаковка
+- SOURCE_SHA256SUMS.txt генерируется ПОСЛЕ этого файла и всех остальных изменений.
+- ZIP должен сохранять .gitignore/.github без переименования.
+- Пакет нельзя накладывать поверх старого дерева: распаковывать в новую папку.

@@ -134,7 +134,7 @@ class BackendTransferCore(
         stats.totalItems += 1
         stats.totalBytes += bytes
         onProgress(stats.progress(TransferState.PREPARING))
-        if (item.isDirectory) {
+        if (item.isDirectory && !item.isLink) {
             backend.list(item.path).forEach { child ->
                 val nested = measure(backend, child, controller, stats, onProgress)
                 count += nested.items
@@ -158,6 +158,9 @@ class BackendTransferCore(
     ): CopyOutcome {
         controller.checkpoint()
         stats.currentName = source.name
+        if (source.isLink) {
+            throw IOException("Ссылки, ярлыки и junction нельзя копировать между хранилищами как обычные файлы")
+        }
         val decision = targetDecision(
             source,
             destinationBackend,
@@ -268,7 +271,7 @@ class BackendTransferCore(
         var writeHandle: com.aurafiles.app.backend.StorageWriteHandle? = null
         try {
             sourceBackend.openRead(source.path).use { inputHandle ->
-                val outputHandle = destinationBackend.openWrite(temporaryPath, replace = false)
+                val outputHandle = destinationBackend.openWrite(temporaryPath, replace = false, expectedSize = source.size.takeIf { it > 0L })
                 writeHandle = outputHandle
                 outputHandle.use { handle ->
                     val input = inputHandle.input.buffered(BUFFER_SIZE)
@@ -445,7 +448,7 @@ class BackendTransferCore(
 
     private suspend fun countNode(backend: StorageBackend, item: StorageItem, controller: TransferController): Measure {
         controller.checkpoint()
-        if (!item.isDirectory) return Measure(1, item.size.coerceAtLeast(0L))
+        if (!item.isDirectory || item.isLink) return Measure(1, item.size.coerceAtLeast(0L))
         var items = 1
         var bytes = 0L
         backend.list(item.path).forEach { child ->

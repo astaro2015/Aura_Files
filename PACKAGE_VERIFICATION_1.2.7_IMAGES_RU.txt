@@ -1,0 +1,24 @@
+Aura Files 1.2.7 IMAGES CATALOG — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.2.7, versionCode = 127.
+- «Изображения» открываются через отдельную Room page-query, а не через старую grouped category выдачу.
+- Начальный фильтр: Все; начальная сортировка: по дате, новые сверху.
+- Фильтры: Все / Камера / Снимки экрана / WhatsApp / Telegram / Загрузки / Другие.
+- Page size = 400; жёсткого максимума 5000 для «Изображений» нет.
+- Поиск имени включён непосредственно в SQL image-query.
+- Сортировка Name / Modified / Size / Type включена в SQL, поэтому порядок не ломается между страницами.
+- FileCategory.Images исключена из background warmCategoryCollectionCache.
+- Kotlin/KTS PSI syntax scan: 120 файлов, 0 syntax errors.
+- Android XML parse: 14 файлов, 0 ошибок.
+- IndexedFileDao.java с новыми методами компилируется javac со строгими минимальными Room stubs: OK.
+- Новые SQLite WHERE/ORDER BY/LIMIT/OFFSET запросы проверены на in-memory SQLite: All/Camera/Screenshots/WhatsApp/Telegram/Downloads/Other + Modified DESC: OK.
+- FileClassifier sourceLabel smoke-test для Pictures/Screenshots, DCIM/Screenshots, DCIM/Camera, Download: OK.
+
+Полная Gradle-компиляция в текущем контейнере НЕ выполнена: wrapper требует Gradle 9.5.0 и пытается скачать
+https://services.gradle.org/distributions/gradle-9.5.0-bin.zip,
+но среда не разрешает DNS для services.gradle.org (UnknownHostException).
+Это ограничение среды проверки, а не подтверждение успешной Android-компиляции.
+
+SOURCE_SHA256SUMS.txt формируется последним шагом; после него ZIP проверяется unzip -t и отдельной сверкой manifest.

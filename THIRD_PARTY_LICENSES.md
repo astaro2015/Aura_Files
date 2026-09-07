@@ -60,3 +60,9 @@ Used for SFTP/SSH client access. Project: https://github.com/hierynomus/sshj
 ## Apache MINA SSHD 2.19.0 — Apache License 2.0
 
 Used for the embedded SFTP-only SSH server on the phone (`sshd-core` + `sshd-sftp`). Project: https://mina.apache.org/sshd-project/
+
+## Google Play services Auth 21.6.0
+
+Used for Google Identity Services `AuthorizationClient` in the Google Drive connection flow.
+Artifact: `com.google.android.gms:play-services-auth:21.6.0` from Google Maven.
+Use and redistribution are subject to the applicable Google Play services / Google APIs SDK terms published by Google; this project does not vendor or modify the library source.

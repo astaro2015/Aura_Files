@@ -71,6 +71,7 @@ import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.Cloud
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
@@ -127,6 +128,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -149,6 +151,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -161,6 +164,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -171,6 +175,8 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import com.aurafiles.app.model.ClipboardMode
@@ -180,6 +186,7 @@ import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.FileCollectionGroup
 import com.aurafiles.app.model.FileSortMode
 import com.aurafiles.app.model.FileViewMode
+import com.aurafiles.app.model.ImageSourceFilter
 import com.aurafiles.app.model.FtpEntry
 import com.aurafiles.app.model.FtpProfile
 import com.aurafiles.app.model.FtpServerConfig
@@ -192,6 +199,7 @@ import com.aurafiles.app.model.SmbEntry
 import com.aurafiles.app.model.SmbProfile
 import com.aurafiles.app.model.SftpProfile
 import com.aurafiles.app.data.FtpServerService
+import com.aurafiles.app.data.FastDocumentListing
 import com.aurafiles.app.data.SftpServerService
 import com.aurafiles.app.model.MainSection
 import com.aurafiles.app.model.StorageSnapshot
@@ -199,11 +207,14 @@ import com.aurafiles.app.model.StorageAnalysis
 import com.aurafiles.app.model.StorageAccessMode
 import com.aurafiles.app.model.StorageVolumeInfo
 import com.aurafiles.app.model.SystemSoundType
+import com.aurafiles.app.cloud.CloudProfile
 import com.aurafiles.app.network.NetworkProfile
 import com.aurafiles.app.network.NetworkProtocol
+import com.aurafiles.app.network.normalizedSmbProfile
 import com.aurafiles.app.transfer.TransferConflictPolicy
 import com.aurafiles.app.ui.dialogs.TransferConflictDialog
 import com.aurafiles.app.ui.dialogs.TransferStatusOverlay
+import com.aurafiles.app.ui.cloud.CloudProfilesCard
 import com.aurafiles.app.ui.network.NetworkProfilesCard
 import com.aurafiles.app.model.TrashRecord
 import com.aurafiles.app.model.displayLocation
@@ -234,6 +245,31 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
         context.startActivity(
             Intent(context, BackendWorkspaceActivity::class.java)
                 .putExtra(BackendWorkspaceActivity.EXTRA_INITIAL_BACKEND_ID, "sftp:${profile.id}")
+        )
+    }
+    val openCloudWorkspace: (CloudProfile) -> Unit = { profile ->
+        val prefix = when (profile.provider) {
+            com.aurafiles.app.cloud.CloudProvider.YANDEX_DISK -> "yandex"
+            com.aurafiles.app.cloud.CloudProvider.GOOGLE_DRIVE -> "google"
+        }
+        context.startActivity(
+            Intent(context, BackendWorkspaceActivity::class.java)
+                .putExtra(BackendWorkspaceActivity.EXTRA_INITIAL_BACKEND_ID, "$prefix:${profile.id}")
+                .putExtra(BackendWorkspaceActivity.EXTRA_SINGLE_PANE, true)
+        )
+    }
+    val addYandexDisk: () -> Unit = {
+        context.startActivity(
+            Intent(context, BackendWorkspaceActivity::class.java)
+                .putExtra(BackendWorkspaceActivity.EXTRA_ADD_YANDEX, true)
+                .putExtra(BackendWorkspaceActivity.EXTRA_SINGLE_PANE, true)
+        )
+    }
+    val addGoogleDrive: () -> Unit = {
+        context.startActivity(
+            Intent(context, BackendWorkspaceActivity::class.java)
+                .putExtra(BackendWorkspaceActivity.EXTRA_ADD_GOOGLE, true)
+                .putExtra(BackendWorkspaceActivity.EXTRA_SINGLE_PANE, true)
         )
     }
     val snackbarHostState = remember { SnackbarHostState() }
@@ -336,6 +372,7 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshCloudProfiles()
                 val externallyDeleted = ExternalFileChanges.consumeDeleted()
                 if (externallyDeleted.isNotEmpty()) {
                     viewModel.refreshStorageVolumes()
@@ -404,11 +441,11 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     BackHandler(
         enabled = !uiState.browserOpen && uiState.activeSection == MainSection.Network &&
             (uiState.smbPath != "/" ||
-                (uiState.smbProfile?.share?.isNotBlank() == true && uiState.smbShares.isNotEmpty()) ||
+                (!uiState.smbBrowsingShares && uiState.smbShares.isNotEmpty()) ||
                 uiState.ftpPath != "/"),
     ) {
         val smbCanGoBack = uiState.smbPath != "/" ||
-            (uiState.smbProfile?.share?.isNotBlank() == true && uiState.smbShares.isNotEmpty())
+            (!uiState.smbBrowsingShares && uiState.smbShares.isNotEmpty())
         if (smbCanGoBack) viewModel.navigateSmbBack() else viewModel.navigateFtpBack()
     }
 
@@ -459,6 +496,9 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                     },
                     onSort = viewModel::setSortMode,
                     onViewMode = viewModel::setViewMode,
+                    onImageSourceFilter = viewModel::setImageSourceFilter,
+                    onImageQueryChange = viewModel::setImageQuery,
+                    onLoadMoreImages = viewModel::loadMoreImageCollection,
                     onCancelOperation = viewModel::cancelOperation,
                     onPauseOperation = viewModel::pauseOperation,
                     onResumeOperation = viewModel::resumeOperation,
@@ -475,7 +515,7 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                     MainSection.Browse -> HomeScreen(
                         state = uiState,
                         onChooseRoot = { treeLauncher.launch(null) },
-                        onOpenFavorites = viewModel::openFavorites,
+                        onOpenFavorites = { context.startActivity(Intent(context, VaultActivity::class.java)) },
                         onOpenVolume = { volume ->
                             val mountedVolume = volume.volume
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && mountedVolume != null) {
@@ -533,6 +573,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         },
                         onDuplicateProfile = viewModel::duplicateNetworkProfile,
                         onDeleteProfile = viewModel::deleteNetworkProfile,
+                        onOpenCloudProfile = openCloudWorkspace,
+                        onAddYandex = addYandexDisk,
+                        onAddGoogle = addGoogleDrive,
+                        onDeleteCloudProfile = viewModel::deleteCloudProfile,
                         onLoadSftpProfile = viewModel::sftpProfile,
                         onSaveSftpProfile = viewModel::saveSftpProfile,
                         onOpenSftpProfile = openSftpWorkspace,
@@ -548,6 +592,9 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onCreateSmbFolder = viewModel::createSmbFolder,
                         onRenameSmb = viewModel::renameSmb,
                         onDeleteSmb = viewModel::deleteSmb,
+                        onPauseSmbTransfer = viewModel::pauseOperation,
+                        onResumeSmbTransfer = viewModel::resumeOperation,
+                        onCancelSmbTransfer = viewModel::cancelOperation,
                         onConnect = viewModel::connectFtp,
                         onDisconnect = viewModel::disconnectFtp,
                         onRefresh = viewModel::refreshFtp,
@@ -590,9 +637,10 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onOpenLargeFiles = viewModel::openLargeFiles,
                         onOpenDuplicates = viewModel::openDuplicates,
                         onOpenTemporary = viewModel::openTemporaryFiles,
+                        onOpenApps = { context.startActivity(Intent(context, InstalledAppsActivity::class.java)) },
                         onOpenCategory = viewModel::openCategory,
-                        onRestoreTrash = viewModel::restoreTrash,
-                        onDeleteTrash = viewModel::permanentlyDelete,
+                        onRestoreTrash = { viewModel.restoreTrash(it) },
+                        onDeleteTrash = { viewModel.permanentlyDelete(it) },
                         onEmptyTrash = viewModel::emptyTrash,
                     )
                 }
@@ -663,7 +711,7 @@ private fun HomeScreen(
                         Column(Modifier.weight(1f)) {
                             Text("Избранное", fontWeight = FontWeight.SemiBold)
                             Text(
-                                if (state.favoriteItems.isEmpty()) "Добавляйте файлы через меню «…»" else "Объектов: ${state.favoriteItems.size}",
+                                if (state.favoriteItems.isEmpty()) "Защищённое хранилище" else "Зашифровано: ${state.favoriteItems.size}",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 fontSize = 12.sp,
                             )
@@ -757,6 +805,10 @@ private fun FtpScreen(
     onTestProfile: (NetworkProfile) -> Unit,
     onDuplicateProfile: (NetworkProfile) -> Unit,
     onDeleteProfile: (NetworkProfile) -> Unit,
+    onOpenCloudProfile: (CloudProfile) -> Unit,
+    onAddYandex: () -> Unit,
+    onAddGoogle: () -> Unit,
+    onDeleteCloudProfile: (CloudProfile) -> Unit,
     onLoadSftpProfile: (NetworkProfile?) -> SftpProfile?,
     onSaveSftpProfile: (SftpProfile) -> NetworkProfile,
     onOpenSftpProfile: (NetworkProfile) -> Unit,
@@ -772,6 +824,9 @@ private fun FtpScreen(
     onCreateSmbFolder: (String) -> Unit,
     onRenameSmb: (SmbEntry, String) -> Unit,
     onDeleteSmb: (SmbEntry, Boolean) -> Unit,
+    onPauseSmbTransfer: () -> Unit,
+    onResumeSmbTransfer: () -> Unit,
+    onCancelSmbTransfer: () -> Unit,
     onConnect: (FtpProfile) -> Unit,
     onDisconnect: () -> Unit,
     onRefresh: () -> Unit,
@@ -799,6 +854,7 @@ private fun FtpScreen(
     var sftpServerSettingsOpen by remember { mutableStateOf(false) }
     var connectSectionExpanded by remember { mutableStateOf(false) }
     var serverSectionExpanded by remember { mutableStateOf(serverStatus.running || sftpServerStatus.running) }
+    var cloudSectionExpanded by remember { mutableStateOf(state.cloudProfiles.isNotEmpty()) }
     val savedSftpProfile = state.networkProfiles.firstOrNull { it.protocol == NetworkProtocol.SFTP }
 
     LaunchedEffect(serverStatus.running, sftpServerStatus.running) {
@@ -817,15 +873,14 @@ private fun FtpScreen(
                 scanning = state.lanScanning,
                 onScan = onScanLan,
                 onSmb = { device ->
-                    onConnectSmb(
-                        SmbProfile(
-                            name = device.name,
-                            host = device.address,
-                            share = "",
-                            username = "",
-                            password = "",
-                        )
+                    smbDialogInitial = SmbProfile(
+                        name = device.name,
+                        host = device.address,
+                        share = "",
+                        username = "",
+                        password = "",
                     )
+                    smbSettingsOpen = true
                 },
                 onFtp = { device ->
                     ftpDialogInitial = FtpProfile(name = device.name, host = device.address, username = "", password = "")
@@ -845,7 +900,7 @@ private fun FtpScreen(
         item {
             ExpandableNetworkSection(
                 title = "Подключиться к",
-                subtitle = "SMB, FTP, SFTP и сохранённые подключения",
+                subtitle = "SMB, FTP, SFTP и сохранённые сетевые подключения",
                 icon = Icons.Rounded.Language,
                 accent = AuraPurple,
                 expanded = connectSectionExpanded,
@@ -931,6 +986,28 @@ private fun FtpScreen(
                 )
             }
         }
+        item {
+            ExpandableNetworkSection(
+                title = "Облако",
+                subtitle = when {
+                    state.cloudProfiles.isEmpty() -> "Яндекс.Диск и Google Drive"
+                    state.cloudProfiles.size == 1 -> "Подключено: 1 облако"
+                    else -> "Подключено облаков: ${state.cloudProfiles.size}"
+                },
+                icon = Icons.Rounded.Cloud,
+                accent = AuraBlue,
+                expanded = cloudSectionExpanded,
+                onToggle = { cloudSectionExpanded = !cloudSectionExpanded },
+            ) {
+                CloudProfilesCard(
+                    profiles = state.cloudProfiles,
+                    onOpen = onOpenCloudProfile,
+                    onAddYandex = onAddYandex,
+                    onAddGoogle = onAddGoogle,
+                    onDelete = onDeleteCloudProfile,
+                )
+            }
+        }
         if (state.smbConnected) {
             item {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
@@ -938,8 +1015,9 @@ private fun FtpScreen(
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        val canGoBack = state.smbPath != "/" ||
-                            (state.smbProfile?.share?.isNotBlank() == true && state.smbShares.isNotEmpty())
+                        val smbBusy = state.smbLoading || state.smbTransferLabel != null || state.operationInProgress
+                        val canGoBack = !smbBusy && (state.smbPath != "/" ||
+                            (!state.smbBrowsingShares && state.smbShares.isNotEmpty()))
                         IconButton(onClick = { onBackSmb() }, enabled = canGoBack) {
                             Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "На уровень выше")
                         }
@@ -947,62 +1025,68 @@ private fun FtpScreen(
                             buildString {
                                 append("\\\\")
                                 append(state.smbProfile?.host.orEmpty())
-                                state.smbProfile?.share?.takeIf(String::isNotBlank)?.let { append("\\").append(it) }
+                                if (!state.smbBrowsingShares) {
+                                    state.smbProfile?.share?.takeIf(String::isNotBlank)?.let { append("\\").append(it) }
+                                }
                                 if (state.smbPath != "/") append(state.smbPath.replace('/', '\\'))
                             },
                             modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
                             maxLines = 1,
                             fontWeight = FontWeight.Medium,
                         )
-                        IconButton(onClick = onRefreshSmb, enabled = !state.smbLoading) {
+                        IconButton(onClick = onRefreshSmb, enabled = !smbBusy) {
                             Icon(Icons.Rounded.Refresh, contentDescription = "Обновить SMB")
                         }
                     }
                 }
             }
-            if (state.smbProfile?.share?.isNotBlank() == true) {
+            if (!state.smbBrowsingShares && state.smbProfile?.share?.isNotBlank() == true) {
                 item {
                     Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
                             horizontalArrangement = Arrangement.SpaceEvenly,
                         ) {
-                            TextButton(onClick = onUploadSmb, enabled = state.smbTransferLabel == null) {
+                            TextButton(onClick = onUploadSmb, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
                                 Icon(Icons.Rounded.UploadFile, contentDescription = null)
                                 Spacer(Modifier.width(5.dp))
                                 Text("Файлы")
                             }
-                            TextButton(onClick = onUploadSmbFolder, enabled = state.smbTransferLabel == null) {
+                            TextButton(onClick = onUploadSmbFolder, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
                                 Icon(Icons.Rounded.Folder, contentDescription = null)
                                 Spacer(Modifier.width(5.dp))
                                 Text("Папку")
                             }
-                            TextButton(onClick = { smbCreateFolderOpen = true }, enabled = state.smbTransferLabel == null) {
+                            TextButton(onClick = { smbCreateFolderOpen = true }, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
                                 Icon(Icons.Rounded.Add, contentDescription = null)
                                 Spacer(Modifier.width(5.dp))
                                 Text("Папка")
                             }
-                            TextButton(onClick = onDisconnectSmb) { Text("Отключить") }
+                            TextButton(onClick = onDisconnectSmb, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) { Text("Отключить") }
                         }
                     }
                 }
             }
             state.smbTransferLabel?.let { label ->
                 item {
-                    Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.primaryContainer) {
-                        Column(Modifier.fillMaxWidth().padding(14.dp)) {
-                            Text(label, fontWeight = FontWeight.Medium)
-                            Spacer(Modifier.height(8.dp))
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-                    }
+                    TransferStatusOverlay(
+                        progress = state.transferProgress.takeIf { state.smbTransferActive },
+                        label = label,
+                        fallbackProgress = if (state.smbTransferActive) state.operationProgress else 0f,
+                        cancelable = state.smbTransferActive && state.operationCancelable,
+                        paused = state.smbTransferActive && state.transferPaused,
+                        onPause = onPauseSmbTransfer,
+                        onResume = onResumeSmbTransfer,
+                        onCancel = onCancelSmbTransfer,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
             when {
                 state.smbLoading -> item {
                     Box(Modifier.fillMaxWidth().height(130.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 }
-                state.smbProfile?.share.isNullOrBlank() && state.smbShares.isNotEmpty() -> item {
+                state.smbBrowsingShares && state.smbShares.isNotEmpty() -> item {
                     Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
                         Column {
                             state.smbShares.forEachIndexed { index, shareName ->
@@ -1021,7 +1105,7 @@ private fun FtpScreen(
                         }
                     }
                 }
-                state.smbProfile?.share.isNullOrBlank() -> item {
+                state.smbBrowsingShares -> item {
                     Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
                         Text(
                             "Доступные общие папки не найдены. Проверьте учётные данные или укажите имя шары в расширенных настройках.",
@@ -1044,7 +1128,7 @@ private fun FtpScreen(
                         Column {
                             SmbFileRow(
                                 entry = entry,
-                                busy = state.smbTransferLabel != null,
+                                busy = state.smbLoading || state.smbTransferLabel != null || state.operationInProgress,
                                 onOpen = { onOpenSmb(entry) },
                                 onDownload = { onDownloadSmb(entry) },
                                 onRename = { name -> onRenameSmb(entry, name) },
@@ -1371,7 +1455,7 @@ private fun FtpConnectionCard(
                         when {
                             state.ftpLoading -> "Подключение…"
                             state.ftpConnected -> "Подключено · keep-alive 25 с"
-                            state.ftpProfile != null -> "${state.ftpProfile?.name.orEmpty()} · соединение закрыто"
+                            state.ftpProfile != null -> "${state.ftpProfile.name} · соединение закрыто"
                             else -> "Удалённый FTP-сервер"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1420,19 +1504,27 @@ private fun SmbConnectionCard(
                         when {
                             state.smbLoading -> "Подключение…"
                             state.smbConnected -> "SMB2/3 · ${state.smbProfile?.host.orEmpty()}"
-                            state.smbProfile != null -> "${state.smbProfile?.name.orEmpty()} · ${state.smbProfile?.host.orEmpty()}"
+                            state.smbProfile != null -> "${state.smbProfile.name} · ${state.smbProfile.host}"
                             else -> "Windows, macOS, NAS и роутеры"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 12.sp,
                     )
                 }
-                TextButton(onClick = onConfigure) { Text("Параметры") }
+                TextButton(onClick = onConfigure, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) { Text("Параметры") }
             }
             if (state.smbConnected) {
-                TextButton(onClick = onDisconnect, modifier = Modifier.fillMaxWidth()) { Text("Отключить SMB") }
+                TextButton(
+                    onClick = onDisconnect,
+                    enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("Отключить SMB") }
             } else {
-                Button(onClick = onConnect, enabled = !state.smbLoading, modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = onConnect,
+                    enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Text(if (state.smbProfile == null) "Настроить и подключиться" else "Подключиться")
                 }
             }
@@ -1907,7 +1999,11 @@ private fun SmbFileRow(
         Column(Modifier.weight(1f)) {
             Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
             Text(
-                if (entry.isDirectory) "Папка SMB" else formatBytes(entry.size),
+                when {
+                    entry.isReparsePoint -> "Ссылка / junction SMB"
+                    entry.isDirectory -> "Папка SMB"
+                    else -> formatBytes(entry.size)
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 11.sp,
             )
@@ -1918,8 +2014,17 @@ private fun SmbFileRow(
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
-                    text = { Text(if (entry.isDirectory) "Скачать папку" else "Скачать на устройство") },
+                    text = {
+                        Text(
+                            when {
+                                entry.isReparsePoint -> "Скачивание ссылки отключено"
+                                entry.isDirectory -> "Скачать папку"
+                                else -> "Скачать на устройство"
+                            }
+                        )
+                    },
                     leadingIcon = { Icon(Icons.Rounded.Download, contentDescription = null) },
+                    enabled = !entry.isReparsePoint,
                     onClick = { menuOpen = false; onDownload() },
                 )
                 DropdownMenuItem(
@@ -1947,12 +2052,24 @@ private fun SmbFileRow(
     if (deleteOpen) {
         AlertDialog(
             onDismissRequest = { deleteOpen = false },
-            title = { Text(if (entry.isDirectory) "Удалить папку SMB?" else "Удалить файл SMB?") },
+            title = {
+                Text(
+                    when {
+                        entry.isReparsePoint -> "Удалить ссылку SMB?"
+                        entry.isDirectory -> "Удалить папку SMB?"
+                        else -> "Удалить файл SMB?"
+                    }
+                )
+            },
             text = {
                 Text(
-                    if (entry.isDirectory) {
-                        "${entry.name}\nПапка и всё её содержимое будут удалены без корзины."
-                    } else "${entry.name}\nФайл будет удалён без корзины."
+                    when {
+                        entry.isReparsePoint ->
+                            "${entry.name}\nБудет удалена только ссылка/junction. Целевая папка и её содержимое не затрагиваются."
+                        entry.isDirectory ->
+                            "${entry.name}\nПапка и всё её содержимое будут удалены без корзины."
+                        else -> "${entry.name}\nФайл будет удалён без корзины."
+                    }
                 )
             },
             confirmButton = {
@@ -1962,7 +2079,7 @@ private fun SmbFileRow(
                     scope.launch {
                         val wait = deleteAnimationMode.preDeleteDelayMillis()
                         if (wait > 0L) delay(wait)
-                        onDelete(entry.isDirectory)
+                        onDelete(entry.isDirectory && !entry.isReparsePoint)
                     }
                 }) { Text("Удалить") }
             },
@@ -2117,7 +2234,7 @@ private fun SmbConnectionDialog(
                 verticalArrangement = Arrangement.spacedBy(9.dp),
             ) {
                 Text(
-                    "Укажите только компьютер или IP. Aura попробует гостевой вход, затем введённую учётную запись и покажет доступные общие папки.",
+                    "Укажите компьютер или IP. Пустой логин означает гостевой вход; если логин указан, Aura использует только эти учётные данные SMB.",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -2126,7 +2243,8 @@ private fun SmbConnectionDialog(
                 OutlinedTextField(
                     value = username,
                     onValueChange = { username = it },
-                    label = { Text("Логин (пусто — гостевой вход)") },
+                    label = { Text("Пользователь SMB (пусто — гостевой вход)") },
+                    supportingText = { Text("Можно DOMAIN\\user или user@domain") },
                     singleLine = true,
                 )
                 OutlinedTextField(
@@ -2151,7 +2269,8 @@ private fun SmbConnectionDialog(
                         OutlinedTextField(
                             value = domain,
                             onValueChange = { domain = it },
-                            label = { Text("Домен (необязательно)") },
+                            label = { Text("Домен / рабочая группа (необязательно)") },
+                            supportingText = { Text("AD/Windows domain или Samba WORKGROUP; для обычного NAS обычно пусто") },
                             singleLine = true,
                         )
                     }
@@ -2162,15 +2281,23 @@ private fun SmbConnectionDialog(
         },
         confirmButton = {
             Button(onClick = {
-                val rawTarget = host.trim().removePrefix("\\\\").removePrefix("smb://")
-                val separator = rawTarget.indexOfAny(charArrayOf('\\', '/'))
-                val targetHost = if (separator < 0) rawTarget else rawTarget.substring(0, separator)
-                val pastedShare = if (separator < 0) "" else rawTarget.substring(separator + 1)
-                    .substringBefore('\\').substringBefore('/')
-                val targetShare = share.trim().trim('/', '\\').ifBlank { pastedShare }
-                when {
-                    targetHost.isBlank() -> localError = "Введите адрес устройства"
-                    else -> onConfirm(SmbProfile(name.ifBlank { targetHost }, targetHost, targetShare, username, password, domain))
+                localError = null
+                if (username.isBlank() && password.isNotBlank()) {
+                    localError = "Для пароля укажите пользователя SMB; без пользователя используется гостевой вход"
+                    return@Button
+                }
+                runCatching {
+                    SmbProfile(
+                        name = name,
+                        host = host,
+                        share = share,
+                        username = username,
+                        password = password,
+                        domain = domain,
+                        id = initial?.id.orEmpty(),
+                    ).normalizedSmbProfile()
+                }.onSuccess(onConfirm).onFailure { error ->
+                    localError = error.message ?: "Проверьте параметры SMB"
                 }
             }) { Text("Подключиться") }
         },
@@ -2332,7 +2459,17 @@ private fun FtpConnectionDialog(
                     host.isBlank() -> localError = "Введите адрес сервера"
                     username.isBlank() -> localError = "Введите логин"
                     parsedPort == null || parsedPort !in 1..65535 -> localError = "Некорректный порт"
-                    else -> onConfirm(FtpProfile(name.ifBlank { host }, host, parsedPort, username, password, tls))
+                    else -> onConfirm(
+                        FtpProfile(
+                            name = name.ifBlank { host },
+                            host = host,
+                            port = parsedPort,
+                            username = username,
+                            password = password,
+                            useTls = tls,
+                            id = initial?.id.orEmpty(),
+                        )
+                    )
                 }
             }) { Text("Сохранить и подключить") }
         },
@@ -2533,6 +2670,9 @@ private fun BrowserScreen(
     onShare: (List<FileEntry>) -> Unit,
     onSort: (FileSortMode) -> Unit,
     onViewMode: (FileViewMode) -> Unit,
+    onImageSourceFilter: (ImageSourceFilter) -> Unit,
+    onImageQueryChange: (String) -> Unit,
+    onLoadMoreImages: () -> Unit,
     onCancelOperation: () -> Unit,
     onPauseOperation: () -> Unit,
     onResumeOperation: () -> Unit,
@@ -2554,15 +2694,24 @@ private fun BrowserScreen(
     var archiveEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var batchRenameEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     val context = LocalContext.current
+    val imageCollection = state.collectionTitle == "Изображения"
     val hasCollectionGroups = state.collectionGroups.isNotEmpty()
     val shownItems = remember(
-        state.items, state.showHidden, state.showThumbnailFiles, query, state.sortMode, state.sortAscending, hasCollectionGroups
+        state.items, state.showHidden, state.showThumbnailFiles, query, state.sortMode, state.sortAscending, hasCollectionGroups, imageCollection
     ) {
-        // Collection screens render their grouped data, so sorting the same 5,000-file list here
-        // as well is pure duplicate work. Skip the flat sort when groups are available.
-        if (hasCollectionGroups) emptyList() else sortEntries(
+        // Image collections are already ordered by the Room query so pagination remains globally
+        // correct. Other flat collections continue to use the common in-memory sorter.
+        if (hasCollectionGroups) emptyList() else if (imageCollection) {
+            state.items.filter {
+                !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                    (state.showHidden || !it.name.startsWith('.')) &&
+                    (state.showThumbnailFiles || !it.isThumbnailCache()) &&
+                    it.name.contains(query, ignoreCase = true)
+            }
+        } else sortEntries(
             entries = state.items.filter {
-                (state.showHidden || !it.name.startsWith('.')) &&
+                !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                    (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
             },
@@ -2576,7 +2725,8 @@ private fun BrowserScreen(
         state.collectionGroups.mapNotNull { group ->
             val sorted = sortEntries(
                 group.entries.filter {
-                    (state.showHidden || !it.name.startsWith('.')) &&
+                    !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                        (state.showHidden || !it.name.startsWith('.')) &&
                         (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                         it.name.contains(query, ignoreCase = true)
                 },
@@ -2587,6 +2737,12 @@ private fun BrowserScreen(
                 sorted.sortedByDescending { it.uri in state.duplicateOriginalUris }
             if (entries.isEmpty()) null else group.copy(entries = entries)
         }
+    }
+    val displayedEntries = remember(shownItems, shownGroups) {
+        if (shownGroups.isEmpty()) shownItems else shownGroups.flatMap(FileCollectionGroup::entries)
+    }
+    val openDisplayedFile: (FileEntry) -> Unit = { entry ->
+        if (!openEnhancedPreview(context, entry, displayedEntries)) onOpenFile(entry)
     }
     val selectedEntries = remember(state.items, selectedUris) { state.items.filter { it.uri in selectedUris } }
 
@@ -2614,7 +2770,7 @@ private fun BrowserScreen(
 
     LaunchedEffect(state.folderStack.lastOrNull()?.document?.uri, state.collectionTitle) {
         selectedUris = emptySet()
-        query = ""
+        query = if (state.collectionTitle == "Изображения") state.imageQuery else ""
         searchVisible = false
     }
 
@@ -2636,6 +2792,7 @@ private fun BrowserScreen(
                 count = selectedEntries.size,
                 shareEnabled = true,
                 dateEnabled = selectedEntries.none(FileEntry::isDirectory),
+                favoriteEnabled = selectedEntries.none(FileEntry::isDirectory),
                 allFavorited = selectedEntries.all { it.uri in state.favoriteUris },
                 onFavorite = {
                     onToggleFavorites(selectedEntries)
@@ -2650,6 +2807,12 @@ private fun BrowserScreen(
             )
         }
         if (state.collectionTitle == null) Breadcrumbs(state = state)
+        if (imageCollection && selectedEntries.isEmpty()) {
+            ImageSourceFilterBar(
+                selected = state.imageSourceFilter,
+                onSelect = onImageSourceFilter,
+            )
+        }
         BrowserControls(
             sortMode = state.sortMode,
             ascending = state.sortAscending,
@@ -2659,15 +2822,22 @@ private fun BrowserScreen(
             onViewMode = onViewMode,
             onToggleSearch = {
                 searchVisible = !searchVisible
-                if (!searchVisible) query = ""
+                if (!searchVisible) {
+                    query = ""
+                    if (imageCollection) onImageQueryChange("")
+                }
             },
         )
         AnimatedVisibility(visible = searchVisible, enter = fadeIn(), exit = fadeOut()) {
             AuraSearchField(
                 query = query,
-                onQueryChange = { query = it },
+                onQueryChange = { value ->
+                    query = value
+                    if (imageCollection) onImageQueryChange(value)
+                },
                 onClose = {
                     query = ""
+                    if (imageCollection) onImageQueryChange("")
                     searchVisible = false
                 },
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
@@ -2697,7 +2867,11 @@ private fun BrowserScreen(
                     deletingUris = state.deletingUris,
                     deleteAnimationMode = state.deleteAnimationMode,
                     duplicateOriginalUris = state.duplicateOriginalUris,
-                    onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else onOpenFile(entry) },
+                    loadMoreLabel = if (imageCollection && state.items.size < state.collectionTotalCount)
+                        "Показать ещё · ${state.items.size} из ${state.collectionTotalCount}" else null,
+                    loadingMore = state.collectionLoadingMore,
+                    onLoadMore = onLoadMoreImages,
+                    onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else openDisplayedFile(entry) },
                     onToggleSelection = { entry ->
                         selectedUris = toggleSelection(selectedUris, entry.uri)
                     },
@@ -2719,7 +2893,11 @@ private fun BrowserScreen(
                     deletingUris = state.deletingUris,
                     deleteAnimationMode = state.deleteAnimationMode,
                     duplicateOriginalUris = state.duplicateOriginalUris,
-                    onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else onOpenFile(entry) },
+                    loadMoreLabel = if (imageCollection && state.items.size < state.collectionTotalCount)
+                        "Показать ещё · ${state.items.size} из ${state.collectionTotalCount}" else null,
+                    loadingMore = state.collectionLoadingMore,
+                    onLoadMore = onLoadMoreImages,
+                    onOpen = { entry -> if (entry.isDirectory) onOpen(entry) else openDisplayedFile(entry) },
                     onToggleSelection = { entry ->
                         selectedUris = toggleSelection(selectedUris, entry.uri)
                     },
@@ -2833,6 +3011,7 @@ private fun BrowserScreen(
             hash = state.fileHashes[entry.uri],
             hashing = entry.uri in state.hashingUris,
             favorite = entry.uri in state.favoriteUris,
+            favoriteEnabled = !entry.isDirectory,
             onCalculateHash = { onCalculateHash(entry) },
             onToggleFavorite = { onToggleFavorites(listOf(entry)) },
             onDismiss = { propertiesEntry = null },
@@ -2879,6 +3058,10 @@ private fun RecentScreen(
     var dateEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var archiveEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
     var batchRenameEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    val context = LocalContext.current
+    val openRecentFile: (FileEntry) -> Unit = { entry ->
+        if (!openEnhancedPreview(context, entry, items)) onOpenFile(entry)
+    }
     val selectedEntries = items.filter { it.uri in selectedUris }
 
     LaunchedEffect(selectedEntries.isNotEmpty()) {
@@ -2915,6 +3098,7 @@ private fun RecentScreen(
                 count = selectedEntries.size,
                 shareEnabled = true,
                 dateEnabled = true,
+                favoriteEnabled = selectedEntries.none(FileEntry::isDirectory),
                 allFavorited = selectedEntries.all { it.uri in state.favoriteUris },
                 onFavorite = {
                     onToggleFavorites(selectedEntries)
@@ -2946,7 +3130,7 @@ private fun RecentScreen(
                         selectionMode = selectedEntries.isNotEmpty(),
                         deletingUris = state.deletingUris,
                         deleteAnimationMode = state.deleteAnimationMode,
-                        onOpen = onOpenFile,
+                        onOpen = openRecentFile,
                         onToggleSelection = { selectedUris = toggleSelection(selectedUris, it.uri) },
                         onRename = onRename,
                         onDelete = { deleteEntries = listOf(it) },
@@ -2966,7 +3150,7 @@ private fun RecentScreen(
                         selectionMode = selectedEntries.isNotEmpty(),
                         deletingUris = state.deletingUris,
                         deleteAnimationMode = state.deleteAnimationMode,
-                        onOpen = onOpenFile,
+                        onOpen = openRecentFile,
                         onToggleSelection = { selectedUris = toggleSelection(selectedUris, it.uri) },
                         onRename = onRename,
                         onDelete = { deleteEntries = listOf(it) },
@@ -3034,6 +3218,7 @@ private fun RecentScreen(
             hash = state.fileHashes[entry.uri],
             hashing = entry.uri in state.hashingUris,
             favorite = entry.uri in state.favoriteUris,
+            favoriteEnabled = !entry.isDirectory,
             onCalculateHash = { onCalculateHash(entry) },
             onToggleFavorite = { onToggleFavorites(listOf(entry)) },
             onDismiss = { propertiesEntry = null },
@@ -3060,9 +3245,10 @@ private fun CleanupScreen(
     onOpenLargeFiles: () -> Unit,
     onOpenDuplicates: () -> Unit,
     onOpenTemporary: () -> Unit,
+    onOpenApps: () -> Unit,
     onOpenCategory: (FileCategory) -> Unit,
-    onRestoreTrash: (TrashRecord) -> Unit,
-    onDeleteTrash: (TrashRecord) -> Unit,
+    onRestoreTrash: (List<TrashRecord>) -> Unit,
+    onDeleteTrash: (List<TrashRecord>) -> Unit,
     onEmptyTrash: () -> Unit,
 ) {
     val analysis = state.analysis
@@ -3082,7 +3268,7 @@ private fun CleanupScreen(
                         when {
                             state.analyzing -> "Проверяем папки и сравниваем содержимое файлов…"
                             analysis == null -> "Aura просканирует только подключённую папку и ничего не удалит без подтверждения."
-                            else -> "${analysis.files.size} файлов · ${formatBytes(analysis.totalBytes)}"
+                            else -> "${analysis.totalFileCount} файлов · ${formatBytes(analysis.totalBytes)}"
                         },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         fontSize = 13.sp,
@@ -3154,6 +3340,17 @@ private fun CleanupScreen(
                         color = MaterialTheme.colorScheme.outline.copy(alpha = 0.55f),
                     )
                     RecommendationRow(
+                        icon = Icons.Rounded.Apps,
+                        tint = AuraBlue,
+                        title = "Приложения",
+                        subtitle = "APK / SPLIT · поделиться · установить полученный .APKS",
+                        onClick = onOpenApps,
+                    )
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 64.dp),
+                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.55f),
+                    )
+                    RecommendationRow(
                         icon = Icons.Rounded.RestoreFromTrash,
                         tint = AuraBlue,
                         title = "Корзина",
@@ -3175,7 +3372,7 @@ private fun CleanupScreen(
         }
     }
     if (trashOpen) {
-        TrashDialog(
+        TrashBrowserDialog(
             records = state.trashRecords,
             deletingUris = state.deletingUris,
             deleteAnimationMode = state.deleteAnimationMode,
@@ -3401,7 +3598,7 @@ private fun SettingsPage(
                         Button(
                             onClick = { AdvancedSettingsActivity.start(context) },
                             modifier = Modifier.fillMaxWidth(),
-                        ) { Text("Расширенные возможности 0.14") }
+                        ) { Text("Расширенные возможности") }
                     }
                     item { SectionHeader("Область работы") }
                     item {
@@ -3431,7 +3628,7 @@ private fun SettingsPage(
                     }
                     item {
                         Text(
-                            "Избранное хранит ссылки на исходные файлы и не скрывает их от других приложений. Для настоящего тайного раздела потребуется отдельный зашифрованный сейф.",
+                            "Избранное — зашифрованное хранилище Aura. Файл при добавлении перемещается из обычной папки и привязывается к этому устройству.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(horizontal = 4.dp),
@@ -3483,7 +3680,7 @@ private fun SettingsSwitchRow(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AuraSearchField(
+internal fun AuraSearchField(
     query: String,
     onQueryChange: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -3719,7 +3916,47 @@ private fun SimpleFileRow(entry: FileEntry, onClick: () -> Unit) {
 }
 
 @Composable
-private fun BrowserControls(
+private fun ImageSourceFilterBar(
+    selected: ImageSourceFilter,
+    onSelect: (ImageSourceFilter) -> Unit,
+) {
+    val options = listOf(
+        ImageSourceFilter.All to "Все",
+        ImageSourceFilter.Camera to "Камера",
+        ImageSourceFilter.Screenshots to "Снимки экрана",
+        ImageSourceFilter.WhatsApp to "WhatsApp",
+        ImageSourceFilter.Telegram to "Telegram",
+        ImageSourceFilter.Downloads to "Загрузки",
+        ImageSourceFilter.Other to "Другие",
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        options.forEach { (filter, label) ->
+            val active = selected == filter
+            Surface(
+                modifier = Modifier.clickable { onSelect(filter) },
+                shape = RoundedCornerShape(14.dp),
+                color = if (active) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = if (active) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+            ) {
+                Text(
+                    text = label,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                    fontSize = 13.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+internal fun BrowserControls(
     sortMode: FileSortMode,
     ascending: Boolean,
     viewMode: FileViewMode,
@@ -3795,6 +4032,9 @@ private fun BrowserListContent(
     deletingUris: Set<Uri> = emptySet(),
     deleteAnimationMode: DeleteAnimationMode = DeleteAnimationMode.Dissolve,
     duplicateOriginalUris: Set<Uri> = emptySet(),
+    loadMoreLabel: String? = null,
+    loadingMore: Boolean = false,
+    onLoadMore: () -> Unit = {},
     onOpen: (FileEntry) -> Unit,
     onToggleSelection: (FileEntry) -> Unit,
     onRename: (FileEntry, String) -> Unit,
@@ -3866,6 +4106,24 @@ private fun BrowserListContent(
                 }
             }
         }
+        if (loadMoreLabel != null || loadingMore) {
+            item(key = "collection-load-more") {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 14.dp, bottom = 8.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (loadingMore) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    } else {
+                        OutlinedButton(onClick = onLoadMore) {
+                            Text(loadMoreLabel ?: "Показать ещё")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3879,6 +4137,9 @@ private fun BrowserGridContent(
     deletingUris: Set<Uri> = emptySet(),
     deleteAnimationMode: DeleteAnimationMode = DeleteAnimationMode.Dissolve,
     duplicateOriginalUris: Set<Uri> = emptySet(),
+    loadMoreLabel: String? = null,
+    loadingMore: Boolean = false,
+    onLoadMore: () -> Unit = {},
     onOpen: (FileEntry) -> Unit,
     onToggleSelection: (FileEntry) -> Unit,
     onRename: (FileEntry, String) -> Unit,
@@ -3937,6 +4198,27 @@ private fun BrowserGridContent(
                     onSetSystemSound = { type -> onSetSystemSound(entry, type) },
                     onProperties = { onProperties(entry) },
                     )
+                }
+            }
+        }
+        if (loadMoreLabel != null || loadingMore) {
+            item(
+                key = "grid-collection-load-more",
+                span = { GridItemSpan(maxLineSpan) },
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 14.dp, bottom = 8.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (loadingMore) {
+                        CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                    } else {
+                        OutlinedButton(onClick = onLoadMore) {
+                            Text(loadMoreLabel ?: "Показать ещё")
+                        }
+                    }
                 }
             }
         }
@@ -4309,6 +4591,7 @@ private fun SelectionHeader(
     count: Int,
     shareEnabled: Boolean,
     dateEnabled: Boolean,
+    favoriteEnabled: Boolean,
     allFavorited: Boolean,
     onFavorite: () -> Unit,
     onShare: () -> Unit,
@@ -4337,6 +4620,7 @@ private fun SelectionHeader(
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
                     text = { Text(if (allFavorited) "Убрать из избранного" else "В избранное") },
+                    enabled = favoriteEnabled,
                     leadingIcon = {
                         Icon(
                             if (allFavorited) Icons.Rounded.Star else Icons.Rounded.StarBorder,
@@ -4513,6 +4797,7 @@ private fun FilePropertiesDialog(
     hash: String?,
     hashing: Boolean,
     favorite: Boolean,
+    favoriteEnabled: Boolean,
     onCalculateHash: () -> Unit,
     onToggleFavorite: () -> Unit,
     onDismiss: () -> Unit,
@@ -4558,7 +4843,7 @@ private fun FilePropertiesDialog(
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Готово") } },
         dismissButton = {
-            TextButton(onClick = onToggleFavorite) {
+            TextButton(onClick = onToggleFavorite, enabled = favoriteEnabled) {
                 Icon(
                     if (favorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
                     contentDescription = null,
@@ -4618,7 +4903,7 @@ private fun FileIcon(entry: FileEntry, showThumbnail: Boolean = false) {
         mime.startsWith("audio/") || extension in setOf("mp3", "m4a", "wav", "flac", "ogg", "aac") ->
             Icons.Rounded.MusicNote to AuraGreen
         mime == "application/pdf" || extension in setOf("pdf", "djvu", "djv") -> Icons.Rounded.Description to AuraRed
-        mime == "application/vnd.android.package-archive" || extension == "apk" -> Icons.Rounded.Apps to AuraGreen
+        mime == "application/vnd.android.package-archive" || (extension == "apk" || extension == "apks") -> Icons.Rounded.Apps to AuraGreen
         mime.contains("zip") || mime.contains("archive") || extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz2", "txz") ->
             Icons.Rounded.Archive to AuraOrange
         mime.startsWith("text/") || extension in setOf("txt", "md", "doc", "docx", "rtf", "odt") ->
@@ -4646,7 +4931,7 @@ private fun fileAccent(entry: FileEntry): Color {
         mime.startsWith("video/") || extension in setOf("mp4", "mkv", "avi", "mov", "webm", "3gp") -> AuraPurple
         mime.startsWith("audio/") || extension in setOf("mp3", "m4a", "wav", "flac", "ogg", "aac") -> AuraGreen
         extension in setOf("pdf", "djvu", "djv") -> AuraRed
-        extension == "apk" -> AuraGreen
+        (extension == "apk" || extension == "apks") -> AuraGreen
         extension in setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz2", "txz") -> AuraOrange
         extension in setOf("txt", "md", "doc", "docx", "rtf", "odt") -> AuraBlue
         else -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -4793,18 +5078,21 @@ private fun StorageCard(storage: StorageSnapshot) {
 }
 
 @Composable
-private fun BrowserHeader(
+internal fun BrowserHeader(
     title: String,
     onBack: () -> Unit,
     onRefresh: () -> Unit,
     onCreateFolder: () -> Unit,
     onDualPane: () -> Unit,
+    backEnabled: Boolean = true,
+    createFolderEnabled: Boolean = true,
+    dualPaneEnabled: Boolean = true,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp, end = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        IconButton(onClick = { onBack() }) {
+        IconButton(onClick = { onBack() }, enabled = backEnabled) {
             Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Назад")
         }
         Text(
@@ -4818,10 +5106,10 @@ private fun BrowserHeader(
         IconButton(onClick = onRefresh) {
             Icon(Icons.Rounded.Refresh, contentDescription = "Обновить")
         }
-        IconButton(onClick = onDualPane) {
+        IconButton(onClick = onDualPane, enabled = dualPaneEnabled) {
             Icon(Icons.Rounded.Splitscreen, contentDescription = "Две панели")
         }
-        IconButton(onClick = onCreateFolder) {
+        IconButton(onClick = onCreateFolder, enabled = createFolderEnabled) {
             Icon(Icons.Rounded.Add, contentDescription = "Создать папку")
         }
     }
@@ -4919,7 +5207,7 @@ private fun EmptyRecentCard(connected: Boolean, onChooseRoot: () -> Unit) {
 }
 
 @Composable
-private fun EmptyFolder(modifier: Modifier = Modifier) {
+internal fun EmptyFolder(modifier: Modifier = Modifier) {
     Column(modifier = modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Icon(Icons.Rounded.FolderOpen, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(42.dp))
         Spacer(Modifier.height(10.dp))
@@ -5143,9 +5431,7 @@ private fun BatchRenameDialog(
 
 @Composable
 private fun StorageMapCard(analysis: StorageAnalysis) {
-    val summaries = analysis.categories.filter {
-        it.bytes > 0L && it.category !in setOf(FileCategory.Downloads, FileCategory.Camera)
-    }
+    val summaries = analysis.storageCategories.filter { it.bytes > 0L }
     if (summaries.isEmpty()) return
     Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -5190,77 +5476,452 @@ private fun categoryColor(category: FileCategory): Color = when (category) {
 }
 
 @Composable
-private fun TrashDialog(
+private fun TrashBrowserDialog(
     records: List<TrashRecord>,
     deletingUris: Set<Uri>,
     deleteAnimationMode: DeleteAnimationMode,
-    onRestore: (TrashRecord) -> Unit,
-    onDelete: (TrashRecord) -> Unit,
+    onRestore: (List<TrashRecord>) -> Unit,
+    onDelete: (List<TrashRecord>) -> Unit,
     onEmpty: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var permanentRecord by remember { mutableStateOf<TrashRecord?>(null) }
+    val context = LocalContext.current
+    var folderStack by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    var nestedEntries by remember { mutableStateOf<List<FileEntry>>(emptyList()) }
+    var loading by remember { mutableStateOf(false) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var viewMode by rememberSaveable { mutableStateOf(FileViewMode.List) }
+    var sortMode by rememberSaveable { mutableStateOf(FileSortMode.Name) }
+    var sortAscending by rememberSaveable { mutableStateOf(true) }
+    var searchVisible by rememberSaveable { mutableStateOf(false) }
+    var query by rememberSaveable { mutableStateOf("") }
+    var selectedRootUris by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var permanentRecords by remember { mutableStateOf<List<TrashRecord>>(emptyList()) }
     var emptyConfirmation by remember { mutableStateOf(false) }
-    AlertDialog(
+    val currentFolder = folderStack.lastOrNull()
+
+    LaunchedEffect(currentFolder?.uri) {
+        val folder = currentFolder
+        selectedRootUris = emptySet()
+        query = ""
+        searchVisible = false
+        if (folder == null) {
+            nestedEntries = emptyList()
+            loadError = null
+            loading = false
+        } else {
+            loading = true
+            loadError = null
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    FastDocumentListing.list(context, folder.document).map { info ->
+                        FileEntry(
+                            document = info.document,
+                            name = info.name,
+                            uri = info.uri,
+                            isDirectory = info.isDirectory,
+                            mimeType = info.mimeType,
+                            size = info.size,
+                            modifiedAt = info.modifiedAt,
+                            parentUri = folder.uri,
+                        )
+                    }
+                }
+            }.onSuccess { nestedEntries = it }
+                .onFailure {
+                    nestedEntries = emptyList()
+                    loadError = it.message ?: "Не удалось прочитать папку в корзине"
+                }
+            loading = false
+        }
+    }
+
+    val rootRecordsByUri = remember(records) { records.associateBy { it.entry.uri.toString() } }
+    val rawVisibleEntries = if (currentFolder == null) records.map { it.entry } else nestedEntries
+    val visibleEntries = remember(rawVisibleEntries, query, sortMode, sortAscending) {
+        sortEntries(
+            rawVisibleEntries.filter { it.name.contains(query, ignoreCase = true) },
+            sortMode,
+            sortAscending,
+        )
+    }
+    val selectedRecords = remember(records, selectedRootUris) {
+        records.filter { it.entry.uri.toString() in selectedRootUris }
+    }
+    val rootRecordForCurrentFolder = folderStack.firstOrNull()?.uri?.toString()?.let(rootRecordsByUri::get)
+    val selectionMode = currentFolder == null && selectedRootUris.isNotEmpty()
+
+    fun openTrashFile(entry: FileEntry) {
+        if (entry.isDirectory) {
+            folderStack = folderStack + entry
+            return
+        }
+        when {
+            entry.isReaderSupported() -> runCatching { openBookReader(context, entry) }
+                .onFailure { openFile(context, entry) }
+            ArchiveBrowserActivity.isBrowsableArchiveName(entry.name) ->
+                runCatching { ArchiveBrowserActivity.start(context, entry) }.onFailure { openFile(context, entry) }
+            openEnhancedPreview(context, entry, visibleEntries) -> Unit
+            else -> openFile(context, entry)
+        }
+    }
+
+    fun toggleRootSelection(entry: FileEntry) {
+        if (currentFolder != null) return
+        val key = entry.uri.toString()
+        selectedRootUris = if (key in selectedRootUris) selectedRootUris - key else selectedRootUris + key
+    }
+
+    fun restoreRecords(items: List<TrashRecord>) {
+        onRestore(items)
+        selectedRootUris = emptySet()
+        if (folderStack.isNotEmpty()) folderStack = emptyList()
+    }
+
+    BackHandler {
+        when {
+            selectedRootUris.isNotEmpty() -> selectedRootUris = emptySet()
+            folderStack.isNotEmpty() -> folderStack = folderStack.dropLast(1)
+            else -> onDismiss()
+        }
+    }
+
+    Dialog(
         onDismissRequest = onDismiss,
-        icon = { Icon(Icons.Rounded.RestoreFromTrash, contentDescription = null) },
-        title = { Text("Корзина") },
-        text = {
-            if (records.isEmpty()) {
-                Text("Корзина пуста. Удалённые через Aura объекты появятся здесь.")
-            } else {
-                LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 380.dp)) {
-                    items(records.size) { index ->
-                        val record = records[index]
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .auraDeleteEffect(
-                                    active = record.entry.uri in deletingUris,
-                                    mode = deleteAnimationMode,
-                                    seed = record.entry.uri.toString().hashCode(),
-                                )
-                                .padding(vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+        properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnBackPress = false),
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background,
+        ) {
+            Column(Modifier.fillMaxSize()) {
+                if (selectionMode) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = { selectedRootUris = emptySet() }) {
+                            Icon(Icons.Rounded.Close, contentDescription = "Снять выделение")
+                        }
+                        Text(
+                            "Выбрано: ${selectedRecords.size}",
+                            modifier = Modifier.weight(1f),
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        TextButton(onClick = {
+                            selectedRootUris = records.map { it.entry.uri.toString() }.toSet()
+                        }) { Text("Все") }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(
+                            onClick = {
+                                if (folderStack.isNotEmpty()) folderStack = folderStack.dropLast(1) else onDismiss()
+                            },
                         ) {
-                            FileIcon(record.entry)
-                            Spacer(Modifier.width(10.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(record.originalName, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
-                                Text(
-                                    DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(record.deletedAt)),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    fontSize = 11.sp,
-                                )
+                            Icon(
+                                if (folderStack.isNotEmpty()) Icons.AutoMirrored.Rounded.ArrowBack else Icons.Rounded.Close,
+                                contentDescription = if (folderStack.isNotEmpty()) "Назад" else "Закрыть",
+                            )
+                        }
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                currentFolder?.name ?: "Корзина",
+                                fontSize = 21.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                when {
+                                    currentFolder != null -> "Удалённая папка · ${visibleEntries.size} объект(ов)"
+                                    records.isEmpty() -> "Корзина пуста"
+                                    else -> "Удалено объектов: ${records.size}"
+                                },
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+
+                BrowserControls(
+                    sortMode = sortMode,
+                    ascending = sortAscending,
+                    viewMode = viewMode,
+                    searchVisible = searchVisible,
+                    onSort = { mode ->
+                        if (sortMode == mode) sortAscending = !sortAscending
+                        else {
+                            sortMode = mode
+                            sortAscending = true
+                        }
+                    },
+                    onViewMode = { viewMode = it },
+                    onToggleSearch = {
+                        searchVisible = !searchVisible
+                        if (!searchVisible) query = ""
+                    },
+                )
+                AnimatedVisibility(visible = searchVisible, enter = fadeIn(), exit = fadeOut()) {
+                    AuraSearchField(
+                        query = query,
+                        onQueryChange = { query = it },
+                        onClose = {
+                            query = ""
+                            searchVisible = false
+                        },
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                }
+                HorizontalDivider()
+
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when {
+                        loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                        loadError != null -> Text(
+                            loadError.orEmpty(),
+                            modifier = Modifier.align(Alignment.Center).padding(24.dp),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        visibleEntries.isEmpty() -> Text(
+                            if (currentFolder == null) "Корзина пуста" else "Папка пуста",
+                            modifier = Modifier.align(Alignment.Center),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        viewMode == FileViewMode.List -> LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                        ) {
+                            items(visibleEntries, key = { it.uri.toString() }) { entry ->
+                                val record = rootRecordsByUri[entry.uri.toString()]
+                                val selected = entry.uri.toString() in selectedRootUris
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .auraDeleteEffect(
+                                            active = entry.uri in deletingUris,
+                                            mode = deleteAnimationMode,
+                                            seed = entry.uri.toString().hashCode(),
+                                        )
+                                        .combinedClickable(
+                                            enabled = entry.uri !in deletingUris,
+                                            onClick = {
+                                                if (selectionMode && currentFolder == null) toggleRootSelection(entry)
+                                                else openTrashFile(entry)
+                                            },
+                                            onLongClick = {
+                                                if (currentFolder == null) toggleRootSelection(entry)
+                                            },
+                                        ),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 9.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        if (selectionMode && currentFolder == null) {
+                                            Checkbox(
+                                                checked = selected,
+                                                onCheckedChange = { toggleRootSelection(entry) },
+                                            )
+                                            Spacer(Modifier.width(4.dp))
+                                        }
+                                        FileIcon(entry)
+                                        Spacer(Modifier.width(10.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                                            Text(
+                                                when {
+                                                    record != null -> "Удалён ${DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(record.deletedAt))}"
+                                                    entry.isDirectory -> "Папка"
+                                                    else -> formatBytes(entry.size)
+                                                },
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                fontSize = 11.sp,
+                                            )
+                                        }
+                                        if (!selectionMode && entry.isDirectory) {
+                                            Icon(Icons.Rounded.ChevronRight, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(4.dp))
                             }
-                            IconButton(onClick = { onRestore(record) }) {
-                                Icon(Icons.Rounded.RestoreFromTrash, contentDescription = "Восстановить")
-                            }
-                            IconButton(onClick = { permanentRecord = record }) {
-                                Icon(Icons.Rounded.DeleteForever, contentDescription = "Удалить навсегда", tint = MaterialTheme.colorScheme.error)
+                        }
+                        else -> LazyVerticalGrid(
+                            columns = GridCells.Adaptive(140.dp),
+                            modifier = Modifier.fillMaxSize(),
+                            contentPadding = PaddingValues(12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            items(visibleEntries, key = { it.uri.toString() }) { entry ->
+                                val record = rootRecordsByUri[entry.uri.toString()]
+                                val selected = entry.uri.toString() in selectedRootUris
+                                Surface(
+                                    shape = RoundedCornerShape(18.dp),
+                                    tonalElevation = if (selected) 4.dp else 1.dp,
+                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .auraDeleteEffect(
+                                            active = entry.uri in deletingUris,
+                                            mode = deleteAnimationMode,
+                                            seed = entry.uri.toString().hashCode(),
+                                        )
+                                        .combinedClickable(
+                                            enabled = entry.uri !in deletingUris,
+                                            onClick = {
+                                                if (selectionMode && currentFolder == null) toggleRootSelection(entry)
+                                                else openTrashFile(entry)
+                                            },
+                                            onLongClick = {
+                                                if (currentFolder == null) toggleRootSelection(entry)
+                                            },
+                                        ),
+                                ) {
+                                    Box(Modifier.padding(12.dp)) {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                                            FileIcon(entry, showThumbnail = true)
+                                            Spacer(Modifier.height(8.dp))
+                                            Text(
+                                                entry.name,
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                                textAlign = TextAlign.Center,
+                                                fontSize = 12.sp,
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                when {
+                                                    record != null -> DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(record.deletedAt))
+                                                    entry.isDirectory -> "Папка"
+                                                    else -> formatBytes(entry.size)
+                                                },
+                                                maxLines = 1,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                fontSize = 10.sp,
+                                            )
+                                        }
+                                        if (selectionMode && currentFolder == null) {
+                                            Checkbox(
+                                                checked = selected,
+                                                onCheckedChange = { toggleRootSelection(entry) },
+                                                modifier = Modifier.align(Alignment.TopEnd),
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+
+                HorizontalDivider()
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        when {
+                            selectionMode -> {
+                                Button(
+                                    onClick = { restoreRecords(selectedRecords) },
+                                    enabled = selectedRecords.isNotEmpty(),
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.RestoreFromTrash, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Восстановить (${selectedRecords.size})")
+                                }
+                                OutlinedButton(
+                                    onClick = { permanentRecords = selectedRecords },
+                                    enabled = selectedRecords.isNotEmpty(),
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.DeleteForever, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Удалить", color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                            rootRecordForCurrentFolder != null -> {
+                                Button(
+                                    onClick = { restoreRecords(listOf(rootRecordForCurrentFolder)) },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.RestoreFromTrash, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Восстановить")
+                                }
+                                OutlinedButton(
+                                    onClick = { permanentRecords = listOf(rootRecordForCurrentFolder) },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.DeleteForever, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Удалить", color = MaterialTheme.colorScheme.error)
+                                }
+                            }
+                            records.isNotEmpty() -> {
+                                OutlinedButton(
+                                    onClick = { selectedRootUris = records.map { it.entry.uri.toString() }.toSet() },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.CheckCircle, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Выбрать")
+                                }
+                                Button(
+                                    onClick = { emptyConfirmation = true },
+                                    modifier = Modifier.weight(1f),
+                                ) {
+                                    Icon(Icons.Rounded.DeleteForever, contentDescription = null)
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Очистить")
+                                }
+                            }
+                            else -> Text(
+                                "Корзина пуста",
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Готово") } },
-        dismissButton = if (records.isNotEmpty()) {
-            { TextButton(onClick = { emptyConfirmation = true }) { Text("Очистить", color = MaterialTheme.colorScheme.error) } }
-        } else null,
-    )
-    permanentRecord?.let { record ->
+        }
+    }
+
+    if (permanentRecords.isNotEmpty()) {
         AlertDialog(
-            onDismissRequest = { permanentRecord = null },
+            onDismissRequest = { permanentRecords = emptyList() },
             icon = { Icon(Icons.Rounded.DeleteForever, contentDescription = null) },
             title = { Text("Удалить безвозвратно?") },
-            text = { Text(record.originalName) },
+            text = {
+                Text(
+                    if (permanentRecords.size == 1) permanentRecords.first().originalName
+                    else "Будут безвозвратно удалены ${permanentRecords.size} объект(ов)."
+                )
+            },
             confirmButton = {
-                TextButton(onClick = { onDelete(record); permanentRecord = null }) {
+                TextButton(onClick = {
+                    onDelete(permanentRecords)
+                    permanentRecords = emptyList()
+                    selectedRootUris = emptySet()
+                    if (folderStack.isNotEmpty()) folderStack = emptyList()
+                }) {
                     Text("Удалить", color = MaterialTheme.colorScheme.error)
                 }
             },
-            dismissButton = { TextButton(onClick = { permanentRecord = null }) { Text("Отмена") } },
+            dismissButton = { TextButton(onClick = { permanentRecords = emptyList() }) { Text("Отмена") } },
         )
     }
     if (emptyConfirmation) {
@@ -5270,7 +5931,12 @@ private fun TrashDialog(
             title = { Text("Очистить корзину?") },
             text = { Text("Все ${records.size} объектов будут удалены без возможности восстановления.") },
             confirmButton = {
-                TextButton(onClick = { onEmpty(); emptyConfirmation = false }) {
+                TextButton(onClick = {
+                    onEmpty()
+                    emptyConfirmation = false
+                    selectedRootUris = emptySet()
+                    folderStack = emptyList()
+                }) {
                     Text("Очистить", color = MaterialTheme.colorScheme.error)
                 }
             },
@@ -5280,7 +5946,7 @@ private fun TrashDialog(
 }
 
 @Composable
-private fun NameDialog(
+internal fun NameDialog(
     title: String,
     initialValue: String,
     confirmLabel: String,

@@ -1,12 +1,14 @@
-Aura Files 1.0 NO-OCR — STABLE FULL SOURCE
+Aura Files 1.3.1 VAULT FAVORITES — FULL SOURCE
 
-Это полное дерево исходников, а не набор патчей.
-Для Codex: начать с 00_CODEX_TASK.md и AURA_1.0_CHANGES_RU.txt.
-Для чистого Windows-ПК: запустить BUILD_ON_CLEAN_WINDOWS.bat.
-Не накладывать поверх этого дерева старые FIXPACK-архивы.
+Продолжать от полного дерева этого пакета.
+Читать: 00_CODEX_TASK.md + AURA_1.3.1_CLOUD_CHECKPOINT.md + AURA_1.3.1_VAULT_FAVORITES_CHANGES_RU.md.
+Инструкция cloud OAuth по-прежнему: CLOUD_SETUP_1.2.4_RU.md.
 
-Сборщик устанавливает переносимые инструменты без Android Studio,
-переносит проект в ASCII-путь и создаёт debug APK в BUILD_OUTPUT.
+Ключевое 1.3.1: прежнее URI-«Избранное» заменено persistent encrypted `.AuraVault` в общей памяти.
+«В избранное» означает только move; ключ не хранится и вычисляется как ANDROID_ID -> HKDF-SHA256(info="AuraVault-v1") -> AES-256-GCM.
+Имена/метаданные/данные шифруются, наружу видны только UUID `.avf`; `.AuraVault` исключён из browser/index Aura.
+На том же устройстве/Android user с той же подписью Aura после reinstall ключ должен вычислиться снова; простое копирование vault на другой телефон штатной Aura не открывается.
+Папки в vault пока не поддерживаются.
 
-Версия приложения: 1.0 (versionCode 100).
-OCR намеренно не включён.
+Сохранять без регрессий 1.3.0 SPLIT/APKS export/install, cloud backends/OAuth, Images catalog paging и transfer/trash safety.
+Версия: 1.3.1 (versionCode 131).

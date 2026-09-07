@@ -49,4 +49,16 @@ class FileClassifierTest {
         assertEquals(FileCategory.Documents, FileClassifier.category("misnamed.mp4", mimeType = "application/pdf"))
         assertEquals(FileCategory.Images, FileClassifier.category("misnamed.bin", mimeType = "image/jpeg"))
     }
+
+    @Test
+    fun screenshotFoldersAreRecognizedAcrossCommonAndroidLocations() {
+        val paths = listOf(
+            "/storage/emulated/0/Pictures/Screenshots/Screenshot_001.png",
+            "/storage/emulated/0/DCIM/Screenshots/Screenshot_002.jpg",
+            "content://provider/tree/primary:Pictures/document/primary:Pictures/Screenshot/capture.webp",
+        )
+        paths.forEach { path ->
+            assertEquals(path, "Снимки экрана", FileClassifier.sourceLabel(path.lowercase()))
+        }
+    }
 }

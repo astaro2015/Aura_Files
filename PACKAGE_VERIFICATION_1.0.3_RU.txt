@@ -1,0 +1,11 @@
+Aura Files 1.0.3 — локальная проверка пакета
+
+База: Aura Files 1.0.2 / официальный GitHub 1.0.
+
+Проверено локально без Android SDK:
+- versionName 1.0.3 / versionCode 103 / compileSdk 36 / NDK 28.2.13676358.
+- Нажатие SMB у LAN-устройства открывает SmbConnectionDialog с подставленными name/address и не запускает немедленный Guest/Anonymous connect.
+- SmbRepository скрывает внутреннюю строку jCIFS `0.0.0.0<00>/IP` для класса Failed to connect и анализирует цепочку cause для типовых SMB-ошибок.
+- Kotlin PSI, Java parser, XML parse, checksum manifest и ZIP integrity проверяются перед упаковкой.
+
+Полный Android Gradle build 1.0.3 в текущем контейнере НЕ заявляется пройденным: Android SDK/сетевые зависимости здесь недоступны.

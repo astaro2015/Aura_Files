@@ -193,4 +193,33 @@ class CrossBackendTransferTest {
         registry.close()
     }
 
+    @Test fun linkLikeDirectoryIsNotTraversedDuringCrossBackendCopy() = runBlocking {
+        val sourceBackend = FakeStorageBackend("source", StorageBackendKind.SMB).apply {
+            putDirectory("/junction", isLink = true)
+            // Simulates content reachable through a server-side junction. Aura must not enumerate it.
+            putFile("/junction/outside.txt", "OUTSIDE")
+        }
+        val destination = FakeStorageBackend("destination")
+        val registry = StorageBackendRegistry().apply { register(sourceBackend); register(destination) }
+        val source = requireNotNull(sourceBackend.stat("/junction"))
+        val request = TransferRequest(
+            type = TransferType.COPY,
+            sources = listOf(TransferSource.Backend(sourceBackend.descriptor.id, source.path, source.name, 0L, 1L, true)),
+            destination = TransferDestination.Backend(destination.descriptor.id, "/"),
+            conflictPolicy = TransferConflictPolicy.KEEP_BOTH,
+        )
+        val failure = runCatching {
+            BackendTransferCore(registry).execute(
+                request,
+                TransferController(),
+                { TransferConflictDecision(TransferConflictPolicy.KEEP_BOTH) },
+                {},
+            )
+        }.exceptionOrNull()
+        assertTrue(failure?.message?.contains("junction", ignoreCase = true) == true ||
+            failure?.message?.contains("Ссылки", ignoreCase = true) == true)
+        assertFalse(destination.exists("/junction"))
+        registry.close()
+    }
+
 }

@@ -1,0 +1,45 @@
+Aura Files 1.1.0 CLOUD — проверка этапа 3
+Дата: 2026-09-06
+
+Входной пакет этапа:
+- Aura_Files_1.1.0_CLOUD_STAGE2_source.zip
+- SHA-256: 0cae67c6f15bfc8efed9adde0fffd5e2d4e2baebe0df194f58de218da49ef935
+
+Архитектурно проверено:
+- YandexDiskStorageBackend реализует общий StorageBackend;
+- пользовательские панели на этом этапе не изменены и Yandex backend ещё не зарегистрирован в UI;
+- Photoslice не смешан с официальным REST backend;
+- delete использует обычное удаление Yandex Disk (в Корзину), не permanent delete;
+- transfer core сохраняет `.aura-part-*` + rename и backup/swap semantics;
+- старые Local/SMB/FTP/SFTP backend'ы не обязаны реализовывать новый size-aware overload: у него есть default fallback.
+
+Проверено в контейнере:
+- Yandex main core kotlinc compile с JVM stubs для Android repository/org.json: OK;
+- BackendTransferCore compile после нового openWrite overload: OK;
+- YandexDiskStorageBackendTest smoke через локальный runner: OK;
+  * HTTP 401 -> один forced refresh -> retry;
+  * mkdir / rename / move / delete;
+  * non-recursive delete protection;
+  * Local -> Yandex -> Local через общий BackendTransferCore;
+  * expectedSize передан binary writer;
+  * `.aura-part-*` после успешного commit не остаётся;
+- Kotlin PSI parse: 102 Kotlin-файла, 0 синтаксических ошибок;
+- Android XML parse: 14 файлов, 0 ошибок;
+- logging scan новых Yandex backend/binary/API файлов: Log/println/printStackTrace отсутствуют;
+- app metadata не повышены: versionName 1.0.4 / versionCode 104.
+
+Полный Android Gradle build НЕ заявляется пройденным:
+- команда: ./gradlew :app:testDebugUnitTest :app:assembleDebug --offline --no-daemon
+- wrapper всё равно требует локально отсутствующий gradle-9.5.0-bin.zip;
+- попытка получения https://services.gradle.org/distributions/gradle-9.5.0-bin.zip завершилась UnknownHostException;
+- Gradle не стартовал, поэтому это ограничение среды, а не полученная ошибка компиляции проекта.
+
+Контрольная сборка на Windows/CI:
+  gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon
+
+Следующий этап:
+- Android device-code UI;
+- profile/account management;
+- регистрация сохранённых YandexDiskStorageBackend в StorageBackendRegistry;
+- показ Яндекс.Диска в универсальных панелях;
+- без Photoslice до отдельного read-only этапа.

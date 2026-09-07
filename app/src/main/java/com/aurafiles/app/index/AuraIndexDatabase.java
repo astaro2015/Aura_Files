@@ -8,7 +8,7 @@ import androidx.room.RoomDatabase;
 import androidx.room.migration.Migration;
 import androidx.sqlite.db.SupportSQLiteDatabase;
 
-@Database(entities = {IndexedFileEntity.class, IndexedRootEntity.class}, version = 3, exportSchema = false)
+@Database(entities = {IndexedFileEntity.class, IndexedRootEntity.class}, version = 4, exportSchema = false)
 public abstract class AuraIndexDatabase extends RoomDatabase {
     public abstract IndexedFileDao indexedFileDao();
     public abstract RootDao rootDao();
@@ -46,6 +46,16 @@ public abstract class AuraIndexDatabase extends RoomDatabase {
         }
     };
 
+    private static final Migration MIGRATION_3_4 = new Migration(3, 4) {
+        @Override
+        public void migrate(@NonNull SupportSQLiteDatabase db) {
+            // 1.0 could retain recommendation rows that no longer matched the visible file set.
+            // The index is only a rebuildable cache, so reset it once and require a fresh Analysis.
+            db.execSQL("DELETE FROM indexed_files");
+            db.execSQL("DELETE FROM indexed_roots");
+        }
+    };
+
     public static AuraIndexDatabase get(Context context) {
         AuraIndexDatabase value = INSTANCE;
         if (value != null) return value;
@@ -56,7 +66,7 @@ public abstract class AuraIndexDatabase extends RoomDatabase {
                         context.getApplicationContext(),
                         AuraIndexDatabase.class,
                         "aura-index.db"
-                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build();
+                ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build();
                 INSTANCE = value;
             }
             return value;

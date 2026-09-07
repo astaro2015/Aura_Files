@@ -21,14 +21,16 @@ class NetworkProfileRepository(context: Context) {
 
     fun save(profile: FtpProfile): NetworkProfile {
         val protocol = if (profile.useTls) NetworkProtocol.FTPS else NetworkProtocol.FTP
-        val existing = profiles().firstOrNull {
-            it.protocol == protocol && it.host.equals(profile.host, true) && it.port == profile.port &&
-                it.username == profile.username
-        }
-        val secretId = preserveOrStore(profile.password, existing?.secretId)
+        val all = profiles()
+        val existing = profile.id.takeIf(String::isNotBlank)?.let { id -> all.firstOrNull { it.id == id } }
+            ?: all.firstOrNull {
+                it.protocol == protocol && it.host.equals(profile.host, true) && it.port == profile.port &&
+                    it.username == profile.username
+            }
+        val secretId = storeOrClear(profile.password, existing?.secretId)
         return upsert(
             NetworkProfile(
-                id = existing?.id ?: UUID.randomUUID().toString(),
+                id = existing?.id ?: profile.id.takeIf(String::isNotBlank) ?: UUID.randomUUID().toString(),
                 name = profile.name,
                 protocol = protocol,
                 host = profile.host,
@@ -41,22 +43,32 @@ class NetworkProfileRepository(context: Context) {
     }
 
     fun save(profile: SmbProfile): NetworkProfile {
-        val existing = profiles().firstOrNull {
-            it.protocol == NetworkProtocol.SMB && it.host.equals(profile.host, true) &&
-                it.smbShare.equals(profile.share, true) && it.username == profile.username
+        val normalized = profile.normalizedSmbProfile()
+        val all = profiles()
+        val existing = normalized.id.takeIf(String::isNotBlank)?.let { id -> all.firstOrNull { it.id == id } }
+            ?: all.firstOrNull {
+                it.protocol == NetworkProtocol.SMB && it.host.equals(normalized.host, true) &&
+                    it.smbShare.equals(normalized.share, true) && it.username == normalized.username &&
+                    it.smbDomain.equals(normalized.domain, true)
+            }
+        val secretId = if (normalized.username.isBlank()) {
+            // Guest/anonymous mode must not keep an old password hidden in Keystore.
+            credentials.remove(existing?.secretId)
+            null
+        } else {
+            storeOrClear(normalized.password, existing?.secretId)
         }
-        val secretId = preserveOrStore(profile.password, existing?.secretId)
         return upsert(
             NetworkProfile(
-                id = existing?.id ?: UUID.randomUUID().toString(),
-                name = profile.name,
+                id = existing?.id ?: normalized.id.takeIf(String::isNotBlank) ?: UUID.randomUUID().toString(),
+                name = normalized.name,
                 protocol = NetworkProtocol.SMB,
-                host = profile.host,
+                host = normalized.host,
                 port = 445,
-                username = profile.username,
+                username = normalized.username,
                 secretId = secretId,
-                smbShare = profile.share,
-                smbDomain = profile.domain,
+                smbShare = normalized.share,
+                smbDomain = normalized.domain,
             )
         )
     }
@@ -80,7 +92,7 @@ class NetworkProfileRepository(context: Context) {
         } else {
             credentials.remove(existing?.sftpPrivateKeySecretId)
             credentials.remove(existing?.sftpKeyPassphraseSecretId)
-            passwordId = preserveOrStore(profile.password, existing?.secretId)
+            passwordId = storeOrClear(profile.password, existing?.secretId)
             privateKeyId = null
             passphraseId = null
         }
@@ -103,6 +115,7 @@ class NetworkProfileRepository(context: Context) {
     }
 
     fun ftp(profile: NetworkProfile): FtpProfile = FtpProfile(
+        id = profile.id,
         name = profile.name,
         host = profile.host,
         port = profile.port,
@@ -112,13 +125,14 @@ class NetworkProfileRepository(context: Context) {
     )
 
     fun smb(profile: NetworkProfile): SmbProfile = SmbProfile(
+        id = profile.id,
         name = profile.name,
         host = profile.host,
         share = profile.smbShare,
         username = profile.username,
         password = credentials.get(profile.secretId),
         domain = profile.smbDomain,
-    )
+    ).normalizedSmbProfile()
 
     fun sftp(profile: NetworkProfile): SftpProfile {
         require(profile.protocol == NetworkProtocol.SFTP) { "Профиль не является SFTP" }

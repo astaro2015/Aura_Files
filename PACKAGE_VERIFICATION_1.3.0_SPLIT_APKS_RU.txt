@@ -1,0 +1,31 @@
+Aura Files 1.3.0 SPLIT APKS — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.3.0, versionCode = 130.
+- InstalledAppsActivity: single APK share сохранён, SPLIT получает «Поделиться комплектом…».
+- На принимающей стороне добавлен явный путь: Очистка → Приложения → «Установить .APKS».
+- «Установить .APKS» использует системный ActivityResultContracts.OpenDocument и принимает custom MIME/ZIP/octet-stream/*/*, после выбора дополнительно проверяет расширение .apks.
+- SplitPackageInstallerActivity умеет принять URI через внутренний EXTRA_URI, ACTION_VIEW data, ACTION_SEND EXTRA_STREAM и ClipData.
+- Manifest регистрирует ACTION_VIEW custom MIME, ACTION_SEND custom MIME и .apks content-URI fallback для ZIP/octet-stream.
+- AuraApksBundle экспортирует sourceDir + все splitSourceDirs в один .apks.
+- ZIP не повторно сжимает уже сжатые APK (Deflater.NO_COMPRESSION level).
+- В контейнер добавляется META-INF/aura-apks.json с package/version/device/size/SHA-256.
+- Импорт защищён от traversal, повторов, отсутствующего base, неверных размеров и hash mismatch.
+- Base APK проверяется через PackageManager; split package/version/signers сверяются, когда PackageManager может разобрать standalone split.
+- Native ABI извлекаются из lib/<abi>/; очевидно несовместимый ABI блокируется до install session.
+- SplitPackageInstallerActivity использует одну PackageInstaller.Session MODE_FULL_INSTALL для всех APK.
+- openWrite names уникальны; все output streams закрываются до commit; fsync вызывается до закрытия каждого session stream.
+- targetSdk 35+ requirement mutable status PendingIntent учтён: FLAG_MUTABLE включается на Android 12+.
+- STATUS_PENDING_USER_ACTION запускает системное confirmation Intent; финальные PackageInstaller statuses преобразуются в понятные сообщения.
+- REQUEST_INSTALL_PACKAGES присутствует; canRequestPackageInstalls + ACTION_MANAGE_UNKNOWN_APP_SOURCES используются перед session install.
+- FileClassifier/EnhancedPreview/FileRepository/AuraFileManagerApp распознают .apks как APK-категорию.
+- BackendWorkspaceActivity открывает скачанный .apks встроенным SplitPackageInstallerActivity.
+- Android XML parse: 14 XML, 0 ошибок.
+- Kotlin syntax-like pass через kotlinc для InstalledAppsActivity.kt, SplitPackageInstallerActivity.kt и AuraFileManagerApp.kt: 0 expecting/unexpected/unclosed/syntax ошибок (unresolved Android/Compose symbols ожидаемы без Android SDK/dependencies).
+- AuraApksBundle.kt отдельно успешно скомпилирован kotlinc 1.9.0 с минимальными Android/JSON stubs: EXIT 0; чистая Kotlin-логика файла проходит semantic type-check.
+- Статические связки version/permissions/picker/ACTION_SEND/EnhancedPreview/PackageInstaller session проверены скриптом: все OK.
+
+Полная Gradle-компиляция в контейнере НЕ выполнена: реальный запуск `./gradlew --no-daemon :app:compileDebugKotlin` остановился до конфигурации проекта, потому что wrapper не смог скачать Gradle 9.5.0: `java.net.UnknownHostException: services.gradle.org`. Это ограничение сети среды, а не результат Android-компиляции исходников.
+
+SOURCE_SHA256SUMS.txt формируется самым последним шагом и затем сверяется с деревом и итоговым ZIP.

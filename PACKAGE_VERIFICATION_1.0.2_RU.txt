@@ -1,0 +1,15 @@
+Aura Files 1.0.2 — локальная проверка пакета
+Дата: 2026-09-04
+База: Aura Files 1.0.1 / GitHub 1.0 commit 63773f432aa700d042b57b8f98ad3091e209ea4d
+
+Проверено в текущей среде:
+- versionName 1.0.2 / versionCode 102 / compileSdk 36 / NDK 28.2.13676358.
+- Kotlin PSI: 83 .kt-файла под app/src разобраны, 0 синтаксических ошибок.
+- Android XML: 14 файлов, 0 ошибок разбора.
+- Новый индексный фикс точечно исключает только Android/data и Android/obb; общий IOException/SecurityException не подавляется.
+- Добавлен StorageIndexerPathPolicyTest для Android/data, Android/obb и обычных каталогов.
+- SOURCE_SHA256SUMS.txt пересоздан после всех изменений и проверяется повторно после упаковки.
+
+Полный Android Gradle build 1.0.2 в текущем контейнере НЕ заявляется пройденным:
+локальный Gradle 9.5.0 не скачан полностью, а services.gradle.org недоступен из этой среды.
+Контрольную сборку выполнить BUILD_ON_CLEAN_WINDOWS.bat.

@@ -120,7 +120,7 @@ class SftpServer(
             fileHandle: FileHandle?,
             file: Path,
             handle: String?,
-            options: Set<out OpenOption>,
+            options: Set<OpenOption>,
             vararg attrs: FileAttribute<*>,
         ): SeekableByteChannel {
             val writes = options.any {

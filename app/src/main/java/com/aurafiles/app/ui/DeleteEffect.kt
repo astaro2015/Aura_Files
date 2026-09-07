@@ -68,10 +68,10 @@ internal fun Modifier.auraDeleteEffect(
     if (mode == DeleteAnimationMode.Off) return this
 
     val maxStagger = when (mode) {
+        DeleteAnimationMode.Off -> 0
         DeleteAnimationMode.Dissolve -> DELETE_DISSOLVE_MAX_STAGGER_MS
         DeleteAnimationMode.Smoke -> DELETE_SAND_MAX_STAGGER_MS
         DeleteAnimationMode.Burn -> DELETE_BURN_MAX_STAGGER_MS
-        else -> 0
     }
     val delay = if (active && maxStagger > 0) {
         (seed and Int.MAX_VALUE) % (maxStagger + 1)

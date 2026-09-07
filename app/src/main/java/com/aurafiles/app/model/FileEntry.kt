@@ -13,6 +13,8 @@ data class FileEntry(
     val size: Long,
     val modifiedAt: Long,
     val parentUri: Uri? = null,
+    /** Non-null only for decrypted metadata views of the protected Aura vault. */
+    val vaultItemId: String? = null,
 )
 
 data class TrashRecord(
@@ -50,6 +52,16 @@ enum class FileSortMode {
 enum class FileViewMode {
     List,
     Grid,
+}
+
+enum class ImageSourceFilter {
+    All,
+    Camera,
+    Screenshots,
+    WhatsApp,
+    Telegram,
+    Downloads,
+    Other,
 }
 
 enum class SystemSoundType {
@@ -92,8 +104,10 @@ data class CategorySummary(
 
 data class StorageAnalysis(
     val files: List<FileEntry>,
+    val totalFileCount: Int = files.size,
     val totalBytes: Long,
     val categories: List<CategorySummary>,
+    val storageCategories: List<CategorySummary> = categories,
     val largeFiles: List<FileEntry>,
     val largeFileCount: Int = largeFiles.size,
     val duplicateGroups: List<List<FileEntry>>,
@@ -167,6 +181,7 @@ data class FtpProfile(
     val username: String,
     val password: String,
     val useTls: Boolean = false,
+    val id: String = "",
 )
 
 data class FtpEntry(
@@ -238,6 +253,7 @@ data class SmbProfile(
     val username: String,
     val password: String,
     val domain: String = "",
+    val id: String = "",
 )
 
 data class SmbEntry(
@@ -246,6 +262,9 @@ data class SmbEntry(
     val isDirectory: Boolean,
     val size: Long,
     val modifiedAt: Long,
+    // Directory junctions/symlinks/reparse points may lead outside the visible tree or form
+    // cycles. Browsing is allowed, but recursive copy/delete must never follow them blindly.
+    val isReparsePoint: Boolean = false,
 )
 
 enum class StorageAccessMode {

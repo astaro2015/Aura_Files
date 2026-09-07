@@ -25,7 +25,7 @@ class SmbTransferGatewayAdapter(
         controller.checkpoint()
         var previous = 0L
         var previousName = ""
-        repository.upload(listOf(source.uri)) { name, written, total ->
+        repository.upload(listOf(source.uri), destination.directoryPath, refreshListing = false) { name, written, total ->
             controller.checkpointBlocking()
             val started = written == 0L || name != previousName
             if (started) {
@@ -56,6 +56,7 @@ class SmbTransferGatewayAdapter(
                 isDirectory = source.isDirectory,
                 size = source.size,
                 modifiedAt = source.modifiedAt,
+                isReparsePoint = source.isReparsePoint,
             ),
             local,
         ) { name, written, total ->

@@ -1,0 +1,70 @@
+Aura Files 1.2.0 CLOUD — Stage 5 package verification
+Дата: 2026-09-06
+
+СТАТУС
+======
+Кодовая ревизия Stage 1–4 выполнена, найденные cloud-ошибки исправлены.
+Google Drive интегрирован как StorageBackend.
+Photoslice и отдельные cloud trash views намеренно исключены из плана.
+
+ПРОВЕРКИ ИСХОДНОГО ДЕРЕВА
+=========================
+1. Kotlin/KTS PSI parser
+   - файлов: 117
+   - syntax errors: 0
+
+2. Android XML
+   - файлов: 14
+   - parse errors: 0
+
+3. Version metadata
+   - versionName = 1.2.0
+   - versionCode = 120
+
+4. Secret/logging scan
+   - явного println/Log с accessToken / refreshToken / deviceCode не найдено
+   - GoogleAuthorizationStep.Granted.toString() редактирует access token как <redacted>
+
+GOOGLE DRIVE
+============
+- Google core + GIS wrapper собраны отдельным kotlinc compile-smoke со стабами актуальных публичных сигнатур AuthorizationClient API: OK
+- AuthorizationResult.grantedScopes моделируется как List<String>: OK
+- Local-like backend -> GoogleDriveStorageBackend через BackendTransferCore: OK
+  результат smoke: TRANSFER_GOOGLE_SMOKE_OK completed=1 invalidations=1 expectedSize=12
+- HTTP 401 -> один invalidate access token -> один повтор: OK
+- expectedSize передаётся в upload: OK
+- duplicate-name guard для compare/sync: OK
+  результат smoke: COMPARE_DUPLICATE_GUARD_OK
+- существующие объекты адресуются реальным Google fileId: проверено кодом/tests
+- неизвестный размер upload: spool во временный app-private файл -> fixed Content-Length
+- Google Workspace export mappings присутствуют: DOCX/XLSX/PPTX/PDF
+
+YANDEX DISK
+===========
+- backend core повторно собран отдельным kotlinc compile-smoke: OK
+- HTTP 401 refresh/retry regression: OK
+- fixed-size upload regression: OK
+  результат smoke: YANDEX_SMOKE_OK tokenCalls=6 expectedSize=77
+- operation polling использует coroutine delay, не Thread.sleep
+- OAuth Client ID хранится на профиле авторизации
+- hasStoredTokens требует успешной расшифровки token blob
+
+WINDOWS BUILD / GRADLE
+======================
+Пользовательский build.log для исходной базы 1.0.4 подтверждает реальный Windows build Gradle 9.5.0 до :app:assembleDebug / BUILD SUCCESSFUL.
+Ранее присланный LAST_ERROR был checksum-защитой SOURCE_SHA256SUMS.txt, а не ошибкой Kotlin/Gradle: после позднего изменения 00_CODEX_TASK.md manifest оказался устаревшим.
+
+Полный Android Gradle build именно этого изменённого 1.2.0 в контейнере НЕ выполнялся: в контейнере нет готового Android SDK/Gradle distribution и полного Maven cache. Поэтому окончательная Android/AGP типовая проверка должна быть выполнена штатным BUILD_ON_CLEAN_WINDOWS.bat или Gradle на Windows.
+
+ФИНАЛЬНАЯ УПАКОВКА
+==================
+- SOURCE_SHA256SUMS.txt генерируется ПОСЛЕ всех документов и исходников и не включает сам себя.
+- bootstrap_windows.ps1 проверяет каждый manifest entry до staging.
+- лишние файлы исходной папки Windows builder игнорирует.
+- ZIP проверяется через unzip -t.
+- build/.gradle/.idea/__pycache__/BUILD_OUTPUT, APK/AAB/class и временные *.part в пакет не входят.
+
+ИТОГ
+====
+Stage 5 source package готов для реального Windows build + OAuth regression.
+Если Windows build обнаружит ошибку, исправлять от полного Stage 5 ZIP, не накладывая отдельные файлы поверх распакованного дерева.

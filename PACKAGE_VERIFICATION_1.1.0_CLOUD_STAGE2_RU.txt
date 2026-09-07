@@ -1,0 +1,49 @@
+Aura Files 1.1.0 CLOUD — проверка этапа 2
+Дата: 2026-09-06
+
+Входной пакет этапа:
+- Aura_Files_1.1.0_CLOUD_STAGE1_source.zip
+- SHA-256: b562244f438a215672002231c836e6e88129440c332e474feb0f4c3720203dd5
+
+Проверено по актуальной документации Яндекса:
+- device-code: POST https://oauth.yandex.ru/device/code;
+- token exchange: POST https://oauth.yandex.ru/token, grant_type=device_code;
+- refresh: POST https://oauth.yandex.ru/token, grant_type=refresh_token;
+- refresh может вернуть новый refresh token, который требуется сохранять;
+- проверка Disk token: GET https://cloud-api.yandex.net/v1/disk/ с Authorization: OAuth <token>.
+
+Проверено в контейнере:
+- Yandex pure smoke (error mapping, token expiry, refresh-token merge, redacted secrets): OK;
+- Yandex core kotlinc compile с минимальными JVM stubs для Android CloudProfileRepository и org.json: OK;
+- Kotlin PSI parse: 98 Kotlin-файлов, 0 синтаксических ошибок;
+- Android XML parse: 14 файлов, 0 ошибок;
+- whitespace audit изменённых исходников/checkpoint: 11 файлов, 0 проблем;
+- Stage 1 -> Stage 2 app/src diff: изменён CloudAuthTokens.kt, добавлены только cloud/yandex main + test файлы;
+- Yandex core logging scan: Log/println/printStackTrace отсутствуют;
+- secret-bearing toString redaction проверена smoke-тестом;
+- app metadata не повышены: versionName 1.0.4 / versionCode 104;
+- Photoslice не подключён к Yandex OAuth/API core (только комментарий об архитектурной изоляции).
+
+Дополнительные защитные решения:
+- новый аккаунт сохраняется только после успешного Disk API info запроса;
+- access+refresh token rotation сохраняется через защищённый CloudTokenStore этапа 1;
+- при отсутствии нового refresh token сохраняется предыдущий;
+- refresh accessToken синхронизирован, чтобы параллельные операции не обновляли один refresh token одновременно;
+- OAuth request body, Authorization header и OAuth response body не печатаются в toString;
+- access token / refresh token / client secret / device_code редактируются в строковом представлении моделей.
+
+Полный Android Gradle build НЕ заявляется пройденным:
+- команда: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+- Gradle wrapper попытался получить gradle-9.5.0-bin.zip;
+- среда не разрешает services.gradle.org (UnknownHostException), поэтому Gradle не стартовал;
+- это ограничение текущей среды. Ошибка компиляции проекта Gradle-ом не была получена, потому что сам Gradle не загрузился.
+
+Следующая контрольная сборка на Windows/CI:
+  gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon
+
+Следующий этап разработки:
+- YandexDiskStorageBackend поверх официального REST API и общего StorageBackend/transfer core;
+- list/stat/download/upload/mkdir/rename/move/delete;
+- ровно один refresh/retry после 401;
+- fake transport/backend regression tests;
+- до фиксации этих проверок backend не регистрировать в основных пользовательских панелях.

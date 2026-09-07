@@ -1,0 +1,21 @@
+Aura Files 1.2.8 CLOUD THEME — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.2.8, versionCode = 128.
+- BackendWorkspaceActivity: root workspace обёрнут в Material3 Surface(background/onBackground).
+- Safe-area padding statusBars/navigationBars сохранён внутри Surface.
+- Заголовок cloud browser и Back используют onBackground.
+- Refresh / 2 панели / Create folder используют единый onSurface; busy-state = 38% alpha.
+- TextButton «2 панели» больше не оставляет primary-синий цвет по умолчанию.
+- В корне Yandex/Google верхний заголовок = имя провайдера, descriptor/profile остаётся в breadcrumb.
+- Kotlin compiler syntax pass для изменённого BackendWorkspaceActivity.kt: parser дошёл до semantic unresolved Android/Compose refs; ошибок вида expecting/unexpected/missing нет.
+- Kotlin/KTS файлов в дереве: 120.
+- Android XML parse: 14 файлов, 0 ошибок.
+
+Полная Gradle-компиляция в текущем контейнере НЕ выполнена: wrapper требует Gradle 9.5.0 и пытается скачать
+https://services.gradle.org/distributions/gradle-9.5.0-bin.zip,
+но среда не разрешает DNS для services.gradle.org (UnknownHostException).
+Это ограничение среды проверки, а не подтверждение успешной Android-компиляции.
+
+SOURCE_SHA256SUMS.txt формируется последним шагом; после него ZIP проверяется unzip -t и отдельной сверкой manifest.

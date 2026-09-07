@@ -5,7 +5,6 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.security.KeyStore
-import java.security.SecureRandom
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -16,9 +15,10 @@ class CredentialStore(context: Context) {
     private val preferences = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
     fun put(secret: String, id: String = UUID.randomUUID().toString()): String {
-        val iv = ByteArray(IV_BYTES).also(SecureRandom()::nextBytes)
         val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey(), GCMParameterSpec(TAG_BITS, iv))
+        cipher.init(Cipher.ENCRYPT_MODE, encryptionKey())
+        val iv = cipher.iv
+        require(iv.size == IV_BYTES) { "Неожиданный размер IV Android Keystore: ${iv.size}" }
         val encrypted = cipher.doFinal(secret.toByteArray(Charsets.UTF_8))
         val payload = Base64.encodeToString(iv + encrypted, Base64.NO_WRAP)
         preferences.edit().putString(id, payload).apply()

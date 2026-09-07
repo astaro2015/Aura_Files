@@ -5,10 +5,13 @@ import android.net.Uri
 import android.os.SystemClock
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.data.FastDocumentListing
+import com.aurafiles.app.data.AuraVault
 import com.aurafiles.app.model.CategorySummary
 import com.aurafiles.app.model.FileCategory
 import com.aurafiles.app.model.FileClassifier
 import com.aurafiles.app.model.FileEntry
+import com.aurafiles.app.model.FileSortMode
+import com.aurafiles.app.model.ImageSourceFilter
 import com.aurafiles.app.model.StorageAnalysis
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -33,6 +36,15 @@ data class IndexScanProgress(
     val currentFile: String = "",
 )
 
+internal fun isProtectedAndroidSharedPath(path: String): Boolean {
+    if (path.isBlank()) return false
+    val normalized = path.replace('\\', '/').trimEnd('/').lowercase()
+    return normalized.endsWith("/android/data") ||
+        normalized.contains("/android/data/") ||
+        normalized.endsWith("/android/obb") ||
+        normalized.contains("/android/obb/")
+}
+
 class StorageIndexer(
     context: Context,
     database: AuraIndexDatabase = AuraIndexDatabase.get(context),
@@ -44,9 +56,16 @@ class StorageIndexer(
     private val _progress = MutableStateFlow(IndexScanProgress())
     val progress: StateFlow<IndexScanProgress> = _progress.asStateFlow()
     private var lastProgressAt = 0L
+    var skippedProtectedDirectoryCount: Int = 0
+        private set
 
-    suspend fun scan(root: DocumentFile): StorageAnalysis {
+    suspend fun scan(
+        root: DocumentFile,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): StorageAnalysis {
         require(root.isDirectory) { "Корень индекса должен быть папкой" }
+        skippedProtectedDirectoryCount = 0
         val rootId = root.uri.toString()
         val generation = System.currentTimeMillis()
         val previousRoot = rootDao.get(rootId)
@@ -84,9 +103,18 @@ class StorageIndexer(
             )
             for (child in FastDocumentListing.list(appContext, directory)) {
                 currentCoroutineContext().ensureActive()
-                if (child.name == TRASH_FOLDER) continue
+                if (child.name == TRASH_FOLDER || child.name == AuraVault.VAULT_FOLDER) continue
                 val childPath = if (relativePath.isBlank()) child.name else "$relativePath/${child.name}"
                 if (child.isDirectory) {
+                    // Android intentionally blocks third-party apps from enumerating other apps'
+                    // private external-storage trees even when MANAGE_EXTERNAL_STORAGE is granted.
+                    // Treat only those well-known protected trees as out of scope for analysis.
+                    // Do not swallow generic I/O failures here: a disconnected SD/USB volume must
+                    // still fail the scan instead of producing a falsely "complete" index.
+                    if (isProtectedAndroidSharedPath(child.uri.path.orEmpty())) {
+                        skippedProtectedDirectoryCount += 1
+                        continue
+                    }
                     walk(child.document, childPath)
                     continue
                 }
@@ -143,7 +171,7 @@ class StorageIndexer(
                     generation,
                 )
             )
-            val analysis = buildAnalysis(rootId, duplicateEntities, completedAt)
+            val analysis = buildAnalysis(rootId, duplicateEntities, completedAt, showHidden, showThumbnails)
             publish(IndexScanProgress(IndexScanState.COMPLETED, count, bytes), force = true)
             analysis
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -155,31 +183,104 @@ class StorageIndexer(
         }
     }
 
-    fun load(root: DocumentFile): StorageAnalysis? {
+    fun load(
+        root: DocumentFile,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): StorageAnalysis? {
         val rootId = root.uri.toString()
         val indexedRoot = rootDao.get(rootId)?.takeIf { it.lastScanCompleted > 0L } ?: return null
-        return buildAnalysis(rootId, loadDuplicateGroups(rootId), indexedRoot.lastScanCompleted)
+        return buildAnalysis(rootId, loadDuplicateGroups(rootId), indexedRoot.lastScanCompleted, showHidden, showThumbnails)
     }
 
-    fun categoryEntries(root: DocumentFile, category: FileCategory, limit: Int = UI_QUERY_LIMIT): List<FileEntry> {
+    fun imageEntriesPage(
+        root: DocumentFile,
+        sourceFilter: ImageSourceFilter,
+        query: String,
+        sortMode: FileSortMode,
+        ascending: Boolean,
+        offset: Int,
+        limit: Int = IMAGE_PAGE_SIZE,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): List<FileEntry> {
+        val rootId = root.uri.toString()
+        return resolveAndPrune(
+            rootId,
+            fileDao.visibleImagesPage(
+                rootId,
+                sourceFilter.name,
+                query.trim(),
+                sortMode.name,
+                ascending,
+                limit,
+                offset,
+                showHidden,
+                showThumbnails,
+            ),
+        )
+    }
+
+    fun imageEntryCount(
+        root: DocumentFile,
+        sourceFilter: ImageSourceFilter,
+        query: String,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): Int = fileDao.visibleImageCount(
+        root.uri.toString(),
+        sourceFilter.name,
+        query.trim(),
+        showHidden,
+        showThumbnails,
+    ).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+
+    fun categoryEntries(
+        root: DocumentFile,
+        category: FileCategory,
+        limit: Int = UI_QUERY_LIMIT,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): List<FileEntry> {
         val rootId = root.uri.toString()
         val entities = when (category) {
-            FileCategory.Downloads -> fileDao.bySourceFolder(root.uri.toString(), "Загрузки", limit)
-            FileCategory.Camera -> fileDao.bySourceFolder(root.uri.toString(), "Камера", limit)
-            FileCategory.Books -> fileDao.books(root.uri.toString(), limit)
-            else -> fileDao.byCategory(root.uri.toString(), category.name, limit)
+            FileCategory.Downloads -> fileDao.visibleBySourceFolder(rootId, "Загрузки", limit, showHidden, showThumbnails)
+            FileCategory.Camera -> fileDao.visibleBySourceFolder(rootId, "Камера", limit, showHidden, showThumbnails)
+            FileCategory.Books -> fileDao.visibleBooks(rootId, limit, showHidden, showThumbnails)
+            else -> fileDao.visibleByCategory(rootId, category.name, limit, showHidden, showThumbnails)
         }
         return resolveAndPrune(rootId, entities)
     }
 
-    fun temporaryEntries(root: DocumentFile, limit: Int = UI_QUERY_LIMIT): List<FileEntry> =
-        resolveAndPrune(root.uri.toString(), fileDao.temporary(root.uri.toString(), limit))
+    fun temporaryEntries(
+        root: DocumentFile,
+        limit: Int = UI_QUERY_LIMIT,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): List<FileEntry> = resolveAndPrune(
+        root.uri.toString(),
+        fileDao.visibleTemporary(root.uri.toString(), limit, showHidden, showThumbnails),
+    )
 
-    fun largeEntries(root: DocumentFile, limit: Int = UI_QUERY_LIMIT): List<FileEntry> =
-        resolveAndPrune(root.uri.toString(), fileDao.largestAtLeast(root.uri.toString(), LARGE_FILE_BYTES, limit))
+    fun largeEntries(
+        root: DocumentFile,
+        limit: Int = UI_QUERY_LIMIT,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): List<FileEntry> = resolveAndPrune(
+        root.uri.toString(),
+        fileDao.visibleLargestAtLeast(root.uri.toString(), LARGE_FILE_BYTES, limit, showHidden, showThumbnails),
+    )
 
-    fun recentEntries(root: DocumentFile, limit: Int = 500): List<FileEntry> =
-        resolveAndPrune(root.uri.toString(), fileDao.recent(root.uri.toString(), limit))
+    fun recentEntries(
+        root: DocumentFile,
+        limit: Int = 500,
+        showHidden: Boolean = false,
+        showThumbnails: Boolean = false,
+    ): List<FileEntry> = resolveAndPrune(
+        root.uri.toString(),
+        fileDao.visibleRecent(root.uri.toString(), limit, showHidden, showThumbnails),
+    )
 
     fun clear(root: DocumentFile) {
         fileDao.deleteRoot(root.uri.toString())
@@ -235,11 +336,17 @@ class StorageIndexer(
         rootId: String,
         duplicateEntities: List<List<IndexedFileEntity>>,
         scannedAt: Long,
+        showHidden: Boolean,
+        showThumbnails: Boolean,
     ): StorageAnalysis {
-        val categoryStats = fileDao.categoryAggregates(rootId).associateBy { it.category }
-        val sourceStats = fileDao.sourceAggregates(rootId).associateBy { it.sourceFolder }
-        val bookCount = fileDao.bookCount(rootId)
-        val bookBytes = fileDao.bookBytes(rootId)
+        val categoryStats = fileDao.visibleCategoryAggregates(rootId, showHidden, showThumbnails).associateBy { it.category }
+        val sourceStats = fileDao.visibleSourceAggregates(rootId, showHidden, showThumbnails).associateBy { it.sourceFolder }
+        val bookCount = fileDao.visibleBookCount(rootId, showHidden, showThumbnails)
+        val bookBytes = fileDao.visibleBookBytes(rootId, showHidden, showThumbnails)
+        val storageCategories = FileCategory.entries.map { category ->
+            val stat = categoryStats[category.name]?.let { it.count to it.bytes } ?: (0L to 0L)
+            CategorySummary(category, stat.first.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), stat.second)
+        }
         val categories = FileCategory.entries.map { category ->
             val stat = when (category) {
                 FileCategory.Downloads -> sourceStats["Загрузки"]?.let { it.count to it.bytes }
@@ -249,18 +356,26 @@ class StorageIndexer(
             } ?: (0L to 0L)
             CategorySummary(category, stat.first.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(), stat.second)
         }
+        val visibleDuplicates = duplicateEntities.map { group ->
+            group.filter { entity ->
+                (showHidden || !entity.name.startsWith('.')) &&
+                    (showThumbnails || entity.sourceFolder != "Миниатюры и кэш")
+            }.mapNotNull(::toEntryFast)
+        }.filter { it.size > 1 }
         return StorageAnalysis(
-            // This is only a small UI cache for Recent. Recommendation counters below are
-            // deliberately queried from the complete Room index, so they cannot show stale
-            // values merely because a matching file is outside this 2,000-item window.
-            files = fileDao.recent(rootId, UI_CACHE_LIMIT).mapNotNull(::toEntryFast),
+            // `files` remains a bounded Recent cache; all counters below come from the full Room index.
+            files = fileDao.visibleRecent(rootId, UI_CACHE_LIMIT, showHidden, showThumbnails).mapNotNull(::toEntryFast),
+            totalFileCount = fileDao.count(rootId).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
             totalBytes = fileDao.totalBytes(rootId),
             categories = categories,
-            largeFiles = fileDao.largestAtLeast(rootId, LARGE_FILE_BYTES, 50).mapNotNull(::toEntryFast),
-            largeFileCount = fileDao.largeCount(rootId, LARGE_FILE_BYTES).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-            duplicateGroups = duplicateEntities.map { group -> group.mapNotNull(::toEntryFast) }.filter { it.size > 1 },
-            temporaryFileCount = fileDao.temporaryCount(rootId).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-            temporaryBytes = fileDao.temporaryBytes(rootId),
+            storageCategories = storageCategories,
+            largeFiles = fileDao.visibleLargestAtLeast(rootId, LARGE_FILE_BYTES, 50, showHidden, showThumbnails).mapNotNull(::toEntryFast),
+            largeFileCount = fileDao.visibleLargeCount(rootId, LARGE_FILE_BYTES, showHidden, showThumbnails)
+                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            duplicateGroups = visibleDuplicates,
+            temporaryFileCount = fileDao.visibleTemporaryCount(rootId, showHidden, showThumbnails)
+                .coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            temporaryBytes = fileDao.visibleTemporaryBytes(rootId, showHidden, showThumbnails),
             limitReached = false,
             scannedAt = scannedAt,
         )
@@ -311,6 +426,7 @@ class StorageIndexer(
     companion object {
         private const val BATCH_SIZE = 750
         private const val UI_CACHE_LIMIT = 2_000
+        const val IMAGE_PAGE_SIZE = 400
         private const val UI_QUERY_LIMIT = 5_000
         private const val PROGRESS_INTERVAL_MS = 200L
         private const val TRASH_FOLDER = ".AuraTrash"

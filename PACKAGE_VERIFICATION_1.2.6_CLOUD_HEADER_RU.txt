@@ -1,0 +1,20 @@
+Aura Files 1.2.6 CLOUD HEADER — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.2.6, versionCode = 126.
+- Однопанельный backend header содержит только Назад + название.
+- Обновить / 2 панели / Создать папку перенесены в строку BackendBreadcrumbs.
+- Действия используют те же callback'и 1.2.5: refresh / dual-pane / createFolder; backend-логика не заменялась.
+- Действия заблокированы при busy=true.
+- BackendWorkspaceActivity использует statusBarsPadding + navigationBarsPadding.
+- Kotlin/KTS PSI syntax scan: 120 файлов, 0 syntax errors.
+- Android XML parse: 14 файлов, 0 ошибок.
+- Проверка Icons.Rounded/AutoMirrored импортов для BackendWorkspaceActivity: пропусков нет.
+
+Полная Gradle-компиляция в текущем контейнере НЕ выполнена: wrapper требует Gradle 9.5.0 и пытается скачать
+https://services.gradle.org/distributions/gradle-9.5.0-bin.zip,
+но среда не разрешает DNS для services.gradle.org (UnknownHostException).
+Это ограничение среды проверки, а не диагностированная ошибка исходников.
+
+После всех изменений SOURCE_SHA256SUMS.txt пересчитать последним шагом; ZIP проверить unzip -t.

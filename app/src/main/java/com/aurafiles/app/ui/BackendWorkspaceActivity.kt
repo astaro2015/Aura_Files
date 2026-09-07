@@ -1,12 +1,28 @@
 package com.aurafiles.app.ui
 
+import android.app.Activity
+import android.app.PendingIntent
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.os.Bundle
+import android.net.Uri
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.result.IntentSenderRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
+import androidx.lifecycle.SavedStateViewModelFactory
+import androidx.core.content.FileProvider
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.draganddrop.dragAndDropSource
 import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.horizontalScroll
@@ -19,27 +35,47 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
+import androidx.compose.material.icons.automirrored.rounded.CompareArrows
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
-import androidx.compose.material.icons.rounded.CompareArrows
+import androidx.compose.material.icons.rounded.Cloud
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ContentCopy
+import androidx.compose.material.icons.rounded.ContentCut
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DriveFileRenameOutline
+import androidx.compose.material.icons.rounded.Launch
 import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Movie
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Storage
+import androidx.compose.material.icons.rounded.Splitscreen
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material3.AlertDialog
@@ -64,6 +100,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -79,14 +116,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aurafiles.app.backend.StorageBackendDescriptor
+import com.aurafiles.app.backend.StorageBackendKind
 import com.aurafiles.app.data.FileRepository
 import com.aurafiles.app.backend.StorageItem
+import com.aurafiles.app.model.FileSortMode
+import com.aurafiles.app.model.FileViewMode
 import com.aurafiles.app.model.SftpProfile
 import com.aurafiles.app.sync.DirectoryDifference
 import com.aurafiles.app.sync.SyncDirection
 import com.aurafiles.app.transfer.TransferConflictPolicy
 import com.aurafiles.app.transfer.TransferState
 import com.aurafiles.app.ui.theme.AuraFilesTheme
+import java.io.File
 import java.text.DateFormat
 import java.util.Date
 import java.util.UUID
@@ -94,11 +135,24 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 class BackendWorkspaceActivity : ComponentActivity() {
-    private val viewModel: BackendWorkspaceViewModel by viewModels()
+    private val viewModel: BackendWorkspaceViewModel by viewModels {
+        SavedStateViewModelFactory(application, this)
+    }
+    private val googleAuthorizationLauncher = registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        viewModel.completeGoogleAuthorization(
+            data = result.data,
+            resultCode = result.resultCode,
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val initialBackendId = intent.getStringExtra(EXTRA_INITIAL_BACKEND_ID)
+        val addYandexOnOpen = intent.getBooleanExtra(EXTRA_ADD_YANDEX, false)
+        val addGoogleOnOpen = intent.getBooleanExtra(EXTRA_ADD_GOOGLE, false)
+        val singlePane = intent.getBooleanExtra(EXTRA_SINGLE_PANE, false)
         setContent {
             AuraFilesTheme {
                 val state by viewModel.state.collectAsState()
@@ -106,6 +160,32 @@ class BackendWorkspaceActivity : ComponentActivity() {
                     state = state,
                     viewModel = viewModel,
                     initialBackendId = initialBackendId,
+                    addYandexOnOpen = addYandexOnOpen,
+                    addGoogleOnOpen = addGoogleOnOpen,
+                    singlePane = singlePane,
+                    onLaunchGoogleResolution = { pending ->
+                        viewModel.markGoogleResolutionLaunched()
+                        googleAuthorizationLauncher.launch(
+                            IntentSenderRequest.Builder(pending.intentSender).build()
+                        )
+                    },
+                    onReopenBackend = { backendId ->
+                        viewModel.consumeReopenBackendRequest()
+                        startActivity(
+                            Intent(this, BackendWorkspaceActivity::class.java)
+                                .putExtra(EXTRA_INITIAL_BACKEND_ID, backendId)
+                                .putExtra(EXTRA_SINGLE_PANE, singlePane)
+                        )
+                        finish()
+                    },
+                    onSwitchToDualPane = { backendId ->
+                        startActivity(
+                            Intent(this, BackendWorkspaceActivity::class.java)
+                                .putExtra(EXTRA_INITIAL_BACKEND_ID, backendId)
+                                .putExtra(EXTRA_SINGLE_PANE, false)
+                        )
+                        finish()
+                    },
                     onClose = ::finish,
                 )
             }
@@ -114,6 +194,9 @@ class BackendWorkspaceActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_INITIAL_BACKEND_ID = "com.aurafiles.app.extra.INITIAL_BACKEND_ID"
+        const val EXTRA_ADD_YANDEX = "com.aurafiles.app.extra.ADD_YANDEX"
+        const val EXTRA_ADD_GOOGLE = "com.aurafiles.app.extra.ADD_GOOGLE"
+        const val EXTRA_SINGLE_PANE = "com.aurafiles.app.extra.SINGLE_PANE"
     }
 }
 
@@ -122,42 +205,130 @@ private fun BackendWorkspaceScreen(
     state: WorkspaceState,
     viewModel: BackendWorkspaceViewModel,
     initialBackendId: String?,
+    addYandexOnOpen: Boolean,
+    addGoogleOnOpen: Boolean,
+    singlePane: Boolean,
+    onLaunchGoogleResolution: (PendingIntent) -> Unit,
+    onReopenBackend: (String) -> Unit,
+    onSwitchToDualPane: (String) -> Unit,
     onClose: () -> Unit,
 ) {
     var sftpDialog by remember { mutableStateOf(false) }
-    var initialBackendApplied by remember(initialBackendId) { mutableStateOf(false) }
+    var addMenuOpen by remember { mutableStateOf(false) }
+    var addYandexApplied by rememberSaveable(addYandexOnOpen) { mutableStateOf(false) }
+    var addGoogleApplied by rememberSaveable(addGoogleOnOpen) { mutableStateOf(false) }
+    var initialBackendApplied by rememberSaveable(initialBackendId) { mutableStateOf(false) }
     LaunchedEffect(state.message) {
         if (state.message != null) {
             delay(10_000L)
             viewModel.dismissMessage()
         }
     }
-    LaunchedEffect(initialBackendId, state.backends, initialBackendApplied) {
+    LaunchedEffect(initialBackendId, state.backends, state.cloudProfiles, initialBackendApplied) {
         val backendId = initialBackendId ?: return@LaunchedEffect
-        if (!initialBackendApplied && state.backends.any { it.id == backendId }) {
+        if (!initialBackendApplied && (state.backends.isNotEmpty() || state.cloudProfiles.isNotEmpty())) {
             viewModel.openBackendFromNetwork(backendId)
             initialBackendApplied = true
         }
     }
+    LaunchedEffect(addYandexOnOpen, addYandexApplied) {
+        if (addYandexOnOpen && !addYandexApplied) {
+            addYandexApplied = true
+            viewModel.showAddYandexDialog()
+        }
+    }
+    LaunchedEffect(addGoogleOnOpen, addGoogleApplied) {
+        if (addGoogleOnOpen && !addGoogleApplied) {
+            addGoogleApplied = true
+            viewModel.showAddGoogleDialog()
+        }
+    }
+    val googleResolution = (state.googleAuth as? GoogleAuthUiState.NeedsResolution)?.pendingIntent
+    LaunchedEffect(googleResolution) {
+        if (googleResolution != null) onLaunchGoogleResolution(googleResolution)
+    }
+    LaunchedEffect(state.reopenBackendId) {
+        state.reopenBackendId?.let(onReopenBackend)
+    }
     var toolsOpen by remember { mutableStateOf(false) }
     var dragMove by remember { mutableStateOf(false) }
     val context = LocalContext.current
-    Column(Modifier.fillMaxSize()) {
-        Row(
+    LaunchedEffect(state.openFileRequest) {
+        val request = state.openFileRequest ?: return@LaunchedEffect
+        viewModel.consumeOpenFileRequest()
+        runCatching {
+            val file = File(request.absolutePath)
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            if (request.displayName.substringAfterLast('.', "").equals("apks", ignoreCase = true)) {
+                SplitPackageInstallerActivity.start(context, uri, request.displayName)
+            } else {
+                val intent = Intent(Intent.ACTION_VIEW)
+                    .setDataAndType(uri, request.mimeType ?: "application/octet-stream")
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                context.startActivity(intent)
+            }
+        }.onFailure { error ->
+            Toast.makeText(context, error.message ?: "Не удалось открыть ${request.displayName}", Toast.LENGTH_LONG).show()
+        }
+    }
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground,
+    ) {
+        Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+        if (!singlePane) Row(
             Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             IconButton(onClick = onClose) { Icon(Icons.Rounded.Close, contentDescription = "Закрыть") }
             Column(Modifier.weight(1f)) {
                 val openedForSftp = initialBackendId?.startsWith("sftp:") == true
-                Text(if (openedForSftp) "SFTP" else "Универсальные панели", fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+                val openedForYandex = initialBackendId?.startsWith("yandex:") == true
+                val openedForGoogle = initialBackendId?.startsWith("google:") == true
                 Text(
-                    if (openedForSftp) "SFTP-сервер · локальное хранилище" else "Local · SMB · FTP · SFTP",
+                    when {
+                        openedForYandex -> "Яндекс.Диск"
+                        openedForGoogle -> "Google Drive"
+                        openedForSftp -> "SFTP"
+                        else -> "Универсальные панели"
+                    },
+                    fontSize = 21.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    when {
+                        openedForYandex -> if (singlePane) "Файлы в Яндекс.Диске" else "Яндекс.Диск · локальное хранилище"
+                        openedForGoogle -> if (singlePane) "Файлы в Google Drive" else "Google Drive · локальное хранилище"
+                        openedForSftp -> "SFTP-сервер · локальное хранилище"
+                        else -> "Local · SMB · FTP · SFTP · Яндекс.Диск · Google Drive"
+                    },
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            IconButton(onClick = { sftpDialog = true }) { Icon(Icons.Rounded.Add, contentDescription = "Добавить SFTP") }
+            if (!singlePane) {
+                Box {
+                    IconButton(onClick = { addMenuOpen = true }) { Icon(Icons.Rounded.Add, contentDescription = "Добавить подключение") }
+                    DropdownMenu(expanded = addMenuOpen, onDismissRequest = { addMenuOpen = false }) {
+                        DropdownMenuItem(
+                            leadingIcon = { Icon(Icons.Rounded.Cloud, contentDescription = null) },
+                            text = { Text("Яндекс.Диск") },
+                            onClick = { addMenuOpen = false; viewModel.showAddYandexDialog() },
+                        )
+                        DropdownMenuItem(
+                            leadingIcon = { Icon(Icons.Rounded.Cloud, contentDescription = null) },
+                            text = { Text("Google Drive") },
+                            onClick = { addMenuOpen = false; viewModel.showAddGoogleDialog() },
+                        )
+                        DropdownMenuItem(
+                            leadingIcon = { Icon(Icons.Rounded.Storage, contentDescription = null) },
+                            text = { Text("SFTP") },
+                            onClick = { addMenuOpen = false; sftpDialog = true },
+                        )
+                    }
+                }
+            }
             Box {
                 IconButton(onClick = { toolsOpen = true }) { Icon(Icons.Rounded.MoreHoriz, contentDescription = "Инструменты") }
                 DropdownMenu(expanded = toolsOpen, onDismissRequest = { toolsOpen = false }) {
@@ -165,21 +336,58 @@ private fun BackendWorkspaceScreen(
                         text = { Text("Похожие фотографии") },
                         onClick = { toolsOpen = false; context.startActivity(Intent(context, SimilarPhotosActivity::class.java)) },
                     )
+                    if (!singlePane) {
+                        DropdownMenuItem(
+                            text = { Text("Drag & Drop: ${if (dragMove) "перемещать" else "копировать"}") },
+                            onClick = { dragMove = !dragMove },
+                        )
+                    }
+                    if (singlePane) {
+                        DropdownMenuItem(
+                            text = { Text("Двухпанельный режим") },
+                            onClick = {
+                                toolsOpen = false
+                                state.left.backendId?.let(onSwitchToDualPane)
+                            },
+                        )
+                    }
                     DropdownMenuItem(
-                        text = { Text("Drag & Drop: ${if (dragMove) "перемещать" else "копировать"}") },
-                        onClick = { dragMove = !dragMove },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Настройки 0.14") },
+                        text = { Text("Расширенные настройки") },
                         onClick = { toolsOpen = false; context.startActivity(Intent(context, AdvancedSettingsActivity::class.java)) },
                     )
                 }
             }
-            IconButton(onClick = viewModel::comparePanels, enabled = state.busyLabel == null) {
-                Icon(Icons.Rounded.CompareArrows, contentDescription = "Сравнить панели")
+            if (!singlePane) {
+                IconButton(onClick = viewModel::comparePanels, enabled = state.busyLabel == null) {
+                    Icon(Icons.AutoMirrored.Rounded.CompareArrows, contentDescription = "Сравнить панели")
+                }
             }
         }
-        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().padding(8.dp)) {
+        if (singlePane) {
+            StandardBackendBrowser(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                pane = state.left,
+                descriptor = state.backends.firstOrNull { it.id == state.left.backendId },
+                clipboard = state.clipboard,
+                busy = state.busyLabel != null,
+                onClose = onClose,
+                onOpen = { viewModel.openOrPreview(true, it) },
+                onToggle = { viewModel.toggleSelection(true, it) },
+                onClearSelection = { viewModel.clearSelection(true) },
+                onBack = { viewModel.back(true) },
+                onRefresh = { viewModel.refresh(true) },
+                onSwitchToDualPane = { state.left.backendId?.let(onSwitchToDualPane) },
+                onCreateFolder = { viewModel.createFolder(true, it) },
+                onRename = { item, name -> viewModel.renameItem(true, item, name) },
+                onDelete = { items -> viewModel.deleteItems(true, items) },
+                onCopy = { item -> viewModel.setClipboardItem(true, item, move = false) },
+                onMove = { item -> viewModel.setClipboardItem(true, item, move = true) },
+                onCopySelected = { viewModel.setClipboard(true, move = false) },
+                onMoveSelected = { viewModel.setClipboard(true, move = true) },
+                onPaste = { viewModel.pasteClipboard(true) },
+                onClearClipboard = viewModel::clearClipboard,
+            )
+        } else BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().padding(8.dp)) {
             val landscapeLayout = maxWidth >= 700.dp
             if (landscapeLayout) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -280,7 +488,20 @@ private fun BackendWorkspaceScreen(
                 }
             }
         }
+        }
     }
+
+    YandexAuthDialog(
+        state = state.yandexAuth,
+        onStart = viewModel::startYandexAuthorization,
+        onVerificationOpened = viewModel::markYandexVerificationOpened,
+        onDismiss = viewModel::dismissYandexDialog,
+    )
+    GoogleAuthDialog(
+        state = state.googleAuth,
+        onRetry = viewModel::showAddGoogleDialog,
+        onDismiss = viewModel::cancelGoogleAuthorization,
+    )
 
     state.conflict?.let { conflict ->
         AlertDialog(
@@ -356,6 +577,984 @@ private fun BackendWorkspaceScreen(
     }
 }
 
+@Composable
+private fun StandardBackendBrowser(
+    modifier: Modifier,
+    pane: BackendPaneState,
+    descriptor: StorageBackendDescriptor?,
+    clipboard: BackendClipboard?,
+    busy: Boolean,
+    onClose: () -> Unit,
+    onOpen: (StorageItem) -> Unit,
+    onToggle: (StorageItem) -> Unit,
+    onClearSelection: () -> Unit,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+    onSwitchToDualPane: () -> Unit,
+    onCreateFolder: (String) -> Unit,
+    onRename: (StorageItem, String) -> Unit,
+    onDelete: (List<StorageItem>) -> Unit,
+    onCopy: (StorageItem) -> Unit,
+    onMove: (StorageItem) -> Unit,
+    onCopySelected: () -> Unit,
+    onMoveSelected: () -> Unit,
+    onPaste: () -> Unit,
+    onClearClipboard: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    var searchVisible by remember { mutableStateOf(false) }
+    var sortMode by remember { mutableStateOf(FileSortMode.Name) }
+    var sortAscending by remember { mutableStateOf(true) }
+    var viewMode by remember { mutableStateOf(FileViewMode.List) }
+    var createFolderOpen by remember { mutableStateOf(false) }
+    var renameTarget by remember { mutableStateOf<StorageItem?>(null) }
+    var deleteTargets by remember { mutableStateOf<List<StorageItem>>(emptyList()) }
+    var propertiesTarget by remember { mutableStateOf<StorageItem?>(null) }
+
+    val selectedItems = remember(pane.items, pane.selected) {
+        pane.items.filter { it.path in pane.selected }
+    }
+    val shownItems = remember(pane.items, query, sortMode, sortAscending) {
+        sortBackendItems(
+            pane.items.filter { it.name.contains(query, ignoreCase = true) },
+            sortMode,
+            sortAscending,
+        )
+    }
+    val backendTitle = descriptor?.title ?: "Хранилище"
+    val backendKind = descriptor?.kind
+    val providerTitle = when (backendKind) {
+        StorageBackendKind.YANDEX_DISK -> "Яндекс.Диск"
+        StorageBackendKind.GOOGLE_DRIVE -> "Google Drive"
+        else -> backendTitle
+    }
+    val folderTitle = when {
+        pane.path == "/" -> providerTitle
+        backendKind == StorageBackendKind.GOOGLE_DRIVE -> providerTitle
+        else -> pane.path.substringAfterLast('/').ifBlank { providerTitle }
+    }
+
+    LaunchedEffect(pane.path) {
+        query = ""
+        searchVisible = false
+    }
+
+    BackHandler {
+        if (!busy) {
+            when {
+                selectedItems.isNotEmpty() -> onClearSelection()
+                pane.back.isNotEmpty() -> onBack()
+                else -> onClose()
+            }
+        }
+    }
+
+    Column(modifier) {
+        if (selectedItems.isEmpty()) {
+            BackendBrowserHeader(
+                title = folderTitle,
+                onBack = { if (pane.back.isNotEmpty()) onBack() else onClose() },
+                backEnabled = !busy,
+            )
+        } else {
+            BackendSelectionHeader(
+                count = selectedItems.size,
+                propertiesEnabled = selectedItems.size == 1,
+                onProperties = { propertiesTarget = selectedItems.singleOrNull() },
+                onClear = onClearSelection,
+            )
+        }
+
+        BackendBreadcrumbs(
+            pane = pane,
+            descriptor = descriptor,
+            busy = busy,
+            onRefresh = onRefresh,
+            onDualPane = onSwitchToDualPane,
+            onCreateFolder = { if (!busy) createFolderOpen = true },
+        )
+
+        BrowserControls(
+            sortMode = sortMode,
+            ascending = sortAscending,
+            viewMode = viewMode,
+            searchVisible = searchVisible,
+            onSort = { requested ->
+                if (requested == sortMode) sortAscending = !sortAscending
+                else {
+                    sortMode = requested
+                    sortAscending = true
+                }
+            },
+            onViewMode = { viewMode = it },
+            onToggleSearch = {
+                searchVisible = !searchVisible
+                if (!searchVisible) query = ""
+            },
+        )
+
+        AnimatedVisibility(visible = searchVisible, enter = fadeIn(), exit = fadeOut()) {
+            AuraSearchField(
+                query = query,
+                onQueryChange = { query = it },
+                onClose = {
+                    query = ""
+                    searchVisible = false
+                },
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+        }
+
+        AnimatedVisibility(visible = clipboard != null, enter = fadeIn(), exit = fadeOut()) {
+            clipboard?.let { clip ->
+                BackendClipboardBar(
+                    clipboard = clip,
+                    busy = busy,
+                    onPaste = onPaste,
+                    onClear = onClearClipboard,
+                )
+            }
+        }
+
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            when {
+                pane.loading -> CircularProgressIndicator(Modifier.align(Alignment.Center))
+                shownItems.isEmpty() -> EmptyFolder(Modifier.align(Alignment.Center))
+                viewMode == FileViewMode.List -> BackendStandardList(
+                    items = shownItems,
+                    selectedPaths = pane.selected,
+                    selectionMode = selectedItems.isNotEmpty(),
+                    busy = busy,
+                    onOpen = onOpen,
+                    onToggle = onToggle,
+                    onCopy = onCopy,
+                    onMove = onMove,
+                    onRename = { renameTarget = it },
+                    onDelete = { deleteTargets = listOf(it) },
+                    onProperties = { propertiesTarget = it },
+                )
+                else -> BackendStandardGrid(
+                    items = shownItems,
+                    selectedPaths = pane.selected,
+                    selectionMode = selectedItems.isNotEmpty(),
+                    busy = busy,
+                    onOpen = onOpen,
+                    onToggle = onToggle,
+                    onCopy = onCopy,
+                    onMove = onMove,
+                    onRename = { renameTarget = it },
+                    onDelete = { deleteTargets = listOf(it) },
+                    onProperties = { propertiesTarget = it },
+                )
+            }
+        }
+
+        if (selectedItems.isNotEmpty()) {
+            BackendSelectionBottomBar(
+                copyEnabled = selectedItems.none(StorageItem::isLink) && !busy,
+                moveEnabled = selectedItems.none(StorageItem::isLink) && !busy,
+                renameEnabled = selectedItems.size == 1 && !busy,
+                deleteEnabled = !busy,
+                onCopy = onCopySelected,
+                onMove = onMoveSelected,
+                onRename = { renameTarget = selectedItems.singleOrNull() },
+                onDelete = { deleteTargets = selectedItems },
+            )
+        }
+    }
+
+    if (createFolderOpen) {
+        NameDialog(
+            title = "Новая папка",
+            initialValue = "",
+            confirmLabel = "Создать",
+            onDismiss = { createFolderOpen = false },
+            onConfirm = {
+                createFolderOpen = false
+                onCreateFolder(it)
+            },
+        )
+    }
+
+    renameTarget?.let { item ->
+        NameDialog(
+            title = "Переименовать",
+            initialValue = item.name,
+            confirmLabel = "Готово",
+            onDismiss = { renameTarget = null },
+            onConfirm = { name ->
+                renameTarget = null
+                onRename(item, name)
+                onClearSelection()
+            },
+        )
+    }
+
+    propertiesTarget?.let { item ->
+        BackendPropertiesDialog(
+            item = item,
+            backendTitle = backendTitle,
+            onDismiss = { propertiesTarget = null },
+        )
+    }
+
+    if (deleteTargets.isNotEmpty()) {
+        BackendDeleteDialog(
+            items = deleteTargets,
+            backendKind = backendKind,
+            onDismiss = { deleteTargets = emptyList() },
+            onConfirm = {
+                val targets = deleteTargets
+                deleteTargets = emptyList()
+                onDelete(targets)
+                onClearSelection()
+            },
+        )
+    }
+}
+
+@Composable
+private fun BackendBrowserHeader(
+    title: String,
+    onBack: () -> Unit,
+    backEnabled: Boolean,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 8.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onBack, enabled = backEnabled) {
+            Icon(
+                Icons.AutoMirrored.Rounded.ArrowBack,
+                contentDescription = "Назад",
+                tint = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+        Text(
+            title,
+            modifier = Modifier.weight(1f),
+            color = MaterialTheme.colorScheme.onBackground,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun BackendBreadcrumbs(
+    pane: BackendPaneState,
+    descriptor: StorageBackendDescriptor?,
+    busy: Boolean,
+    onRefresh: () -> Unit,
+    onDualPane: () -> Unit,
+    onCreateFolder: () -> Unit,
+) {
+    val title = descriptor?.title ?: "Хранилище"
+    val segments = if (descriptor?.kind == StorageBackendKind.GOOGLE_DRIVE) {
+        emptyList()
+    } else {
+        pane.path.removePrefix("/").split('/').filter(String::isNotBlank)
+    }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, top = 2.dp, end = 8.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            Modifier
+                .weight(1f)
+                .horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(title, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            segments.forEach { segment ->
+                Text("  ›  ", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(segment, fontSize = 12.sp)
+            }
+        }
+        IconButton(onClick = onRefresh, enabled = !busy) {
+            Icon(
+                Icons.Rounded.Refresh,
+                contentDescription = "Обновить",
+                tint = if (busy) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                else MaterialTheme.colorScheme.onSurface,
+            )
+        }
+        TextButton(onClick = onDualPane, enabled = !busy) {
+            val actionColor = if (busy) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+            else MaterialTheme.colorScheme.onSurface
+            Icon(
+                Icons.Rounded.Splitscreen,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = actionColor,
+            )
+            Spacer(Modifier.width(4.dp))
+            Text("2 панели", maxLines = 1, fontSize = 12.sp, color = actionColor)
+        }
+        IconButton(onClick = onCreateFolder, enabled = !busy) {
+            Icon(
+                Icons.Rounded.Add,
+                contentDescription = "Создать папку",
+                tint = if (busy) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                else MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BackendSelectionHeader(
+    count: Int,
+    propertiesEnabled: Boolean,
+    onProperties: () -> Unit,
+    onClear: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp, end = 8.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onClear) { Icon(Icons.Rounded.Close, contentDescription = "Снять выделение") }
+        Text("$count выбрано", Modifier.weight(1f), fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+        Box {
+            IconButton(onClick = { menuOpen = true }) { Icon(Icons.Rounded.MoreHoriz, contentDescription = "Ещё действия") }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(
+                    text = { Text("Свойства") },
+                    leadingIcon = { Icon(Icons.Rounded.Info, contentDescription = null) },
+                    enabled = propertiesEnabled,
+                    onClick = { menuOpen = false; onProperties() },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackendClipboardBar(
+    clipboard: BackendClipboard,
+    busy: Boolean,
+    onPaste: () -> Unit,
+    onClear: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(17.dp),
+        color = MaterialTheme.colorScheme.primaryContainer,
+    ) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (clipboard.move) Icons.Rounded.ContentCut else Icons.Rounded.ContentCopy,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.width(10.dp))
+            Text(
+                if (clipboard.items.size == 1) clipboard.items.first().name else "Выбрано объектов: ${clipboard.items.size}",
+                Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontSize = 13.sp,
+            )
+            TextButton(onClick = onClear) { Text("Отмена") }
+            Button(onClick = onPaste, enabled = !busy) { Text("Вставить") }
+        }
+    }
+}
+
+@Composable
+private fun BackendStandardList(
+    items: List<StorageItem>,
+    selectedPaths: Set<String>,
+    selectionMode: Boolean,
+    busy: Boolean,
+    onOpen: (StorageItem) -> Unit,
+    onToggle: (StorageItem) -> Unit,
+    onCopy: (StorageItem) -> Unit,
+    onMove: (StorageItem) -> Unit,
+    onRename: (StorageItem) -> Unit,
+    onDelete: (StorageItem) -> Unit,
+    onProperties: (StorageItem) -> Unit,
+) {
+    LazyColumn(contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 24.dp)) {
+        itemsIndexed(items, key = { _, item -> item.path }) { index, item ->
+            val shape = when {
+                items.size == 1 -> RoundedCornerShape(22.dp)
+                index == 0 -> RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)
+                index == items.lastIndex -> RoundedCornerShape(bottomStart = 22.dp, bottomEnd = 22.dp)
+                else -> RoundedCornerShape(0.dp)
+            }
+            Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
+                Column {
+                    BackendStandardRow(
+                        item = item,
+                        selected = item.path in selectedPaths,
+                        selectionMode = selectionMode,
+                        busy = busy,
+                        onOpen = { onOpen(item) },
+                        onToggle = { onToggle(item) },
+                        onCopy = { onCopy(item) },
+                        onMove = { onMove(item) },
+                        onRename = { onRename(item) },
+                        onDelete = { onDelete(item) },
+                        onProperties = { onProperties(item) },
+                    )
+                    if (index != items.lastIndex) {
+                        HorizontalDivider(Modifier.padding(start = 64.dp), color = MaterialTheme.colorScheme.outline.copy(alpha = 0.45f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackendStandardRow(
+    item: StorageItem,
+    selected: Boolean,
+    selectionMode: Boolean,
+    busy: Boolean,
+    onOpen: () -> Unit,
+    onToggle: () -> Unit,
+    onCopy: () -> Unit,
+    onMove: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onProperties: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(if (selected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f) else MaterialTheme.colorScheme.surface)
+            .combinedClickable(
+                enabled = !busy,
+                onClick = { if (selectionMode) onToggle() else if (!item.isLink) onOpen() },
+                onLongClick = onToggle,
+            )
+            .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BackendItemIcon(item, Modifier.size(32.dp))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+            Text(backendItemDetails(item), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+        }
+        if (selectionMode) {
+            IconButton(onClick = onToggle, enabled = !busy) {
+                Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else Box {
+            IconButton(onClick = { menuOpen = true }, enabled = !busy) { Icon(Icons.Rounded.MoreHoriz, contentDescription = "Действия") }
+            BackendItemMenu(
+                expanded = menuOpen,
+                item = item,
+                onDismiss = { menuOpen = false },
+                onOpen = onOpen,
+                onCopy = onCopy,
+                onMove = onMove,
+                onRename = onRename,
+                onDelete = onDelete,
+                onProperties = onProperties,
+            )
+        }
+    }
+}
+
+@Composable
+private fun BackendStandardGrid(
+    items: List<StorageItem>,
+    selectedPaths: Set<String>,
+    selectionMode: Boolean,
+    busy: Boolean,
+    onOpen: (StorageItem) -> Unit,
+    onToggle: (StorageItem) -> Unit,
+    onCopy: (StorageItem) -> Unit,
+    onMove: (StorageItem) -> Unit,
+    onRename: (StorageItem) -> Unit,
+    onDelete: (StorageItem) -> Unit,
+    onProperties: (StorageItem) -> Unit,
+) {
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(140.dp),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 16.dp, top = 8.dp, end = 16.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        gridItems(items, key = { it.path }) { item ->
+            BackendStandardTile(
+                item = item,
+                selected = item.path in selectedPaths,
+                selectionMode = selectionMode,
+                busy = busy,
+                onOpen = { onOpen(item) },
+                onToggle = { onToggle(item) },
+                onCopy = { onCopy(item) },
+                onMove = { onMove(item) },
+                onRename = { onRename(item) },
+                onDelete = { onDelete(item) },
+                onProperties = { onProperties(item) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun BackendStandardTile(
+    item: StorageItem,
+    selected: Boolean,
+    selectionMode: Boolean,
+    busy: Boolean,
+    onOpen: () -> Unit,
+    onToggle: () -> Unit,
+    onCopy: () -> Unit,
+    onMove: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onProperties: () -> Unit,
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier
+            .height(190.dp)
+            .combinedClickable(
+                enabled = !busy,
+                onClick = { if (selectionMode) onToggle() else if (!item.isLink) onOpen() },
+                onLongClick = onToggle,
+            ),
+        shape = RoundedCornerShape(22.dp),
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        border = BorderStroke(if (selected) 2.dp else 1.dp, MaterialTheme.colorScheme.primary.copy(alpha = if (selected) 0.75f else 0.18f)),
+    ) {
+        Column {
+            Box(
+                Modifier.fillMaxWidth().height(112.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.07f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                BackendItemIcon(item, Modifier.size(52.dp))
+                Box(Modifier.align(Alignment.TopEnd)) {
+                    IconButton(onClick = { if (selectionMode) onToggle() else menuOpen = true }, enabled = !busy) {
+                        Icon(if (selectionMode) Icons.Rounded.CheckCircle else Icons.Rounded.MoreHoriz, contentDescription = null)
+                    }
+                    BackendItemMenu(
+                        expanded = menuOpen,
+                        item = item,
+                        onDismiss = { menuOpen = false },
+                        onOpen = onOpen,
+                        onCopy = onCopy,
+                        onMove = onMove,
+                        onRename = onRename,
+                        onDelete = onDelete,
+                        onProperties = onProperties,
+                    )
+                }
+            }
+            Column(Modifier.fillMaxWidth().weight(1f).padding(11.dp, 8.dp, 11.dp, 9.dp)) {
+                Text(item.name, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.weight(1f))
+                Text(if (item.isDirectory) "Папка" else formatBytes(item.size), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackendItemMenu(
+    expanded: Boolean,
+    item: StorageItem,
+    onDismiss: () -> Unit,
+    onOpen: () -> Unit,
+    onCopy: () -> Unit,
+    onMove: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onProperties: () -> Unit,
+) {
+    DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
+        if (!item.isDirectory) {
+            DropdownMenuItem(
+                text = { Text("Открыть в…") },
+                leadingIcon = { Icon(Icons.Rounded.Launch, contentDescription = null) },
+                enabled = !item.isLink,
+                onClick = { onDismiss(); onOpen() },
+            )
+        }
+        DropdownMenuItem(
+            text = { Text("Копировать") },
+            leadingIcon = { Icon(Icons.Rounded.ContentCopy, contentDescription = null) },
+            enabled = !item.isLink,
+            onClick = { onDismiss(); onCopy() },
+        )
+        DropdownMenuItem(
+            text = { Text("Переместить") },
+            leadingIcon = { Icon(Icons.Rounded.ContentCut, contentDescription = null) },
+            enabled = !item.isLink,
+            onClick = { onDismiss(); onMove() },
+        )
+        DropdownMenuItem(
+            text = { Text("Свойства") },
+            leadingIcon = { Icon(Icons.Rounded.Info, contentDescription = null) },
+            onClick = { onDismiss(); onProperties() },
+        )
+        DropdownMenuItem(
+            text = { Text("Переименовать") },
+            leadingIcon = { Icon(Icons.Rounded.DriveFileRenameOutline, contentDescription = null) },
+            onClick = { onDismiss(); onRename() },
+        )
+        DropdownMenuItem(
+            text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
+            leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+            onClick = { onDismiss(); onDelete() },
+        )
+    }
+}
+
+@Composable
+private fun BackendItemIcon(item: StorageItem, modifier: Modifier = Modifier) {
+    val icon = when {
+        item.isDirectory -> Icons.Rounded.Folder
+        item.mimeType?.startsWith("image/") == true -> Icons.Rounded.Image
+        item.mimeType?.startsWith("video/") == true -> Icons.Rounded.Movie
+        item.mimeType?.startsWith("audio/") == true -> Icons.Rounded.MusicNote
+        else -> Icons.Rounded.Description
+    }
+    Icon(icon, contentDescription = null, modifier = modifier, tint = MaterialTheme.colorScheme.primary)
+}
+
+@Composable
+private fun BackendSelectionBottomBar(
+    copyEnabled: Boolean,
+    moveEnabled: Boolean,
+    renameEnabled: Boolean,
+    deleteEnabled: Boolean,
+    onCopy: () -> Unit,
+    onMove: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(color = MaterialTheme.colorScheme.surface.copy(alpha = 0.98f), tonalElevation = 3.dp) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            BackendSelectionAction(Icons.Rounded.ContentCopy, "Копировать", copyEnabled, onCopy)
+            BackendSelectionAction(Icons.Rounded.ContentCut, "Переместить", moveEnabled, onMove)
+            BackendSelectionAction(Icons.Rounded.DriveFileRenameOutline, "Переименовать", renameEnabled, onRename)
+            BackendSelectionAction(Icons.Rounded.Delete, "Удалить", deleteEnabled, onDelete, error = true)
+        }
+    }
+}
+
+@Composable
+private fun BackendSelectionAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    error: Boolean = false,
+) {
+    val tint = when {
+        !enabled -> MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+        error -> MaterialTheme.colorScheme.error
+        else -> MaterialTheme.colorScheme.onSurface
+    }
+    Column(
+        Modifier.clickable(enabled = enabled, onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Icon(icon, contentDescription = null, tint = tint)
+        Text(label, fontSize = 10.sp, color = tint)
+    }
+}
+
+@Composable
+private fun BackendPropertiesDialog(
+    item: StorageItem,
+    backendTitle: String,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(item.name) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                Text("Хранилище: $backendTitle")
+                Text("Путь: ${item.path}")
+                Text("Тип: ${if (item.isDirectory) "Папка" else item.mimeType ?: "Файл"}")
+                if (!item.isDirectory) Text("Размер: ${formatBytes(item.size)}")
+                if (item.modifiedAt > 0L) {
+                    Text("Изменён: ${DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(item.modifiedAt))}")
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Готово") } },
+    )
+}
+
+@Composable
+private fun BackendDeleteDialog(
+    items: List<StorageItem>,
+    backendKind: StorageBackendKind?,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    val destination = backendDeleteExplanation(backendKind)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (items.size == 1) "Удалить ${items.first().name}?" else "Удалить объектов: ${items.size}?") },
+        text = { Text(destination) },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Удалить", color = MaterialTheme.colorScheme.error) }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+    )
+}
+
+private fun backendDeleteExplanation(kind: StorageBackendKind?): String = when (kind) {
+    StorageBackendKind.YANDEX_DISK -> "Объекты будут перемещены в корзину Яндекс.Диска, откуда их можно восстановить."
+    StorageBackendKind.GOOGLE_DRIVE -> "Объекты будут перемещены в корзину Google Drive, откуда их можно восстановить."
+    else -> "Для этого сетевого хранилища общей корзины Aura нет. Удаление может быть необратимым."
+}
+
+private fun sortBackendItems(
+    items: List<StorageItem>,
+    mode: FileSortMode,
+    ascending: Boolean,
+): List<StorageItem> {
+    val valueComparator = when (mode) {
+        FileSortMode.Name -> compareBy<StorageItem, String>(String.CASE_INSENSITIVE_ORDER) { it.name }
+        FileSortMode.Modified -> compareBy<StorageItem> { it.modifiedAt }
+        FileSortMode.Size -> compareBy<StorageItem> { it.size }
+        FileSortMode.Type -> compareBy<StorageItem, String>(String.CASE_INSENSITIVE_ORDER) {
+            it.mimeType ?: it.name.substringAfterLast('.', "")
+        }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+    }.let { if (ascending) it else it.reversed() }
+    return items.sortedWith(compareByDescending<StorageItem> { it.isDirectory }.then(valueComparator))
+}
+
+private fun backendItemDetails(item: StorageItem): String {
+    if (item.isDirectory) return "Папка"
+    val size = formatBytes(item.size)
+    val date = if (item.modifiedAt > 0L) {
+        DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(item.modifiedAt))
+    } else "Дата неизвестна"
+    return "$size · $date"
+}
+
+@Composable
+private fun GoogleAuthDialog(
+    state: GoogleAuthUiState,
+    onRetry: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    when (state) {
+        GoogleAuthUiState.Idle -> Unit
+        GoogleAuthUiState.Requesting -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Google Drive") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("Проверяю разрешение Google Drive…")
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        )
+        is GoogleAuthUiState.NeedsResolution,
+        GoogleAuthUiState.AwaitingUser -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Google Drive") },
+            text = { Text("Выберите Google-аккаунт и разрешите Aura Files доступ к Google Drive в системном окне Google.") },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        )
+        GoogleAuthUiState.Finalizing -> AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Google Drive") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("Проверяю аккаунт и подключаю Drive…")
+                }
+            },
+            confirmButton = {},
+        )
+        is GoogleAuthUiState.Error -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Не удалось подключить Google Drive") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(state.message)
+                    if (state.message.contains("UNREGISTERED_ON_API_CONSOLE", ignoreCase = true)) {
+                        TextButton(onClick = {
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, Uri.parse("https://console.cloud.google.com/apis/credentials"))
+                                )
+                            }
+                        }) {
+                            Icon(Icons.Rounded.Launch, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("Открыть Google Cloud Credentials")
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(onClick = onRetry) { Text("Повторить") } },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = {
+                        context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                            ClipData.newPlainText("Google Drive OAuth error", state.message)
+                        )
+                    }) { Text("Копировать") }
+                    TextButton(onClick = onDismiss) { Text("Закрыть") }
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun YandexAuthDialog(
+    state: YandexAuthUiState,
+    onStart: (String, String) -> Unit,
+    onVerificationOpened: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    when (state) {
+        YandexAuthUiState.Idle -> Unit
+        is YandexAuthUiState.Configuring,
+        is YandexAuthUiState.Error -> {
+            val initialClientId = when (state) {
+                is YandexAuthUiState.Configuring -> state.clientId
+                is YandexAuthUiState.Error -> state.clientId
+                else -> ""
+            }
+            var clientId by remember(initialClientId) { mutableStateOf(initialClientId) }
+            var clientSecret by remember { mutableStateOf("") }
+            val error = (state as? YandexAuthUiState.Error)?.message
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text("Добавить Яндекс.Диск") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Вход выполняется через официальный device-code OAuth. Пароль Яндекса Aura не получает.")
+                        OutlinedTextField(
+                            value = clientId,
+                            onValueChange = { clientId = it },
+                            label = { Text("Yandex OAuth Client ID") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = clientSecret,
+                            onValueChange = { clientSecret = it },
+                            label = { Text("Yandex OAuth Client Secret") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "Нужны Client ID и Client Secret (пароль приложения) из созданного Yandex OAuth-приложения. Secret сохраняется только в зашифрованном хранилище Android Keystore. В OAuth-приложении нужны права Yandex Disk REST API на чтение и запись.",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        TextButton(onClick = {
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://oauth.yandex.ru/client/new/")))
+                            }
+                        }) { Text("Создать OAuth-приложение Яндекса") }
+                        error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    }
+                },
+                confirmButton = { Button(onClick = { onStart(clientId, clientSecret) }) { Text("Войти через Яндекс") } },
+                dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+            )
+        }
+        is YandexAuthUiState.Requesting -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Яндекс.Диск") },
+            text = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Text("Получаю код входа…")
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+        )
+        is YandexAuthUiState.AwaitingApproval -> {
+            LaunchedEffect(state.userCode, state.verificationUrl, state.autoOpenVerification) {
+                if (state.autoOpenVerification) {
+                    context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                        ClipData.newPlainText("Yandex OAuth code", state.userCode)
+                    )
+                    runCatching {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(state.verificationUrl)))
+                    }
+                    onVerificationOpened()
+                }
+            }
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text("Подтвердите вход в Яндекс") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("Код уже скопирован в буфер обмена:")
+                        Surface(shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.primaryContainer) {
+                            Text(
+                                state.userCode,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                fontSize = 24.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                        }
+                        Text("Введите его на странице Яндекс OAuth, разрешите Aura Files доступ к Диску и вернитесь в Aura. Приложение само завершит вход — отдельной ссылки возврата у device-code OAuth нет.")
+                        Text(state.status, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = {
+                                context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(
+                                    ClipData.newPlainText("Yandex OAuth code", state.userCode)
+                                )
+                            }) {
+                                Icon(Icons.Rounded.ContentCopy, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Копировать код")
+                            }
+                            OutlinedButton(onClick = {
+                                runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(state.verificationUrl))) }
+                            }) {
+                                Icon(Icons.Rounded.Launch, contentDescription = null)
+                                Spacer(Modifier.width(6.dp))
+                                Text("Открыть Яндекс")
+                            }
+                        }
+                    }
+                },
+                confirmButton = {},
+                dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } },
+            )
+        }
+    }
+}
+
 private data class BackendDragPayload(val fromLeft: Boolean, val item: StorageItem)
 
 @Composable
@@ -379,6 +1578,9 @@ private fun BackendPane(
     onDelete: () -> Unit,
     isLeft: Boolean,
     onDrop: (BackendDragPayload) -> Unit,
+    allowCrossPaneActions: Boolean = true,
+    allowBackendSwitch: Boolean = true,
+    openFilesOnClick: Boolean = false,
 ) {
     var backendMenu by remember { mutableStateOf(false) }
     var recentMenu by remember { mutableStateOf(false) }
@@ -393,7 +1595,9 @@ private fun BackendPane(
     val context = LocalContext.current
     val deleteAnimationMode = remember(context) { FileRepository(context.applicationContext).deleteAnimationMode() }
     val scope = rememberCoroutineScope()
-    val backendTitle = descriptors.firstOrNull { it.id == pane.backendId }?.title ?: pane.backendId.orEmpty()
+    val backendDescriptor = descriptors.firstOrNull { it.id == pane.backendId }
+    val backendTitle = backendDescriptor?.title ?: pane.backendId.orEmpty()
+    val backendKind = backendDescriptor?.kind
     LaunchedEffect(busy) {
         if (!busy) dissolvingPaths = emptySet()
     }
@@ -408,14 +1612,17 @@ private fun BackendPane(
             }
         }
     }
-    Surface(
-        modifier = modifier.dragAndDropTarget(
+    val paneModifier = if (allowCrossPaneActions) {
+        modifier.dragAndDropTarget(
             shouldStartDragAndDrop = { event: DragAndDropEvent ->
                 val payload = event.toAndroidDragEvent().localState as? BackendDragPayload
                 if (busy) false else payload != null && payload.fromLeft != isLeft
             },
             target = dropTarget,
-        ),
+        )
+    } else modifier
+    Surface(
+        modifier = paneModifier,
         shape = RoundedCornerShape(18.dp),
         color = MaterialTheme.colorScheme.surface,
     ) {
@@ -427,18 +1634,22 @@ private fun BackendPane(
                 IconButton(onClick = onForward, enabled = pane.forward.isNotEmpty() && !busy) {
                     Icon(Icons.AutoMirrored.Rounded.ArrowForward, contentDescription = "Вперёд")
                 }
-                Box {
-                    TextButton(onClick = { backendMenu = true }, enabled = !busy) {
-                        Text(descriptors.firstOrNull { it.id == pane.backendId }?.title ?: "Источник", maxLines = 1)
-                    }
-                    DropdownMenu(expanded = backendMenu, onDismissRequest = { backendMenu = false }) {
-                        descriptors.forEach { backend ->
-                            DropdownMenuItem(
-                                text = { Text(backend.title) },
-                                onClick = { backendMenu = false; onBackend(backend.id) },
-                            )
+                if (allowBackendSwitch) {
+                    Box {
+                        TextButton(onClick = { backendMenu = true }, enabled = !busy) {
+                            Text(descriptors.firstOrNull { it.id == pane.backendId }?.title ?: "Источник", maxLines = 1)
+                        }
+                        DropdownMenu(expanded = backendMenu, onDismissRequest = { backendMenu = false }) {
+                            descriptors.forEach { backend ->
+                                DropdownMenuItem(
+                                    text = { Text(backend.title) },
+                                    onClick = { backendMenu = false; onBackend(backend.id) },
+                                )
+                            }
                         }
                     }
+                } else {
+                    Text(backendTitle, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
                 Spacer(Modifier.weight(1f))
                 Box {
@@ -467,8 +1678,10 @@ private fun BackendPane(
             if (pane.selected.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     Text("Выбрано: ${pane.selected.size}", modifier = Modifier.weight(1f), fontSize = 12.sp)
-                    TextButton(onClick = onCopy, enabled = !busy) { Text("Копировать →") }
-                    TextButton(onClick = onMove, enabled = !busy) { Text("Переместить →") }
+                    if (allowCrossPaneActions) {
+                        TextButton(onClick = onCopy, enabled = !busy) { Text("Копировать →") }
+                        TextButton(onClick = onMove, enabled = !busy) { Text("Переместить →") }
+                    }
                     Box {
                         IconButton(onClick = { selectionMenu = true }, enabled = !busy) {
                             Icon(Icons.Rounded.MoreHoriz, contentDescription = "Действия с выбранными")
@@ -508,9 +1721,13 @@ private fun BackendPane(
                             busy = busy,
                             dissolving = item.path in dissolvingPaths,
                             deleteAnimationMode = deleteAnimationMode,
-                            onOpen = { if (item.isDirectory) onOpen(item) else onToggle(item) },
+                            onOpen = {
+                                if (item.isDirectory || openFilesOnClick) onOpen(item) else onToggle(item)
+                            },
                             onToggle = { onToggle(item) },
                             fromLeft = isLeft,
+                            enableDrag = allowCrossPaneActions,
+                            showSelectionCheckbox = allowCrossPaneActions || pane.selected.isNotEmpty(),
                         )
                     }
                 }
@@ -569,7 +1786,7 @@ private fun BackendPane(
         AlertDialog(
             onDismissRequest = { deleteOpen = false },
             title = { Text(if (selectedItems.size == 1) "Удалить ${selectedItems.single().name}?" else "Удалить объектов: ${selectedItems.size}?") },
-            text = { Text("В универсальных панелях удаление выполняется напрямую без общей корзины. Папки удаляются вместе с содержимым.") },
+            text = { Text(backendDeleteExplanation(backendKind)) },
             confirmButton = {
                 Button(onClick = {
                     deleteOpen = false
@@ -596,23 +1813,43 @@ private fun BackendItemRow(
     onOpen: () -> Unit,
     onToggle: () -> Unit,
     fromLeft: Boolean,
+    enableDrag: Boolean,
+    showSelectionCheckbox: Boolean,
 ) {
+    val rowModifier = Modifier
+        .fillMaxWidth()
+        .auraDeleteEffect(dissolving, deleteAnimationMode, item.path.hashCode())
+        .combinedClickable(
+            enabled = !busy && !dissolving,
+            onClick = onOpen,
+            onLongClick = onToggle,
+        )
+    val draggableModifier = if (enableDrag) {
+        rowModifier.dragAndDropSource(transferData = { _ ->
+            if (busy) null else DragAndDropTransferData(
+                clipData = ClipData.newPlainText("Aura Files", item.name),
+                localState = BackendDragPayload(fromLeft, item),
+            )
+        })
+    } else rowModifier
     Row(
-        Modifier
-            .fillMaxWidth()
-            .auraDeleteEffect(dissolving, deleteAnimationMode, item.path.hashCode())
-            .clickable(enabled = !busy && !dissolving, onClick = onOpen)
-            .dragAndDropSource(transferData = { _ ->
-                if (busy) null else DragAndDropTransferData(
-                    clipData = ClipData.newPlainText("Aura Files", item.name),
-                    localState = BackendDragPayload(fromLeft, item),
-                )
-            })
+        draggableModifier
             .padding(horizontal = 6.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Checkbox(checked = selected, onCheckedChange = { onToggle() }, enabled = !busy)
-        Icon(if (item.isDirectory) Icons.Rounded.Folder else Icons.Rounded.Storage, contentDescription = null)
+        if (showSelectionCheckbox) {
+            Checkbox(checked = selected, onCheckedChange = { onToggle() }, enabled = !busy)
+        } else {
+            Spacer(Modifier.width(10.dp))
+        }
+        val itemIcon = when {
+            item.isDirectory -> Icons.Rounded.Folder
+            item.mimeType?.startsWith("image/") == true -> Icons.Rounded.Image
+            item.mimeType?.startsWith("video/") == true -> Icons.Rounded.Movie
+            item.mimeType?.startsWith("audio/") == true -> Icons.Rounded.MusicNote
+            else -> Icons.Rounded.Description
+        }
+        Icon(itemIcon, contentDescription = null)
         Spacer(Modifier.width(8.dp))
         Column(Modifier.weight(1f)) {
             Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)

@@ -1,0 +1,27 @@
+Aura Files 1.2.3 CLOUD AUTH FIX — проверка исходного дерева
+Дата: 2026-09-07
+
+Версия:
+- app/build.gradle.kts: versionName 1.2.3
+- app/build.gradle.kts: versionCode 123
+
+Проверки исходников:
+- Kotlin/KTS PSI parse: 120 файлов, 0 syntax errors.
+- Android XML parse: 14 файлов, 0 errors.
+- Google Identity Authorization wrapper: отдельная kotlinc-компиляция со строгими стабами актуальных AuthorizationClient/AuthorizationResult API — OK.
+- Yandex OAuth core: отдельная kotlinc-компиляция + smoke — YANDEX_123_OAUTH_SMOKE_OK.
+- Yandex device token/refresh smoke подтверждает передачу client_id + client_secret.
+- YandexOAuthSecretStore: отдельная kotlinc-компиляция со строгими Android Keystore stub-типами — OK.
+- CloudTokenStore: отдельная kotlinc-компиляция — OK.
+- CredentialStore: отдельная kotlinc-компиляция — OK.
+- В app/src/main/java отсутствует Cipher.init(ENCRYPT_MODE, ..., GCMParameterSpec(...)); при encrypt IV теперь генерирует Cipher/Android Keystore.
+- Google Activity-result path: returned Intent разбирается независимо от resultCode; при отсутствии Granted выполняется повторный AuthorizationClient.authorize(selectAccount=false).
+
+Полная Android Gradle сборка в контейнере НЕ заявляется пройденной:
+- ./gradlew не может получить Gradle 9.5.0;
+- причина: java.net.UnknownHostException: services.gradle.org;
+- до конфигурации/компиляции Android-проекта wrapper не доходит.
+
+На пользовательской Windows исходная база ранее подтверждённо доходила до :app:assembleDebug / BUILD SUCCESSFUL. Для 1.2.3 окончательную Android-компиляцию должен подтвердить BUILD_ON_CLEAN_WINDOWS.bat на Windows.
+
+SOURCE_SHA256SUMS.txt должен быть сгенерирован после этого файла и после всех остальных изменений, самым последним изменением дерева.

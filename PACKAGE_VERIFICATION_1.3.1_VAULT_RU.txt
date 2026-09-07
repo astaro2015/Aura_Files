@@ -1,0 +1,30 @@
+Aura Files 1.3.1 VAULT FAVORITES — проверка пакета
+Дата: 2026-09-07
+
+Проверено:
+- versionName = 1.3.1, versionCode = 131.
+- прежнее URI-«Избранное» заменено persistent `.AuraVault` в корне общей памяти текущего Android user;
+- `.AuraVault/data` хранит только UUID `.avf`, `.nomedia` создаётся в корне сейфа;
+- ключ отдельно не хранится: ANDROID_ID -> HKDF-SHA256(info="AuraVault-v1") -> AES-256 key;
+- metadata и data шифруются AES/GCM/NoPadding с разными случайными 96-bit IV;
+- encrypted metadata ciphertext включён как AAD для data GCM;
+- при decrypt GCM authentication завершается явным `Cipher.doFinal()`, CipherInputStream для GCM не используется;
+- move transactional: исходник удаляется только после записи/fsync/проверки vault-контейнера; при ошибке до завершения созданный `.avf` откатывается;
+- restore создаёт обычный файл, расшифровывает его и только затем удаляет `.avf`; при ошибке созданный plaintext удаляется;
+- открыть/поделиться используют только private cache Aura + FileProvider; expired plaintext cache sweep выполняется при открытии/обновлении vault и перед новой временной копией;
+- `.AuraVault` безусловно исключён из обычного FileRepository browser и StorageIndexer;
+- Home «Избранное» открывает отдельный VaultActivity, показывающий только расшифрованные metadata;
+- в VaultActivity есть открыть / поделиться / вернуть / удалить с подтверждением;
+- «В избранное» для папок отключено в selection/properties UI и дополнительно отклоняется ViewModel/repository;
+- FileProvider разрешает только `cache/vault-open` для временной расшифровки;
+- 1.3.0 SPLIT/APKS код относительно базового 1.3.0 не изменялся, кроме общих version/docs.
+
+Статические/семантические проверки:
+- Kotlin PSI parser: 125 .kt/.kts, 0 syntax errors.
+- Android XML parser: 14 XML (Manifest + res), 0 errors.
+- AuraVault.kt отдельно скомпилирован kotlinc 1.9.0 с минимальными Android/DocumentFile/JSONObject stubs: semantic type-check EXIT 0.
+- 16 статических связок version/crypto/rollback/index exclusion/UI/FileProvider проверены: 16/16 OK.
+
+Полная Gradle-компиляция в контейнере НЕ выполнена: `./gradlew --offline :app:compileDebugKotlin` остановился до конфигурации проекта, потому что wrapper попытался скачать Gradle 9.5.0 и получил `java.net.UnknownHostException: services.gradle.org`. Это ограничение сети среды, а не результат Android-компиляции исходников.
+
+SOURCE_SHA256SUMS.txt формируется последним шагом и затем отдельно сверяется с деревом и итоговым ZIP.

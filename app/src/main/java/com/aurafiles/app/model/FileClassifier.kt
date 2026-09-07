@@ -63,7 +63,8 @@ object FileClassifier {
         isGenericMimeType(mimeType) && extension in imageExtensions -> FileCategory.Images
         isGenericMimeType(mimeType) && extension in videoExtensions -> FileCategory.Video
         isGenericMimeType(mimeType) && extension in audioExtensions -> FileCategory.Audio
-        extension == "apk" || mimeType == "application/vnd.android.package-archive" -> FileCategory.Apk
+        (extension == "apk" || extension == "apks") || mimeType == "application/vnd.android.package-archive" ||
+            mimeType == "application/vnd.aurafiles.apks+zip" -> FileCategory.Apk
         primaryBook(name, extension) -> FileCategory.Books
         mimeType == "application/pdf" || mimeType?.startsWith("text/") == true || extension in documentExtensions -> FileCategory.Documents
         extension in archiveExtensions || mimeType?.contains("zip", ignoreCase = true) == true ||

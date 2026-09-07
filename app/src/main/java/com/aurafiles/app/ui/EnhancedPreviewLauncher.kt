@@ -7,6 +7,10 @@ import com.aurafiles.app.model.FileEntry
 internal fun openEnhancedPreview(context: Context, entry: FileEntry, siblings: List<FileEntry> = emptyList()): Boolean {
     val extension = entry.name.substringAfterLast('.', "").lowercase()
     return when {
+        extension == "apks" || entry.mimeType == "application/vnd.aurafiles.apks+zip" -> {
+            SplitPackageInstallerActivity.start(context, entry)
+            true
+        }
         extension == "apk" || entry.mimeType == "application/vnd.android.package-archive" -> {
             ApkInspectorActivity.start(context, entry)
             true
@@ -16,11 +20,11 @@ internal fun openEnhancedPreview(context: Context, entry: FileEntry, siblings: L
             true
         }
         entry.mimeType?.startsWith("video/") == true || extension in VIDEO_EXTENSIONS -> {
-            MediaPlayerActivity.start(context, entry, audioOnly = false)
+            MediaPlayerActivity.start(context, entry, audioOnly = false, siblings = siblings)
             true
         }
         entry.mimeType?.startsWith("audio/") == true || extension in AUDIO_EXTENSIONS -> {
-            MediaPlayerActivity.start(context, entry, audioOnly = true)
+            MediaPlayerActivity.start(context, entry, audioOnly = true, siblings = siblings)
             true
         }
         else -> false

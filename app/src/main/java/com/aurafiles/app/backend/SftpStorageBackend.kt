@@ -56,7 +56,7 @@ class SftpStorageBackend(
                     name = info.name,
                     isDirectory = attrs.type == FileMode.Type.DIRECTORY,
                     size = if (attrs.type == FileMode.Type.REGULAR) attrs.size.coerceAtLeast(0L) else 0L,
-                    modifiedAt = attrs.mtime.toLong().coerceAtLeast(0L) * 1000L,
+                    modifiedAt = attrs.mtime.coerceAtLeast(0L) * 1000L,
                     mimeType = if (attrs.type == FileMode.Type.DIRECTORY) null else BackendPath.guessMime(info.name),
                 )
             }
@@ -216,7 +216,7 @@ class SftpStorageBackend(
             name = BackendPath.name(normalized),
             isDirectory = directory,
             size = if (directory) 0L else attrs.size.coerceAtLeast(0L),
-            modifiedAt = attrs.mtime.toLong().coerceAtLeast(0L) * 1000L,
+            modifiedAt = attrs.mtime.coerceAtLeast(0L) * 1000L,
             mimeType = if (directory) null else BackendPath.guessMime(BackendPath.name(normalized)),
         )
     }

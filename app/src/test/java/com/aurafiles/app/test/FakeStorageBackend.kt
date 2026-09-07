@@ -19,15 +19,17 @@ class FakeStorageBackend(
     override val descriptor = StorageBackendDescriptor(id, id, kind)
     private data class Node(var directory: Boolean, var bytes: ByteArray = byteArrayOf(), var modifiedAt: Long = 1L)
     private val nodes = linkedMapOf("/" to Node(true))
+    private val linkPaths = mutableSetOf<String>()
     var failReadPath: String? = null
     var failAfterBytes: Int = Int.MAX_VALUE
     var backupDeleteFailuresRemaining: Int = 0
     var backupDeleteAttempts: Int = 0
 
-    fun putDirectory(path: String) {
+    fun putDirectory(path: String, isLink: Boolean = false) {
         val normalized = BackendPath.normalize(path)
         ensureParents(normalized)
         nodes[normalized] = Node(true)
+        if (isLink) linkPaths += normalized else linkPaths -= normalized
     }
 
     fun putFile(path: String, text: String, modifiedAt: Long = 1L) = putFile(path, text.toByteArray(), modifiedAt)
@@ -151,6 +153,7 @@ class FakeStorageBackend(
             size = if (node.directory) 0L else node.bytes.size.toLong(),
             modifiedAt = node.modifiedAt,
             mimeType = if (node.directory) null else BackendPath.guessMime(path),
+            isLink = path in linkPaths,
         )
     }
 
@@ -170,11 +173,19 @@ class FakeStorageBackend(
             .sortedBy { it.key.length }
         require(entries.isNotEmpty()) { "Missing $source" }
         ensureParents(target)
+        val linked = entries.mapNotNull { (key, _) -> key.takeIf { it in linkPaths } }.toSet()
         val copies = entries.map { (key, value) ->
             val suffix = key.removePrefix(source)
             (target + suffix) to value.copy(bytes = value.bytes.copyOf())
         }
-        entries.sortedByDescending { it.key.length }.forEach { nodes.remove(it.key) }
-        copies.forEach { (key, node) -> nodes[key] = node }
+        entries.sortedByDescending { it.key.length }.forEach {
+            nodes.remove(it.key)
+            linkPaths.remove(it.key)
+        }
+        copies.forEach { (key, node) ->
+            nodes[key] = node
+            val original = source + key.removePrefix(target)
+            if (original in linked) linkPaths += key
+        }
     }
 }

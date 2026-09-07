@@ -1,0 +1,43 @@
+> **ИСТОРИЧЕСКИЙ ДОКУМЕНТ.** Актуальная версия — 1.2.3; исправлены Android Keystore IV и завершение Google AuthorizationClient.
+
+Aura Files 1.2.2 CLOUD FINAL — проверка пакета
+Дата: 2026-09-07
+
+Версия:
+- versionName = 1.2.2
+- versionCode = 122
+- package = com.aurafiles.app
+
+Cloud/auth:
+- Yandex device-code OAuth использует Client ID + Client Secret для token/refresh stage.
+- Yandex Client Secret хранится через Android Keystore/AES-GCM.
+- Google использует Google Identity Services AuthorizationClient и Drive REST API.
+- После cloud OAuth успех подтверждается реальным provider API, backend регистрируется и workspace открывается с конкретным cloud backend id.
+- Ошибка отсутствующего cloud backend больше не маскируется двумя Local-панелями.
+
+UI 1.2.2:
+- «Сеть»: 4 верхнеуровневых блока: устройства рядом / подключиться / создать сервер / облако.
+- Обычное открытие Yandex/Google: single-pane.
+- Dual-pane сохранён отдельной командой для transfer-задач.
+- Cloud file tap: StorageBackend.openRead -> app-private cache/backend-open -> FileProvider/ACTION_VIEW.
+- Локальная корзина .AuraTrash: полноэкранная навигация по удалённым папкам + открытие вложенных файлов; Restore/Delete Forever на root records сохранены.
+
+Статические проверки текущего финального дерева:
+- Kotlin/KTS: 120 файлов; Kotlin PSI/compiler front-end parse errors = 0.
+- Android XML: 14 файлов; XML parse errors = 0.
+- versionName/versionCode assertions = OK.
+- Cloud UI/single-pane/trash-browser/FileProvider path assertions = OK.
+- Yandex client_secret token-flow assertion = OK.
+- Google Drive about() validation assertion = OK.
+
+Полный Gradle compile в текущей контейнерной среде:
+- НЕ ВЫПОЛНЕН: Gradle wrapper до конфигурации/компиляции проекта пытается скачать gradle-9.5.0-bin.zip и получает java.net.UnknownHostException: services.gradle.org.
+- Это ограничение среды, а не полученная compile error проекта.
+- На Windows обязательно выполнить BUILD_ON_CLEAN_WINDOWS.bat или:
+  gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon
+
+Упаковка:
+- SOURCE_SHA256SUMS.txt должен быть сгенерирован ПОСЛЕДНИМ после этого файла и всех остальных правок.
+- После генерации manifest дерево исходников не изменять.
+- ZIP создавать с сохранением ведущих точек (.gitignore, .github).
+- Проверить точное совпадение набора файлов, SHA manifest внутри ZIP и unzip -t.

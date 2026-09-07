@@ -71,6 +71,92 @@ public interface IndexedFileDao {
     @Query("DELETE FROM indexed_files WHERE rootId = :rootId AND uri IN (:uris)")
     void deleteUris(String rootId, List<String> uris);
 
+
+    @Query("SELECT COUNT(*) FROM indexed_files WHERE rootId = :rootId AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleCount(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT category, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM indexed_files WHERE rootId = :rootId AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') GROUP BY category")
+    List<CategoryAggregate> visibleCategoryAggregates(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT sourceFolder, COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes FROM indexed_files WHERE rootId = :rootId AND sourceFolder IN ('Загрузки','Камера') AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') GROUP BY sourceFolder")
+    List<SourceAggregate> visibleSourceAggregates(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COUNT(*) FROM indexed_files WHERE rootId = :rootId AND readerSupported = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleBookCount(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM indexed_files WHERE rootId = :rootId AND readerSupported = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleBookBytes(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND category = :category AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY modifiedAt DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleByCategory(String rootId, String category, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COUNT(*) FROM indexed_files WHERE rootId = :rootId AND category = 'Images' " +
+            "AND (:showHidden = 1 OR name NOT LIKE '.%') " +
+            "AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') " +
+            "AND (:query = '' OR LOWER(name) LIKE '%' || LOWER(:query) || '%') " +
+            "AND (" +
+            " :sourceFilter = 'All' " +
+            " OR (:sourceFilter = 'Camera' AND sourceFolder = 'Камера') " +
+            " OR (:sourceFilter = 'Screenshots' AND sourceFolder = 'Снимки экрана') " +
+            " OR (:sourceFilter = 'WhatsApp' AND sourceFolder = 'WhatsApp') " +
+            " OR (:sourceFilter = 'Telegram' AND sourceFolder = 'Telegram') " +
+            " OR (:sourceFilter = 'Downloads' AND sourceFolder = 'Загрузки') " +
+            " OR (:sourceFilter = 'Other' AND sourceFolder NOT IN ('Камера','Снимки экрана','WhatsApp','Telegram','Загрузки'))" +
+            ")")
+    long visibleImageCount(String rootId, String sourceFilter, String query, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND category = 'Images' " +
+            "AND (:showHidden = 1 OR name NOT LIKE '.%') " +
+            "AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') " +
+            "AND (:query = '' OR LOWER(name) LIKE '%' || LOWER(:query) || '%') " +
+            "AND (" +
+            " :sourceFilter = 'All' " +
+            " OR (:sourceFilter = 'Camera' AND sourceFolder = 'Камера') " +
+            " OR (:sourceFilter = 'Screenshots' AND sourceFolder = 'Снимки экрана') " +
+            " OR (:sourceFilter = 'WhatsApp' AND sourceFolder = 'WhatsApp') " +
+            " OR (:sourceFilter = 'Telegram' AND sourceFolder = 'Telegram') " +
+            " OR (:sourceFilter = 'Downloads' AND sourceFolder = 'Загрузки') " +
+            " OR (:sourceFilter = 'Other' AND sourceFolder NOT IN ('Камера','Снимки экрана','WhatsApp','Telegram','Загрузки'))" +
+            ") " +
+            "ORDER BY " +
+            "CASE WHEN :sortMode = 'Name' AND :ascending = 1 THEN LOWER(name) END ASC, " +
+            "CASE WHEN :sortMode = 'Name' AND :ascending = 0 THEN LOWER(name) END DESC, " +
+            "CASE WHEN :sortMode = 'Modified' AND :ascending = 1 THEN modifiedAt END ASC, " +
+            "CASE WHEN :sortMode = 'Modified' AND :ascending = 0 THEN modifiedAt END DESC, " +
+            "CASE WHEN :sortMode = 'Size' AND :ascending = 1 THEN size END ASC, " +
+            "CASE WHEN :sortMode = 'Size' AND :ascending = 0 THEN size END DESC, " +
+            "CASE WHEN :sortMode = 'Type' AND :ascending = 1 THEN LOWER(extension) END ASC, " +
+            "CASE WHEN :sortMode = 'Type' AND :ascending = 0 THEN LOWER(extension) END DESC, " +
+            "LOWER(name) ASC, uri ASC LIMIT :limit OFFSET :offset")
+    List<IndexedFileEntity> visibleImagesPage(
+            String rootId, String sourceFilter, String query, String sortMode, boolean ascending,
+            int limit, int offset, boolean showHidden, boolean showThumbnails
+    );
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND readerSupported = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY modifiedAt DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleBooks(String rootId, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND sourceFolder = :sourceFolder AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY modifiedAt DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleBySourceFolder(String rootId, String sourceFolder, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND temporaryCandidate = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY size DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleTemporary(String rootId, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COUNT(*) FROM indexed_files WHERE rootId = :rootId AND temporaryCandidate = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleTemporaryCount(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM indexed_files WHERE rootId = :rootId AND temporaryCandidate = 1 AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleTemporaryBytes(String rootId, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY modifiedAt DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleRecent(String rootId, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT * FROM indexed_files WHERE rootId = :rootId AND size >= :minBytes AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш') ORDER BY size DESC LIMIT :limit")
+    List<IndexedFileEntity> visibleLargestAtLeast(String rootId, long minBytes, int limit, boolean showHidden, boolean showThumbnails);
+
+    @Query("SELECT COUNT(*) FROM indexed_files WHERE rootId = :rootId AND size >= :minBytes AND (:showHidden = 1 OR name NOT LIKE '.%') AND (:showThumbnails = 1 OR sourceFolder != 'Миниатюры и кэш')")
+    long visibleLargeCount(String rootId, long minBytes, boolean showHidden, boolean showThumbnails);
+
     @Query("SELECT f.* FROM indexed_files f INNER JOIN (SELECT size FROM indexed_files WHERE rootId = :rootId AND size > 0 GROUP BY size HAVING COUNT(*) > 1) d ON f.size = d.size WHERE f.rootId = :rootId ORDER BY f.size, f.uri")
     List<IndexedFileEntity> duplicateCandidates(String rootId);
 

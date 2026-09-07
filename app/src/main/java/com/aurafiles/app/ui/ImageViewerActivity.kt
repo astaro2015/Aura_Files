@@ -32,10 +32,10 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.RotateRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.RotateRight
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -170,9 +170,10 @@ private fun ImageViewerScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
     val deleteAnimationMode = remember(context) { FileRepository(context.applicationContext).deleteAnimationMode() }
     var deletingUri by remember { mutableStateOf<Uri?>(null) }
+    val initialImages = sessionImages.takeIf { it.isNotEmpty() }
+        ?: listOf(ViewerImage(initialUri, initialName, parentUri))
     val sourceImages by produceState(
-        initialValue = sessionImages.takeIf { it.isNotEmpty() }
-            ?: listOf(ViewerImage(initialUri, initialName, parentUri)),
+        initialValue = initialImages,
         parentUri,
         initialUri,
         sessionImages,
@@ -182,7 +183,10 @@ private fun ImageViewerScreen(
     }
     var deletedUris by remember { mutableStateOf<Set<Uri>>(emptySet()) }
     val images = sourceImages.filterNot { it.uri in deletedUris }
-    val pagerState = rememberPagerState(initialPage = 0, pageCount = { images.size.coerceAtLeast(1) })
+    val initialPage = remember(initialImages, initialUri) {
+        initialImages.indexOfFirst { it.uri == initialUri }.coerceAtLeast(0)
+    }
+    val pagerState = rememberPagerState(initialPage = initialPage, pageCount = { images.size.coerceAtLeast(1) })
     val scope = rememberCoroutineScope()
     var infoOpen by remember { mutableStateOf(false) }
     var rotation by remember { mutableIntStateOf(0) }
@@ -221,7 +225,7 @@ private fun ImageViewerScreen(
                 )
                 Text("${pagerState.currentPage + 1} / ${images.size}")
                 IconButton(onClick = { rotation = (rotation + 90) % 360 }) {
-                    Icon(Icons.Rounded.RotateRight, contentDescription = "Повернуть просмотр")
+                    Icon(Icons.AutoMirrored.Rounded.RotateRight, contentDescription = "Повернуть просмотр")
                 }
                 IconButton(onClick = { infoOpen = true }) { Icon(Icons.Rounded.Info, contentDescription = "EXIF") }
             }

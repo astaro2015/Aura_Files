@@ -1,0 +1,69 @@
+> **ИСТОРИЧЕСКИЙ ДОКУМЕНТ.** Cloud OAuth из этой версии заменён исправлением 1.2.2. Для Яндекса актуальный flow требует Client ID + Client Secret; для Google актуальна диагностика Android OAuth package/SHA-1 и обязательная проверка Drive API.
+
+Aura Files 1.2.0 CLOUD — проверка этапа 4
+Дата: 2026-09-06
+
+Входной пакет этапа:
+- Aura_Files_1.1.0_CLOUD_STAGE3_source.zip
+- SHA-256: 32f372f4b693e120a58d202a96c819d6854ab15f0dbad4e718c69452f1c75994
+
+Версия текущего дерева:
+- versionName: 1.2.0
+- versionCode: 120
+- Yandex User-Agent: AuraFiles/1.2.0
+
+Архитектурно проверено:
+- сохранённые Yandex cloud profiles регистрируются как YandexDiskStorageBackend в общем StorageBackendRegistry;
+- BackendFactory создаёт Yandex backend через YandexAuthService + YandexAuthTokenProvider;
+- Local/SMB/FTP/SFTP не получили отдельной cloud-логики и продолжают использовать прежние backend implementations;
+- раздел «Сеть» показывает CloudProfilesCard и открывает Yandex backend в BackendWorkspaceActivity;
+- универсальные панели показывают Yandex Disk рядом с Local/SMB/FTP/SFTP;
+- device-code UI не принимает пользовательский access/refresh token вручную;
+- Client Secret не запрашивается UI и не хранится приложением;
+- публичный Client ID может быть задан через AURA_YANDEX_CLIENT_ID или один раз сохранён на устройстве;
+- стабильный Yandex device_id исключён из Android backup/device transfer;
+- повторная авторизация того же Yandex uid обновляет существующий profile/tokens вместо создания дубля;
+- удаление cloud profile удаляет локальный профиль и OAuth tokens, но не удаляет файлы Яндекс.Диска;
+- Photoslice по-прежнему не смешан с официальным Yandex REST backend.
+
+Проверено в контейнере:
+- Kotlin/KTS PSI parse: 107 файлов, 0 синтаксических ошибок;
+- Android XML parse: 14 файлов, 0 ошибок;
+- Yandex Stage4 auth duplicate-account smoke: OK;
+- Yandex OAuth settings smoke: OK;
+  * build-time Client ID fallback;
+  * remembered Client ID has priority for refresh-token compatibility;
+  * stable device_id;
+  * device_name generation;
+- security scan новых cloud/UI/wiring файлов: явных token/client-secret literals не найдено;
+- logging scan новых cloud/UI/wiring файлов: Log/println/printStackTrace не найдено;
+- diff относительно Stage 3: изменения ограничены cloud/Yandex wiring, UI, version/build config, backup rules и документацией;
+- junk directories build/.gradle/.idea/__pycache__: отсутствуют.
+
+Полный Android Gradle build НЕ заявляется пройденным:
+- финальная команда: ./gradlew :app:testDebugUnitTest :app:assembleDebug --offline --no-daemon
+- wrapper до конфигурации проекта пытается получить локально отсутствующий gradle-9.5.0-bin.zip;
+- https://services.gradle.org/distributions/gradle-9.5.0-bin.zip недоступен в контейнере;
+- результат: java.net.UnknownHostException: services.gradle.org;
+- Gradle не дошёл до чтения/компиляции проекта, поэтому это ограничение среды, а не полученная compile error исходников.
+
+Контрольная проверка на Windows/CI:
+  gradlew.bat testDebugUnitTest assembleDebug lintDebug --no-daemon
+
+Для release Yandex OAuth:
+- зарегистрировать OAuth-приложение Яндекса с правами Yandex Disk REST API на чтение/запись;
+- передать публичный Client ID через AURA_YANDEX_CLIENT_ID при сборке;
+- Client Secret в APK не требуется текущему Android UI.
+
+Официальная схема device-code OAuth проверена по актуальной документации Яндекса 2026-09-06:
+- POST /device/code требует client_id;
+- обмен device_code на token допускает client_id/client_secret как дополнительные параметры;
+- interval/expires_in должны соблюдаться;
+- при отсутствии scope токен получает права, заданные при регистрации OAuth-приложения.
+
+Намеренно ещё не сделано:
+- отдельное Yandex Trash view;
+- Photoslice Android read-only adapter;
+- Google Identity Services / AuthorizationClient;
+- GoogleDriveStorageBackend;
+- instrumented end-to-end тест на реальном Android устройстве/реальном Yandex OAuth аккаунте.
