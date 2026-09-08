@@ -5,8 +5,10 @@ import java.net.Inet6Address
 import java.net.InetSocketAddress
 import java.net.SocketAddress
 import java.nio.channels.SeekableByteChannel
+import java.nio.file.DirectoryStream
 import java.nio.file.AccessDeniedException
 import java.nio.file.CopyOption
+import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.OpenOption
 import java.nio.file.Path
@@ -22,6 +24,7 @@ import org.apache.sshd.common.session.Session
 import org.apache.sshd.common.session.SessionListener
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
+import org.apache.sshd.sftp.server.DirectoryHandle
 import org.apache.sshd.sftp.server.FileHandle
 import org.apache.sshd.sftp.server.SftpFileSystemAccessor
 import org.apache.sshd.sftp.server.SftpSubsystemFactory
@@ -60,7 +63,7 @@ class SftpServer(
             // No ShellFactory and no CommandFactory are installed: this endpoint is SFTP only.
             setFileSystemFactory(VirtualFileSystemFactory(rootPath))
             val sftpFactory = SftpSubsystemFactory.Builder()
-                .withFileSystemAccessor(if (config.readOnly) ReadOnlySftpAccessor else SftpFileSystemAccessor.DEFAULT)
+                .withFileSystemAccessor(VaultFilteringSftpAccessor(config.readOnly))
                 .build()
             setSubsystemFactories(listOf(sftpFactory))
 
@@ -112,8 +115,47 @@ class SftpServer(
         right.toByteArray(Charsets.UTF_8),
     )
 
-    private object ReadOnlySftpAccessor : SftpFileSystemAccessor {
-        private fun denied(path: Path): Nothing = throw AccessDeniedException(path.toString(), null, "SFTP-сервер работает только на чтение")
+    private class VaultFilteringSftpAccessor(
+        private val readOnly: Boolean,
+    ) : SftpFileSystemAccessor {
+        private fun denied(path: Path): Nothing =
+            throw AccessDeniedException(path.toString(), null, "Путь зарезервирован Aura Files")
+
+        private fun readOnlyDenied(path: Path): Nothing =
+            throw AccessDeniedException(path.toString(), null, "SFTP-сервер работает только на чтение")
+
+        private fun isReservedPath(path: Path): Boolean =
+            path.normalize().any { segment ->
+                segment.toString() == AuraVault.VAULT_FOLDER || segment.toString() == AURA_TRASH_FOLDER
+            }
+
+        private fun ensureVisible(path: Path) {
+            if (isReservedPath(path)) denied(path)
+        }
+
+        override fun resolveLocalFilePath(
+            subsystem: SftpSubsystemProxy,
+            rootDir: Path,
+            remotePath: String,
+        ): Path {
+            val resolved = SftpFileSystemAccessor.DEFAULT.resolveLocalFilePath(subsystem, rootDir, remotePath)
+            ensureVisible(resolved)
+            return resolved
+        }
+
+        override fun openDirectory(
+            subsystem: SftpSubsystemProxy,
+            dirHandle: DirectoryHandle?,
+            dir: Path,
+            handle: String?,
+            vararg linkOptions: LinkOption,
+        ): DirectoryStream<Path> {
+            ensureVisible(dir)
+            return Files.newDirectoryStream(dir) { child ->
+                val name = child.fileName?.toString()
+                name != AuraVault.VAULT_FOLDER && name != AURA_TRASH_FOLDER
+            }
+        }
 
         override fun openFile(
             subsystem: SftpSubsystemProxy,
@@ -123,6 +165,7 @@ class SftpServer(
             options: Set<OpenOption>,
             vararg attrs: FileAttribute<*>,
         ): SeekableByteChannel {
+            ensureVisible(file)
             val writes = options.any {
                 it == StandardOpenOption.WRITE ||
                     it == StandardOpenOption.APPEND ||
@@ -131,7 +174,7 @@ class SftpServer(
                     it == StandardOpenOption.TRUNCATE_EXISTING ||
                     it == StandardOpenOption.DELETE_ON_CLOSE
             }
-            if (writes) denied(file)
+            if (readOnly && writes) readOnlyDenied(file)
             return SftpFileSystemAccessor.DEFAULT.openFile(subsystem, fileHandle, file, handle, options, *attrs)
         }
 
@@ -142,66 +185,114 @@ class SftpServer(
             attribute: String,
             value: Any,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.setFileAttribute(subsystem, file, view, attribute, value, *options)
+        }
 
         override fun setFileOwner(
             subsystem: SftpSubsystemProxy,
             file: Path,
             value: Principal,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.setFileOwner(subsystem, file, value, *options)
+        }
 
         override fun setGroupOwner(
             subsystem: SftpSubsystemProxy,
             file: Path,
             value: Principal,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.setGroupOwner(subsystem, file, value, *options)
+        }
 
         override fun setFilePermissions(
             subsystem: SftpSubsystemProxy,
             file: Path,
             perms: Set<PosixFilePermission>,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.setFilePermissions(subsystem, file, perms, *options)
+        }
 
         override fun setFileAccessControl(
             subsystem: SftpSubsystemProxy,
             file: Path,
             acl: List<AclEntry>,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.setFileAccessControl(subsystem, file, acl, *options)
+        }
 
-        override fun createDirectory(subsystem: SftpSubsystemProxy, path: Path) = denied(path)
+        override fun createDirectory(subsystem: SftpSubsystemProxy, path: Path) {
+            ensureVisible(path)
+            if (readOnly) readOnlyDenied(path)
+            SftpFileSystemAccessor.DEFAULT.createDirectory(subsystem, path)
+        }
 
         override fun createLink(
             subsystem: SftpSubsystemProxy,
             link: Path,
             existing: Path,
             symLink: Boolean,
-        ) = denied(link)
+        ) {
+            ensureVisible(link)
+            ensureVisible(existing)
+            if (readOnly) readOnlyDenied(link)
+            SftpFileSystemAccessor.DEFAULT.createLink(subsystem, link, existing, symLink)
+        }
 
         override fun renameFile(
             subsystem: SftpSubsystemProxy,
             oldPath: Path,
             newPath: Path,
             opts: Collection<CopyOption>,
-        ) = denied(oldPath)
+        ) {
+            ensureVisible(oldPath)
+            ensureVisible(newPath)
+            if (readOnly) readOnlyDenied(oldPath)
+            SftpFileSystemAccessor.DEFAULT.renameFile(subsystem, oldPath, newPath, opts)
+        }
 
         override fun copyFile(
             subsystem: SftpSubsystemProxy,
             src: Path,
             dst: Path,
             opts: Collection<CopyOption>,
-        ) = denied(dst)
+        ) {
+            ensureVisible(src)
+            ensureVisible(dst)
+            if (readOnly) readOnlyDenied(dst)
+            SftpFileSystemAccessor.DEFAULT.copyFile(subsystem, src, dst, opts)
+        }
 
-        override fun removeFile(subsystem: SftpSubsystemProxy, path: Path, isDirectory: Boolean) = denied(path)
+        override fun removeFile(subsystem: SftpSubsystemProxy, path: Path, isDirectory: Boolean) {
+            ensureVisible(path)
+            if (readOnly) readOnlyDenied(path)
+            SftpFileSystemAccessor.DEFAULT.removeFile(subsystem, path, isDirectory)
+        }
 
         override fun applyExtensionFileAttributes(
             subsystem: SftpSubsystemProxy,
             file: Path,
             extensions: Map<String, ByteArray>,
             vararg options: LinkOption,
-        ) = denied(file)
+        ) {
+            ensureVisible(file)
+            if (readOnly) readOnlyDenied(file)
+            SftpFileSystemAccessor.DEFAULT.applyExtensionFileAttributes(subsystem, file, extensions, *options)
+        }
     }
+
 }

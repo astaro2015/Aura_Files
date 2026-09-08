@@ -204,17 +204,39 @@ class SimilarPhotoFinder(private val context: Context) {
         } else {
             context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         }
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        if (width <= 0 || height <= 0) return null
+        if (width > MAX_SOURCE_DIMENSION || height > MAX_SOURCE_DIMENSION) return null
         var sample = 1
-        while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2
-        val options = BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) }
-        return if (entry.uri.scheme == ContentResolver.SCHEME_FILE) {
-            BitmapFactory.decodeFile(entry.uri.path, options)
-        } else {
-            context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        while (
+            width / sample > HASH_MAX_EDGE ||
+            height / sample > HASH_MAX_EDGE ||
+            (width.toLong() / sample) * (height.toLong() / sample) > HASH_MAX_PIXELS
+        ) {
+            if (sample >= MAX_SAMPLE_SIZE) return null
+            sample *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sample.coerceAtLeast(1)
+            inPreferredConfig = Bitmap.Config.RGB_565
+        }
+        return try {
+            if (entry.uri.scheme == ContentResolver.SCHEME_FILE) {
+                BitmapFactory.decodeFile(entry.uri.path, options)
+            } else {
+                context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+            }
+        } catch (_: OutOfMemoryError) {
+            null
         }
     }
 
     companion object {
+        private const val HASH_MAX_EDGE = 512
+        private const val HASH_MAX_PIXELS = 512L * 512L
+        private const val MAX_SOURCE_DIMENSION = 65_535
+        private const val MAX_SAMPLE_SIZE = 1 shl 15
         const val DEFAULT_MAX_IMAGES = 2_000
         const val DEFAULT_MAX_COMPARISONS = 2_000_000L
         const val DEFAULT_MAX_STORED_PAIRS = 10_000

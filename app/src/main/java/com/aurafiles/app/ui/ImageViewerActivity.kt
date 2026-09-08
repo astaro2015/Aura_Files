@@ -321,9 +321,8 @@ private fun ZoomableViewerImage(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val targetEdge = remember(context) {
-        max(context.resources.displayMetrics.widthPixels, context.resources.displayMetrics.heightPixels)
-            .times(2)
-            .coerceIn(1600, 4096)
+        (max(context.resources.displayMetrics.widthPixels, context.resources.displayMetrics.heightPixels) * 5 / 4)
+            .coerceIn(1600, 3072)
     }
     val bitmap by produceState<Bitmap?>(initialValue = null, image.uri, targetEdge) {
         value = withContext(Dispatchers.IO) { decodeForViewer(context, image.uri, targetEdge) }
@@ -485,12 +484,30 @@ private fun decodeForViewer(context: Context, uri: Uri, maxEdge: Int): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     if (uri.scheme == ContentResolver.SCHEME_FILE) BitmapFactory.decodeFile(uri.path, bounds)
     else context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    val width = bounds.outWidth
+    val height = bounds.outHeight
+    if (width <= 0 || height <= 0) return null
+    if (width > VIEWER_MAX_SOURCE_DIMENSION || height > VIEWER_MAX_SOURCE_DIMENSION) return null
     var sample = 1
-    while (bounds.outWidth / sample > maxEdge || bounds.outHeight / sample > maxEdge) sample *= 2
-    val opts = BitmapFactory.Options().apply { inSampleSize = sample.coerceAtLeast(1) }
-    val decoded = if (uri.scheme == ContentResolver.SCHEME_FILE) BitmapFactory.decodeFile(uri.path, opts)
-    else context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+    val edge = maxEdge.coerceIn(1, VIEWER_MAX_EDGE)
+    while (
+        width / sample > edge ||
+        height / sample > edge ||
+        (width.toLong() / sample) * (height.toLong() / sample) > VIEWER_MAX_DECODED_PIXELS
+    ) {
+        if (sample >= VIEWER_MAX_SAMPLE) return null
+        sample *= 2
+    }
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = sample.coerceAtLeast(1)
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    val decoded = try {
+        if (uri.scheme == ContentResolver.SCHEME_FILE) BitmapFactory.decodeFile(uri.path, opts)
+        else context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
+    } catch (_: OutOfMemoryError) {
+        null
+    }
     decoded ?: return null
     val exif = runCatching { openExif(context, uri) }.getOrNull() ?: return decoded
     if (exif.rotationDegrees == 0 && !exif.isFlipped) return decoded
@@ -513,6 +530,11 @@ private fun openExif(context: Context, uri: Uri): ExifInterface =
             ?: throw IOException("Не удалось открыть EXIF")
         descriptor.use { ExifInterface(it.fileDescriptor) }
     }
+
+private const val VIEWER_MAX_EDGE = 3072
+private const val VIEWER_MAX_SOURCE_DIMENSION = 65_535
+private const val VIEWER_MAX_DECODED_PIXELS = 8_000_000L
+private const val VIEWER_MAX_SAMPLE = 1 shl 15
 
 private fun readExif(context: Context, uri: Uri): ExifDetails {
     val exif = openExif(context, uri)

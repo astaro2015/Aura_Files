@@ -198,6 +198,7 @@ import com.aurafiles.app.model.LanService
 import com.aurafiles.app.model.SmbEntry
 import com.aurafiles.app.model.SmbProfile
 import com.aurafiles.app.model.SftpProfile
+import com.aurafiles.app.data.AuraVault
 import com.aurafiles.app.data.FtpServerService
 import com.aurafiles.app.data.FastDocumentListing
 import com.aurafiles.app.data.SftpServerService
@@ -2704,6 +2705,7 @@ private fun BrowserScreen(
         if (hasCollectionGroups) emptyList() else if (imageCollection) {
             state.items.filter {
                 !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
                     (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
@@ -2711,6 +2713,7 @@ private fun BrowserScreen(
         } else sortEntries(
             entries = state.items.filter {
                 !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
                     (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
@@ -2726,6 +2729,7 @@ private fun BrowserScreen(
             val sorted = sortEntries(
                 group.entries.filter {
                     !it.name.equals(".AuraTrash", ignoreCase = true) &&
+                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
                         (state.showHidden || !it.name.startsWith('.')) &&
                         (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                         it.name.contains(query, ignoreCase = true)

@@ -1,0 +1,16 @@
+Aura Files 1.3.2 — package verification
+
+PASS: app/build.gradle.kts versionName=1.3.2, versionCode=132.
+PASS: Kotlin/KTS PSI syntax: 125 files, 0 errors.
+PASS: Android XML parse: 14 files, 0 errors.
+PASS: AuraVault.kt semantic compile against Android/API stubs.
+PASS: AVF2 bounded-memory stress: 314572923 bytes round-trip under JVM -Xmx64m.
+PASS: AVF2 integrity: correct-key round-trip; wrong key rejected; ciphertext corruption rejected; truncation rejected; encrypted thumbnail authenticated.
+PASS: no whole-file payload readBytes()/ByteArray(fileSize) in AuraVault AVF2 path.
+PASS: `.AuraVault` filtered/reserved in FileRepository, StorageIndexer, LocalStorageBackend, FTP server and SFTP server.
+PASS: Vault preview plaintext uses FileProvider-covered cache path `vault-open/`.
+PASS: temporary/backup development file AuraVault.kt.before_avf2 removed from package.
+
+PASS: Windows build-log compile failure `private FileRepository.Companion` fixed via module-internal `AURA_TRASH_FOLDER`; no external `FileRepository.TRASH_FOLDER` references remain.
+
+LIMITATION: full Gradle build could not start in this execution environment because gradle-wrapper needs https://services.gradle.org/distributions/gradle-9.5.0-bin.zip and DNS/network access fails with UnknownHostException. This is before project source compilation.

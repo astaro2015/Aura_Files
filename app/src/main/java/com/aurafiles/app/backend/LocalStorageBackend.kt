@@ -5,6 +5,8 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
+import com.aurafiles.app.data.AuraVault
+import com.aurafiles.app.data.AURA_TRASH_FOLDER
 import com.aurafiles.app.data.FastDocumentListing
 import java.io.File
 import java.io.IOException
@@ -30,6 +32,7 @@ class LocalStorageBackend(
         val directory = resolve(path) ?: throw IOException("Папка недоступна: $path")
         require(directory.isDirectory) { "Это не папка: $path" }
         return FastDocumentListing.list(appContext, directory)
+            .filterNot { info -> isReservedName(info.name) }
             .map { info ->
                 StorageItem(
                     backendId = descriptor.id,
@@ -68,6 +71,7 @@ class LocalStorageBackend(
         val parent = resolve(parent(normalized)) ?: throw IOException("Папка назначения недоступна")
         require(parent.isDirectory && parent.canWrite()) { "Папка назначения недоступна для записи" }
         val name = BackendPath.name(normalized)
+        require(!isReservedName(name)) { "Имя $name зарезервировано Aura Files" }
         val existing = parent.findFile(name)
         if (existing != null) {
             if (!replace) throw IOException("$name уже существует")
@@ -107,6 +111,7 @@ class LocalStorageBackend(
         require(normalized != "/") { "Корень уже существует" }
         val parent = resolve(parent(normalized)) ?: throw IOException("Родительская папка недоступна")
         val name = BackendPath.name(normalized)
+        require(!isReservedName(name)) { "Имя $name зарезервировано Aura Files" }
         val existing = parent.findFile(name)
         val directory = existing?.takeIf(DocumentFile::isDirectory)
             ?: parent.createDirectory(name)
@@ -118,6 +123,7 @@ class LocalStorageBackend(
         val normalized = normalize(path)
         require(normalized != "/") { "Нельзя переименовать корень" }
         val document = resolve(normalized) ?: throw IOException("Объект недоступен")
+        require(!isReservedName(newName)) { "Имя $newName зарезервировано Aura Files" }
         require(document.renameTo(newName)) { "Не удалось переименовать ${document.name}" }
         return document.toStorageItem(parent(normalized))
     }
@@ -159,10 +165,14 @@ class LocalStorageBackend(
         val normalized = normalize(path)
         var current = root
         for (segment in BackendPath.relativeSegments(normalized)) {
+            if (isReservedName(segment)) return null
             current = current.findFile(segment) ?: return null
         }
         return current
     }
+
+    private fun isReservedName(name: String): Boolean =
+        name == AuraVault.VAULT_FOLDER || name == AURA_TRASH_FOLDER
 
     private fun DocumentFile.toStorageItem(parentPath: String): StorageItem {
         val name = name ?: "Без имени"

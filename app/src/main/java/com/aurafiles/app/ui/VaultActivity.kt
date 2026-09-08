@@ -2,14 +2,17 @@ package com.aurafiles.app.ui
 
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
+import android.util.LruCache
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -52,10 +55,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
@@ -65,6 +72,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.data.AuraVault
+import com.aurafiles.app.model.FileEntry
+import com.aurafiles.app.model.isReaderSupported
 import com.aurafiles.app.ui.theme.AuraFilesTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -93,6 +102,37 @@ class VaultActivity : ComponentActivity() {
         var status by remember { mutableStateOf<String?>(null) }
         var restoreItem by remember { mutableStateOf<AuraVault.Item?>(null) }
         var deleteItem by remember { mutableStateOf<AuraVault.Item?>(null) }
+        var previewEntry by remember { mutableStateOf<FileEntry?>(null) }
+        var openingId by remember { mutableStateOf<String?>(null) }
+        val thumbnailCache = remember {
+            object : LruCache<String, Bitmap>(VAULT_THUMBNAIL_CACHE_BYTES) {
+                override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+            }
+        }
+
+        fun openItem(item: AuraVault.Item) {
+            if (openingId != null || busy) return
+            openingId = item.encryptedFile.name
+            status = "Готовим ${item.name}…"
+            scope.launch {
+                val prepared = runCatching { withContext(Dispatchers.IO) { preparePlainEntry(vault, item) } }
+                openingId = null
+                prepared.onSuccess { entry ->
+                    status = null
+                    when {
+                        entry.isReaderSupported() -> runCatching { openBookReader(this@VaultActivity, entry) }
+                            .onFailure { previewEntry = entry }
+                        ArchiveBrowserActivity.isBrowsableArchiveName(entry.name) ->
+                            runCatching { ArchiveBrowserActivity.start(this@VaultActivity, entry) }
+                                .onFailure { previewEntry = entry }
+                        openEnhancedPreview(this@VaultActivity, entry) -> Unit
+                        else -> previewEntry = entry
+                    }
+                }.onFailure { error ->
+                    status = error.message ?: "Не удалось подготовить файл для просмотра"
+                }
+            }
+        }
 
         val restoreLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
             val item = restoreItem
@@ -195,11 +235,14 @@ class VaultActivity : ComponentActivity() {
                                 }
                             }
                         }
-                        items(listing.items, key = AuraVault.Item::id) { item ->
+                        items(listing.items, key = { it.encryptedFile.name }) { item ->
                             VaultRow(
+                                vault = vault,
                                 item = item,
-                                enabled = !busy,
-                                onOpen = { openVaultItem(vault, item) },
+                                thumbnailCache = thumbnailCache,
+                                enabled = !busy && openingId == null,
+                                opening = openingId == item.encryptedFile.name,
+                                onOpen = { openItem(item) },
                                 onRestore = {
                                     restoreItem = item
                                     restoreLauncher.launch(null)
@@ -212,6 +255,14 @@ class VaultActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+
+        previewEntry?.let { entry ->
+            FilePreviewDialog(
+                entry = entry,
+                onOpenExternal = { openPlainEntryExternally(entry) },
+                onDismiss = { previewEntry = null },
+            )
         }
 
         deleteItem?.let { item ->
@@ -241,8 +292,11 @@ class VaultActivity : ComponentActivity() {
 
     @Composable
     private fun VaultRow(
+        vault: AuraVault,
         item: AuraVault.Item,
+        thumbnailCache: LruCache<String, Bitmap>,
         enabled: Boolean,
+        opening: Boolean,
         onOpen: () -> Unit,
         onRestore: () -> Unit,
         onShare: () -> Unit,
@@ -255,7 +309,7 @@ class VaultActivity : ComponentActivity() {
                 .padding(start = 14.dp, top = 8.dp, end = 4.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(vaultIcon(item), contentDescription = null, modifier = Modifier.size(30.dp), tint = MaterialTheme.colorScheme.primary)
+            VaultThumbnail(vault, item, thumbnailCache)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(item.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
@@ -266,6 +320,7 @@ class VaultActivity : ComponentActivity() {
                             append(" · ")
                             append(DateFormat.getDateInstance(DateFormat.SHORT).format(Date(item.modifiedAt)))
                         }
+                        if (opening) append(" · готовим просмотр…")
                     },
                     fontSize = 11.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -285,26 +340,73 @@ class VaultActivity : ComponentActivity() {
         }
     }
 
-    private fun openVaultItem(vault: AuraVault, item: AuraVault.Item) {
-        Thread {
-            runCatching {
-                val file = vault.preparePlainFile(item)
-                val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    setDataAndType(uri, mimeFor(item))
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    @Composable
+    private fun VaultThumbnail(
+        vault: AuraVault,
+        item: AuraVault.Item,
+        cache: LruCache<String, Bitmap>,
+    ) {
+        val key = "${item.encryptedFile.absolutePath}|${item.encryptedFile.lastModified()}"
+        val bitmap by produceState<Bitmap?>(initialValue = cache.get(key), key, item.hasThumbnail) {
+            if (value == null && item.hasThumbnail) {
+                value = withContext(Dispatchers.IO) {
+                    runCatching { vault.loadThumbnail(item) }.getOrNull()?.also { cache.put(key, it) }
                 }
-                runOnUiThread {
-                    try {
-                        startActivity(intent)
-                    } catch (_: ActivityNotFoundException) {
-                        Toast.makeText(this, "Нет приложения для открытия этого файла", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }.onFailure { error ->
-                runOnUiThread { Toast.makeText(this, error.message ?: "Не удалось открыть файл", Toast.LENGTH_LONG).show() }
             }
-        }.start()
+        }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap!!.asImageBitmap(),
+                contentDescription = null,
+                modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)),
+                contentScale = ContentScale.Crop,
+            )
+        } else {
+            Surface(
+                modifier = Modifier.size(44.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        vaultIcon(item),
+                        contentDescription = null,
+                        modifier = Modifier.size(27.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun preparePlainEntry(vault: AuraVault, item: AuraVault.Item): FileEntry {
+        val file = vault.preparePlainFile(item)
+        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        return FileEntry(
+            document = DocumentFile.fromFile(file),
+            name = item.name,
+            uri = uri,
+            isDirectory = false,
+            mimeType = mimeFor(item),
+            size = item.size,
+            modifiedAt = item.modifiedAt,
+            parentUri = null,
+            vaultItemId = item.id,
+        )
+    }
+
+    private fun openPlainEntryExternally(entry: FileEntry) {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(entry.uri, entry.mimeType ?: "*/*")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            Toast.makeText(this, "Нет приложения для открытия этого файла", Toast.LENGTH_SHORT).show()
+        } catch (_: SecurityException) {
+            Toast.makeText(this, "Нет доступа к временному файлу", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun shareVaultItem(vault: AuraVault, item: AuraVault.Item) {
@@ -358,4 +460,9 @@ class VaultActivity : ComponentActivity() {
         }
         return if (value >= 100) "%.0f %s".format(value, units[index]) else "%.1f %s".format(value, units[index])
     }
+
+    companion object {
+        private const val VAULT_THUMBNAIL_CACHE_BYTES = 8 * 1024 * 1024
+    }
+
 }

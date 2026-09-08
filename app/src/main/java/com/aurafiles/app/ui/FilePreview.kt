@@ -9,9 +9,7 @@ import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
-import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
-import android.util.Size
 import android.util.LruCache
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -87,6 +85,7 @@ import java.io.File
 import java.io.IOException
 import kotlin.math.roundToInt
 import kotlin.math.max
+import kotlin.math.sqrt
 
 @Composable
 internal fun FileThumbnail(
@@ -368,61 +367,102 @@ private fun loadThumbnail(context: Context, entry: FileEntry, edge: Int): Bitmap
 }
 
 private fun loadThumbnailUncached(context: Context, entry: FileEntry, edge: Int): Bitmap? {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && entry.uri.scheme == "content") {
-        return context.contentResolver.loadThumbnail(entry.uri, Size(edge, edge), CancellationSignal())
-    }
+    // Do not use ContentResolver.loadThumbnail() here. Some OEM MediaProvider implementations
+    // have been observed to decode a very large source bitmap before honouring the requested
+    // thumbnail size, which can make a simple grid scroll attempt a 100-250+ MiB allocation.
+    // Images are sampled from bounds first; videos use the platform scaled-frame API.
     return if (isImage(entry)) {
-        decodeSampledImage(context, entry, edge)
+        decodeSampledImage(context, entry, edge, thumbnail = true)
     } else {
-        MediaMetadataRetriever().let { retriever ->
-            try {
-                retriever.setDataSource(context, entry.uri)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                    retriever.getScaledFrameAtTime(-1L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, edge, edge)
-                } else {
-                    retriever.frameAtTime?.let { raw ->
-                        val largest = max(raw.width, raw.height)
-                        if (largest <= edge) raw else {
-                            val scale = edge.toFloat() / largest
-                            Bitmap.createScaledBitmap(
-                                raw,
-                                (raw.width * scale).roundToInt().coerceAtLeast(1),
-                                (raw.height * scale).roundToInt().coerceAtLeast(1),
-                                true,
-                            ).also { raw.recycle() }
-                        }
-                    }
-                }
-            } finally {
-                retriever.release()
-            }
+        loadVideoThumbnail(context, entry, edge)
+    }
+}
+
+private fun loadVideoThumbnail(context: Context, entry: FileEntry, edge: Int): Bitmap? {
+    // getScaledFrameAtTime() was added in API 27 and avoids materialising a full 4K/8K frame.
+    // On older Android versions it is safer to show the normal video icon than to risk an OOM.
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) return null
+    return MediaMetadataRetriever().let { retriever ->
+        try {
+            retriever.setDataSource(context, entry.uri)
+            retriever.getScaledFrameAtTime(
+                -1L,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                edge.coerceIn(64, MAX_THUMBNAIL_EDGE),
+                edge.coerceIn(64, MAX_THUMBNAIL_EDGE),
+            )?.let { ensureBitmapWithin(it, edge.coerceAtMost(MAX_THUMBNAIL_EDGE)) }
+        } finally {
+            retriever.release()
         }
     }
 }
 
 private fun loadImage(context: Context, entry: FileEntry): Bitmap {
-    return decodeSampledImage(context, entry, MAX_IMAGE_EDGE)
+    return decodeSampledImage(context, entry, MAX_IMAGE_EDGE, thumbnail = false)
         ?: throw IOException("Не удалось декодировать изображение")
 }
 
-private fun decodeSampledImage(context: Context, entry: FileEntry, maxEdge: Int): Bitmap? {
+private fun decodeSampledImage(
+    context: Context,
+    entry: FileEntry,
+    maxEdge: Int,
+    thumbnail: Boolean,
+): Bitmap? {
+    val requestedEdge = maxEdge.coerceIn(1, if (thumbnail) MAX_THUMBNAIL_EDGE else MAX_IMAGE_EDGE)
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     if (entry.uri.scheme == "file") {
         BitmapFactory.decodeFile(entry.uri.path, bounds)
     } else {
         context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
     }
+
+    // If bounds could not be decoded, never retry with inSampleSize=1. That would turn a corrupt,
+    // exotic or OEM-problematic image into an unbounded full-resolution allocation.
+    val width = bounds.outWidth
+    val height = bounds.outHeight
+    if (width <= 0 || height <= 0) return null
+    if (width > MAX_SOURCE_DIMENSION || height > MAX_SOURCE_DIMENSION) return null
+    val sourcePixels = width.toLong() * height.toLong()
+    if (sourcePixels <= 0L || sourcePixels > MAX_SOURCE_PIXELS) return null
+
     var sample = 1
-    while (bounds.outWidth / sample > maxEdge || bounds.outHeight / sample > maxEdge) {
+    while (
+        width / sample > requestedEdge ||
+        height / sample > requestedEdge ||
+        (width.toLong() / sample) * (height.toLong() / sample) > MAX_DECODED_PIXELS
+    ) {
+        if (sample >= MAX_SAMPLE_SIZE) return null
         sample *= 2
     }
-    val options = BitmapFactory.Options().apply { inSampleSize = sample }
-    val bitmap = if (entry.uri.scheme == "file") {
-        BitmapFactory.decodeFile(entry.uri.path, options)
-    } else {
-        context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+
+    val options = BitmapFactory.Options().apply {
+        inSampleSize = sample
+        inPreferredConfig = if (thumbnail) Bitmap.Config.RGB_565 else Bitmap.Config.ARGB_8888
     }
-    return bitmap
+    val decoded = try {
+        if (entry.uri.scheme == "file") {
+            BitmapFactory.decodeFile(entry.uri.path, options)
+        } else {
+            context.contentResolver.openInputStream(entry.uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        }
+    } catch (_: OutOfMemoryError) {
+        null
+    } ?: return null
+    return ensureBitmapWithin(decoded, requestedEdge)
+}
+
+private fun ensureBitmapWithin(bitmap: Bitmap, edge: Int): Bitmap {
+    val largest = max(bitmap.width, bitmap.height)
+    if (largest <= edge || edge <= 0) return bitmap
+    val scale = edge.toFloat() / largest.toFloat()
+    val scaled = Bitmap.createScaledBitmap(
+        bitmap,
+        (bitmap.width * scale).roundToInt().coerceAtLeast(1),
+        (bitmap.height * scale).roundToInt().coerceAtLeast(1),
+        true,
+    )
+    if (scaled !== bitmap) bitmap.recycle()
+    return scaled
 }
 
 private fun renderPdfPage(context: Context, entry: FileEntry, requestedPage: Int): PdfPage {
@@ -430,10 +470,16 @@ private fun renderPdfPage(context: Context, entry: FileEntry, requestedPage: Int
         PdfRenderer(descriptor).use { renderer ->
             val pageIndex = requestedPage.coerceIn(0, renderer.pageCount - 1)
             renderer.openPage(pageIndex).use { page ->
-                val scale = (1400f / page.width.coerceAtLeast(1)).coerceAtMost(2.5f)
+                val pageWidth = page.width.coerceAtLeast(1)
+                val pageHeight = page.height.coerceAtLeast(1)
+                var scale = (PDF_TARGET_WIDTH.toFloat() / pageWidth).coerceAtMost(PDF_MAX_SCALE)
+                val estimatedPixels = pageWidth.toDouble() * pageHeight.toDouble() * scale * scale
+                if (estimatedPixels > PDF_MAX_PIXELS) {
+                    scale *= sqrt(PDF_MAX_PIXELS / estimatedPixels).toFloat()
+                }
                 val bitmap = Bitmap.createBitmap(
-                    (page.width * scale).roundToInt().coerceAtLeast(1),
-                    (page.height * scale).roundToInt().coerceAtLeast(1),
+                    (pageWidth * scale).roundToInt().coerceAtLeast(1),
+                    (pageHeight * scale).roundToInt().coerceAtLeast(1),
                     Bitmap.Config.ARGB_8888,
                 )
                 bitmap.eraseColor(android.graphics.Color.WHITE)
@@ -465,8 +511,16 @@ private fun isText(entry: FileEntry) = entry.mimeType?.startsWith("text/") == tr
 private data class PdfPage(val bitmap: Bitmap, val count: Int)
 private const val MAX_TEXT_PREVIEW_CHARS = 300_000
 private const val MAX_IMAGE_EDGE = 2_048
-private const val THUMBNAIL_CACHE_BYTES = 24 * 1024 * 1024
-private val THUMBNAIL_DECODER = Semaphore(4)
+private const val PDF_TARGET_WIDTH = 1_400
+private const val PDF_MAX_SCALE = 2.5f
+private const val PDF_MAX_PIXELS = 6_000_000.0
+private const val MAX_THUMBNAIL_EDGE = 320
+private const val MAX_SOURCE_DIMENSION = 65_535
+private const val MAX_SOURCE_PIXELS = 400_000_000L
+private const val MAX_DECODED_PIXELS = 4_194_304L // hard ceiling: 2048 x 2048
+private const val MAX_SAMPLE_SIZE = 1 shl 15
+private const val THUMBNAIL_CACHE_BYTES = 12 * 1024 * 1024
+private val THUMBNAIL_DECODER = Semaphore(2)
 private val THUMBNAIL_CACHE = object : LruCache<String, Bitmap>(THUMBNAIL_CACHE_BYTES) {
     override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
 }

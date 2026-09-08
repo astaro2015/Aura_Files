@@ -265,7 +265,9 @@ class FtpServer(
                 reply(550, "Объект не найден")
                 return
             }
-            val documents = if (target.isDirectory) target.listFiles().filterNot { it.name == TRASH_FOLDER } else listOf(target)
+            val documents = if (target.isDirectory) {
+                target.listFiles().filterNot { it.name == TRASH_FOLDER || it.name == AuraVault.VAULT_FOLDER }
+            } else listOf(target)
             withDataConnection("Открываем список") { data ->
                 val output = BufferedWriter(OutputStreamWriter(data.getOutputStream(), StandardCharsets.UTF_8))
                 documents.sortedWith(compareByDescending<DocumentFile> { it.isDirectory }.thenBy { it.name?.lowercase() }).forEach { document ->
@@ -327,6 +329,7 @@ class FtpServer(
                 reply(550, "Некорректное имя")
                 return
             }
+            if (isReservedName(name)) { reply(550, "Имя зарезервировано Aura Files"); return }
             val parent = resolve(parentPath)
             if (parent == null || !parent.isDirectory) {
                 reply(550, "Папка назначения не найдена")
@@ -370,6 +373,7 @@ class FtpServer(
             if (!writesAllowed()) return
             val path = virtualPath(rawPath)
             val (parentPath, name) = splitParent(path) ?: run { reply(550, "Некорректное имя"); return }
+            if (isReservedName(name)) { reply(550, "Имя зарезервировано Aura Files"); return }
             val parent = resolve(parentPath)
             if (parent == null || !parent.isDirectory || parent.findFile(name) != null) {
                 reply(550, "Папку создать нельзя")
@@ -421,6 +425,7 @@ class FtpServer(
             val targetPath = virtualPath(rawPath)
             val (sourceParent, _) = splitParent(source.first) ?: run { reply(550, "Некорректный путь"); return }
             val (targetParent, targetName) = splitParent(targetPath) ?: run { reply(550, "Некорректный путь"); return }
+            if (isReservedName(targetName)) { reply(553, "Имя зарезервировано Aura Files"); return }
             if (sourceParent != targetParent) {
                 reply(553, "Перемещение между папками через RNTO не поддерживается")
             } else if (resolve(targetPath) != null) {
@@ -466,11 +471,14 @@ class FtpServer(
             if (path == "/") return root.takeIf { it.exists() }
             var current = root
             path.trim('/').split('/').forEach { segment ->
-                if (segment == TRASH_FOLDER) return null
+                if (isReservedName(segment)) return null
                 current = current.findFile(segment) ?: return null
             }
             return current.takeIf { it.exists() }
         }
+
+        private fun isReservedName(name: String): Boolean =
+            name == TRASH_FOLDER || name == AuraVault.VAULT_FOLDER
 
         private fun virtualPath(rawPath: String): String {
             val raw = rawPath.trim().ifEmpty { cwd }

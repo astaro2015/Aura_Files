@@ -42,6 +42,8 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
+internal const val AURA_TRASH_FOLDER = ".AuraTrash"
+
 class FileRepository(private val context: Context) {
     private val resolver = context.contentResolver
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -129,6 +131,7 @@ class FileRepository(private val context: Context) {
     fun createFolder(parent: DocumentFile, requestedName: String): DocumentFile {
         val name = requestedName.trim()
         require(name.isNotEmpty()) { "Введите название папки" }
+        require(name != AuraVault.VAULT_FOLDER && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
         require(parent.findFile(name) == null) { "Папка с таким названием уже существует" }
         return requireNotNull(parent.createDirectory(name)) { "Не удалось создать папку" }
     }
@@ -136,6 +139,7 @@ class FileRepository(private val context: Context) {
     fun rename(entry: FileEntry, requestedName: String): Uri {
         val name = requestedName.trim()
         require(name.isNotEmpty()) { "Введите новое название" }
+        require(name != AuraVault.VAULT_FOLDER && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
         val oldUri = entry.uri
         require(entry.document.renameTo(name)) { "Не удалось переименовать объект" }
         replaceFavoriteUri(oldUri, entry.document.uri)
@@ -312,6 +316,7 @@ class FileRepository(private val context: Context) {
         require(entries.isNotEmpty() && entries.size == newNames.size) { "Некорректный список имён" }
         val cleaned = newNames.map(String::trim)
         require(cleaned.none(String::isBlank)) { "Новое имя не может быть пустым" }
+        require(cleaned.none { it == AuraVault.VAULT_FOLDER || it == TRASH_FOLDER }) { "Это имя зарезервировано Aura Files" }
         require(cleaned.distinctBy(String::lowercase).size == cleaned.size) { "Новые имена повторяются" }
 
         entries.zip(cleaned).groupBy { it.first.parentUri }.forEach { (parentUri, changes) ->
@@ -522,7 +527,7 @@ class FileRepository(private val context: Context) {
             if (limitReached) return
             directory.listFiles().forEach { child ->
                 if (limitReached) return@forEach
-                if (child.name == TRASH_FOLDER) return@forEach
+                if (child.name == TRASH_FOLDER || child.name == AuraVault.VAULT_FOLDER) return@forEach
                 if (child.isDirectory) {
                     walk(child)
                 } else {
@@ -1047,7 +1052,7 @@ class FileRepository(private val context: Context) {
         const val KEY_DELETE_ANIMATION = "delete_animation_mode"
         const val ANALYSIS_CACHE_FILE = "analysis-index.json"
         const val ANALYSIS_CACHE_VERSION = 1
-        const val TRASH_FOLDER = ".AuraTrash"
+        const val TRASH_FOLDER = AURA_TRASH_FOLDER
         const val EXTERNAL_STORAGE_AUTHORITY = "com.android.externalstorage.documents"
         const val TIMESTAMP_TOLERANCE_MILLIS = 2_000L
         const val MAX_ANALYZED_FILES = 10_000
