@@ -248,6 +248,13 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                 .putExtra(BackendWorkspaceActivity.EXTRA_INITIAL_BACKEND_ID, "sftp:${profile.id}")
         )
     }
+    val openSmbWorkspace: (String) -> Unit = { profileId ->
+        context.startActivity(
+            Intent(context, BackendWorkspaceActivity::class.java)
+                .putExtra(BackendWorkspaceActivity.EXTRA_INITIAL_BACKEND_ID, "smb:$profileId")
+                .putExtra(BackendWorkspaceActivity.EXTRA_SINGLE_PANE, true)
+        )
+    }
     val openCloudWorkspace: (CloudProfile) -> Unit = { profile ->
         val prefix = when (profile.provider) {
             com.aurafiles.app.cloud.CloudProvider.YANDEX_DISK -> "yandex"
@@ -280,6 +287,30 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
     var pendingSftpServerConfig by remember { mutableStateOf<SftpServerConfig?>(null) }
     var pendingSystemSound by remember { mutableStateOf<Pair<FileEntry, SystemSoundType>?>(null) }
     var selectionModeActive by remember { mutableStateOf(false) }
+
+    // The legacy SMB connector is kept only for authentication/share discovery. As soon as
+    // a concrete share is selected and saved, hand the user to the standard backend browser
+    // instead of rendering remote files at the bottom of the Network screen.
+    LaunchedEffect(
+        uiState.smbConnected,
+        uiState.smbBrowsingShares,
+        uiState.smbLoading,
+        uiState.smbProfile?.id,
+        uiState.smbProfile?.share,
+    ) {
+        val smb = uiState.smbProfile
+        if (
+            uiState.smbConnected &&
+            !uiState.smbBrowsingShares &&
+            !uiState.smbLoading &&
+            smb != null &&
+            smb.id.isNotBlank() &&
+            smb.share.isNotBlank()
+        ) {
+            openSmbWorkspace(smb.id)
+            viewModel.releaseLegacySmbSessionForWorkspace()
+        }
+    }
     val openLocalFile: (FileEntry) -> Unit = { entry ->
         when {
             entry.isReaderSupported() -> runCatching { openBookReader(context, entry) }
@@ -565,8 +596,12 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onOpenSettings = { settingsOpen = true },
                         onScanLan = viewModel::scanLan,
                         onConnectProfile = { profile ->
-                            if (profile.protocol == NetworkProtocol.SFTP) openSftpWorkspace(profile)
-                            else viewModel.connectNetworkProfile(profile)
+                            when {
+                                profile.protocol == NetworkProtocol.SFTP -> openSftpWorkspace(profile)
+                                profile.protocol == NetworkProtocol.SMB && profile.smbShare.isNotBlank() ->
+                                    openSmbWorkspace(profile.id)
+                                else -> viewModel.connectNetworkProfile(profile)
+                            }
                         },
                         onTestProfile = { profile ->
                             if (profile.protocol == NetworkProtocol.SFTP) openSftpWorkspace(profile)
@@ -787,6 +822,7 @@ private fun HomeScreen(
                 state = state,
                 onCategory = onOpenCategory,
                 onAnalyze = onAnalyze,
+                onOpenAllStorage = onFullAccess,
             )
         }
         item {
@@ -1009,143 +1045,6 @@ private fun FtpScreen(
                 )
             }
         }
-        if (state.smbConnected) {
-            item {
-                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        val smbBusy = state.smbLoading || state.smbTransferLabel != null || state.operationInProgress
-                        val canGoBack = !smbBusy && (state.smbPath != "/" ||
-                            (!state.smbBrowsingShares && state.smbShares.isNotEmpty()))
-                        IconButton(onClick = { onBackSmb() }, enabled = canGoBack) {
-                            Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "На уровень выше")
-                        }
-                        Text(
-                            buildString {
-                                append("\\\\")
-                                append(state.smbProfile?.host.orEmpty())
-                                if (!state.smbBrowsingShares) {
-                                    state.smbProfile?.share?.takeIf(String::isNotBlank)?.let { append("\\").append(it) }
-                                }
-                                if (state.smbPath != "/") append(state.smbPath.replace('/', '\\'))
-                            },
-                            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                            maxLines = 1,
-                            fontWeight = FontWeight.Medium,
-                        )
-                        IconButton(onClick = onRefreshSmb, enabled = !smbBusy) {
-                            Icon(Icons.Rounded.Refresh, contentDescription = "Обновить SMB")
-                        }
-                    }
-                }
-            }
-            if (!state.smbBrowsingShares && state.smbProfile?.share?.isNotBlank() == true) {
-                item {
-                    Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp),
-                            horizontalArrangement = Arrangement.SpaceEvenly,
-                        ) {
-                            TextButton(onClick = onUploadSmb, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
-                                Icon(Icons.Rounded.UploadFile, contentDescription = null)
-                                Spacer(Modifier.width(5.dp))
-                                Text("Файлы")
-                            }
-                            TextButton(onClick = onUploadSmbFolder, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
-                                Icon(Icons.Rounded.Folder, contentDescription = null)
-                                Spacer(Modifier.width(5.dp))
-                                Text("Папку")
-                            }
-                            TextButton(onClick = { smbCreateFolderOpen = true }, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) {
-                                Icon(Icons.Rounded.Add, contentDescription = null)
-                                Spacer(Modifier.width(5.dp))
-                                Text("Папка")
-                            }
-                            TextButton(onClick = onDisconnectSmb, enabled = !state.smbLoading && state.smbTransferLabel == null && !state.operationInProgress) { Text("Отключить") }
-                        }
-                    }
-                }
-            }
-            state.smbTransferLabel?.let { label ->
-                item {
-                    TransferStatusOverlay(
-                        progress = state.transferProgress.takeIf { state.smbTransferActive },
-                        label = label,
-                        fallbackProgress = if (state.smbTransferActive) state.operationProgress else 0f,
-                        cancelable = state.smbTransferActive && state.operationCancelable,
-                        paused = state.smbTransferActive && state.transferPaused,
-                        onPause = onPauseSmbTransfer,
-                        onResume = onResumeSmbTransfer,
-                        onCancel = onCancelSmbTransfer,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-            }
-            when {
-                state.smbLoading -> item {
-                    Box(Modifier.fillMaxWidth().height(130.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-                }
-                state.smbBrowsingShares && state.smbShares.isNotEmpty() -> item {
-                    Surface(shape = RoundedCornerShape(22.dp), color = MaterialTheme.colorScheme.surface) {
-                        Column {
-                            state.smbShares.forEachIndexed { index, shareName ->
-                                SmbShareRow(
-                                    name = shareName,
-                                    host = state.smbProfile?.host.orEmpty(),
-                                    onOpen = { onSelectSmbShare(shareName) },
-                                )
-                                if (index != state.smbShares.lastIndex) {
-                                    HorizontalDivider(
-                                        modifier = Modifier.padding(start = 66.dp),
-                                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-                state.smbBrowsingShares -> item {
-                    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                        Text(
-                            "Доступные общие папки не найдены. Проверьте учётные данные или укажите имя шары в расширенных настройках.",
-                            modifier = Modifier.fillMaxWidth().padding(24.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                state.smbItems.isEmpty() -> item {
-                    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface) {
-                        Text("Общая папка пуста", modifier = Modifier.fillMaxWidth().padding(30.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-                else -> itemsIndexed(
-                    items = state.smbItems,
-                    key = { _, entry -> "smb:${entry.path}" },
-                ) { index, entry ->
-                    val shape = networkListRowShape(index, state.smbItems.lastIndex)
-                    Surface(shape = shape, color = MaterialTheme.colorScheme.surface) {
-                        Column {
-                            SmbFileRow(
-                                entry = entry,
-                                busy = state.smbLoading || state.smbTransferLabel != null || state.operationInProgress,
-                                onOpen = { onOpenSmb(entry) },
-                                onDownload = { onDownloadSmb(entry) },
-                                onRename = { name -> onRenameSmb(entry, name) },
-                                onDelete = { recursive -> onDeleteSmb(entry, recursive) },
-                            )
-                            if (index != state.smbItems.lastIndex) {
-                                HorizontalDivider(
-                                    modifier = Modifier.padding(start = 66.dp),
-                                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
         if (state.ftpConnected) {
             item {
                 Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surface) {
@@ -1239,6 +1138,75 @@ private fun FtpScreen(
                 }
             }
         }
+    }
+
+    if (state.smbLoading && state.smbProfile != null) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Подключение SMB") },
+            text = {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(26.dp), strokeWidth = 2.5.dp)
+                    Column(Modifier.weight(1f)) {
+                        Text(state.smbProfile?.name.orEmpty().ifBlank { "SMB" }, fontWeight = FontWeight.Medium)
+                        Text(
+                            state.smbProfile?.host.orEmpty(),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            },
+            confirmButton = {},
+        )
+    } else if (state.smbConnected && state.smbBrowsingShares) {
+        AlertDialog(
+            onDismissRequest = onDisconnectSmb,
+            title = { Text("Выберите общую папку SMB") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "${state.smbProfile?.host.orEmpty()} подключён. После выбора Aura сразу откроет обычный файловый браузер.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 12.sp,
+                    )
+                    if (state.smbShares.isEmpty()) {
+                        Text(
+                            "Доступные общие папки не найдены. Проверьте учётные данные или укажите имя шары в параметрах SMB.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp),
+                        ) {
+                            itemsIndexed(state.smbShares) { index, shareName ->
+                                SmbShareRow(
+                                    name = shareName,
+                                    host = state.smbProfile?.host.orEmpty(),
+                                    onOpen = { onSelectSmbShare(shareName) },
+                                )
+                                if (index != state.smbShares.lastIndex) {
+                                    HorizontalDivider(
+                                        modifier = Modifier.padding(start = 52.dp),
+                                        color = MaterialTheme.colorScheme.outline.copy(alpha = 0.35f),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onRefreshSmb) { Text("Обновить") }
+            },
+            dismissButton = {
+                TextButton(onClick = onDisconnectSmb) { Text("Отмена") }
+            },
+        )
     }
 
     if (smbCreateFolderOpen) {
@@ -3796,19 +3764,24 @@ private fun CategoryGrid(
     state: FileManagerUiState,
     onCategory: (FileCategory) -> Unit,
     onAnalyze: () -> Unit,
+    onOpenAllStorage: (() -> Unit)? = null,
 ) {
-    val tiles = listOf(
-        Triple(FileCategory.Images, Icons.Rounded.Image, AuraPink),
-        Triple(FileCategory.Video, Icons.Rounded.Movie, AuraPurple),
-        Triple(FileCategory.Audio, Icons.Rounded.MusicNote, AuraGreen),
-        Triple(FileCategory.Documents, Icons.Rounded.Description, AuraBlue),
-        Triple(FileCategory.Archives, Icons.Rounded.Archive, AuraOrange),
-        Triple(FileCategory.Books, Icons.AutoMirrored.Rounded.MenuBook, AuraPurple),
-        Triple(FileCategory.Apk, Icons.Rounded.Apps, AuraGreen),
-        Triple(FileCategory.Downloads, Icons.Rounded.Download, AuraBlue),
-        Triple(FileCategory.Camera, Icons.Rounded.PhotoCamera, AuraPink),
-        Triple(FileCategory.Other, Icons.AutoMirrored.Rounded.InsertDriveFile, MaterialTheme.colorScheme.onSurfaceVariant),
-    )
+    val tiles = buildList {
+        add(Triple(FileCategory.Images, Icons.Rounded.Image, AuraPink))
+        add(Triple(FileCategory.Video, Icons.Rounded.Movie, AuraPurple))
+        add(Triple(FileCategory.Audio, Icons.Rounded.MusicNote, AuraGreen))
+        add(Triple(FileCategory.Documents, Icons.Rounded.Description, AuraBlue))
+        add(Triple(FileCategory.Archives, Icons.Rounded.Archive, AuraOrange))
+        add(Triple(FileCategory.Books, Icons.AutoMirrored.Rounded.MenuBook, AuraPurple))
+        add(Triple(FileCategory.Apk, Icons.Rounded.Apps, AuraGreen))
+        add(Triple(FileCategory.Downloads, Icons.Rounded.Download, AuraBlue))
+        add(Triple(FileCategory.Camera, Icons.Rounded.PhotoCamera, AuraPink))
+        if (onOpenAllStorage != null) {
+            add(Triple(FileCategory.Other, Icons.Rounded.Storage, AuraOrange))
+        } else {
+            add(Triple(FileCategory.Other, Icons.AutoMirrored.Rounded.InsertDriveFile, MaterialTheme.colorScheme.onSurfaceVariant))
+        }
+    }
     val categorySummaries = remember(state.analysis) {
         state.analysis?.categories?.associateBy { it.category }.orEmpty()
     }
@@ -3817,19 +3790,34 @@ private fun CategoryGrid(
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 rowTiles.forEach { (category, icon, tint) ->
                     val summary = categorySummaries[category]
+                    val isAllStorage = category == FileCategory.Other && onOpenAllStorage != null
                     Surface(
                         modifier = Modifier
                             .weight(1f)
-                            .clickable { if (state.analysis == null) onAnalyze() else onCategory(category) },
+                            .clickable {
+                                if (isAllStorage) {
+                                    onOpenAllStorage?.invoke()
+                                } else if (state.analysis == null) {
+                                    onAnalyze()
+                                } else {
+                                    onCategory(category)
+                                }
+                            },
                         shape = RoundedCornerShape(20.dp),
                         color = MaterialTheme.colorScheme.surface,
                     ) {
                         Column(modifier = Modifier.padding(14.dp)) {
                             IconBubble(icon, tint)
                             Spacer(Modifier.height(12.dp))
-                            Text(categoryLabel(category), fontWeight = FontWeight.SemiBold, maxLines = 1)
+                            Text(
+                                if (isAllStorage) "Все" else categoryLabel(category),
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                            )
                             Text(
                                 when {
+                                    isAllStorage && state.fullAccessGranted -> "Все папки и файлы"
+                                    isAllStorage -> "Нужен полный доступ"
                                     state.analyzing -> "Анализ…"
                                     summary == null -> "Найти файлы"
                                     else -> "${summary.count} · ${formatBytes(summary.bytes)}"
@@ -5768,12 +5756,14 @@ private fun TrashBrowserDialog(
                             items(visibleEntries, key = { it.uri.toString() }) { entry ->
                                 val record = rootRecordsByUri[entry.uri.toString()]
                                 val selected = entry.uri.toString() in selectedRootUris
+                                val accent = fileAccent(entry)
                                 Surface(
-                                    shape = RoundedCornerShape(18.dp),
-                                    tonalElevation = if (selected) 4.dp else 1.dp,
-                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                                    shape = RoundedCornerShape(22.dp),
+                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                                    border = BorderStroke(if (selected) 2.dp else 1.dp, accent.copy(alpha = if (selected) 0.75f else 0.28f)),
                                     modifier = Modifier
                                         .fillMaxWidth()
+                                        .height(210.dp)
                                         .auraDeleteEffect(
                                             active = entry.uri in deletingUris,
                                             mode = deleteAnimationMode,
@@ -5790,18 +5780,39 @@ private fun TrashBrowserDialog(
                                             },
                                         ),
                                 ) {
-                                    Box(Modifier.padding(12.dp)) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                                            FileIcon(entry, showThumbnail = true)
-                                            Spacer(Modifier.height(8.dp))
+                                    Column {
+                                        Box(
+                                            modifier = Modifier.fillMaxWidth().height(128.dp).background(accent.copy(alpha = 0.10f)),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            if (entry.isDirectory) {
+                                                AppleFolderGlyph()
+                                            } else {
+                                                FileThumbnail(
+                                                    entry = entry,
+                                                    modifier = Modifier.fillMaxSize(),
+                                                    fallback = { FileIcon(entry) },
+                                                )
+                                            }
+                                            if (selectionMode && currentFolder == null) {
+                                                Checkbox(
+                                                    checked = selected,
+                                                    onCheckedChange = { toggleRootSelection(entry) },
+                                                    modifier = Modifier.align(Alignment.TopEnd),
+                                                )
+                                            }
+                                        }
+                                        Column(
+                                            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 10.dp, vertical = 8.dp),
+                                            verticalArrangement = Arrangement.Bottom,
+                                        ) {
                                             Text(
                                                 entry.name,
                                                 maxLines = 2,
                                                 overflow = TextOverflow.Ellipsis,
-                                                textAlign = TextAlign.Center,
-                                                fontSize = 12.sp,
+                                                fontSize = 13.sp,
+                                                fontWeight = FontWeight.Medium,
                                             )
-                                            Spacer(Modifier.height(4.dp))
                                             Text(
                                                 when {
                                                     record != null -> DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(record.deletedAt))
@@ -5810,14 +5821,7 @@ private fun TrashBrowserDialog(
                                                 },
                                                 maxLines = 1,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                fontSize = 10.sp,
-                                            )
-                                        }
-                                        if (selectionMode && currentFolder == null) {
-                                            Checkbox(
-                                                checked = selected,
-                                                onCheckedChange = { toggleRootSelection(entry) },
-                                                modifier = Modifier.align(Alignment.TopEnd),
+                                                fontSize = 11.sp,
                                             )
                                         }
                                     }

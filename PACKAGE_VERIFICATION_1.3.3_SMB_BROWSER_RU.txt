@@ -1,0 +1,14 @@
+Aura Files 1.3.3 — проверка SMB standard browser
+
+Проверено перед упаковкой:
+- versionName 1.3.3 / versionCode 133;
+- удалён рендер state.smbItems со страницы «Сеть»;
+- сохранённый SMB profile с smbShare открывает smb:<profile.id> через BackendWorkspaceActivity в single-pane;
+- SMB без share показывает модальный выбор общей папки, а не удалённый файловый список внизу Network screen;
+- после выбора share legacy SmbRepository session освобождается тихо;
+- SmbStorageBackend и общий BackendWorkspace/transfer core не переписывались;
+- Kotlin/KTS PSI parse: 125 файлов, 0 syntax errors;
+- Android XML parse: 14 файлов, 0 ошибок;
+- исходная 1.3.2 Vault/APKS/Cloud реализация не изменялась вне UI routing и нейтрального backend error text.
+
+Попытка реального Gradle compileDebugKotlin в контейнере остановилась ДО конфигурации проекта: wrapper не смог разрешить services.gradle.org для Gradle 9.5.0 (UnknownHostException). Полный compile должен быть подтверждён Windows builder через BUILD_ON_CLEAN_WINDOWS.bat.

@@ -2032,6 +2032,32 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    /**
+     * The main Network screen uses the old SmbRepository only to authenticate and discover
+     * shares. Once a concrete share has been saved, BackendWorkspaceActivity owns browsing
+     * through SmbStorageBackend. Release the legacy session quietly so returning from the
+     * workspace does not leave a second hidden SMB connection or stale file list behind.
+     */
+    fun releaseLegacySmbSessionForWorkspace() {
+        val snapshot = _state.value
+        if (!snapshot.smbConnected || snapshot.smbBrowsingShares || snapshot.smbLoading) return
+        _state.update {
+            it.copy(
+                smbConnected = false,
+                smbBrowsingShares = false,
+                smbShares = emptyList(),
+                smbItems = emptyList(),
+                smbPath = "/",
+                smbTransferLabel = null,
+                smbTransferActive = false,
+                message = null,
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { smbRepository.disconnect() }
+        }
+    }
+
     fun disconnectSmb() {
         val snapshot = _state.value
         if (snapshot.smbLoading || snapshot.smbTransferLabel != null) {
@@ -2702,7 +2728,7 @@ class FileManagerViewModel(application: Application) : AndroidViewModel(applicat
         "Аудио" -> FileCategory.Audio
         "Документы" -> FileCategory.Documents
         "Архивы" -> FileCategory.Archives
-        "Книги" -> FileCategory.Books
+        "Книги", "Электронные книги" -> FileCategory.Books
         "APK" -> FileCategory.Apk
         "Загрузки" -> FileCategory.Downloads
         "Камера" -> FileCategory.Camera

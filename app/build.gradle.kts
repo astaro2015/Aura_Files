@@ -42,8 +42,8 @@ android {
         applicationId = "com.aurafiles.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 132
-        versionName = "1.3.2"
+        versionCode = 134
+        versionName = "1.3.4"
         buildConfigField("String", "YANDEX_OAUTH_CLIENT_ID", buildConfigString(yandexOAuthClientId))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

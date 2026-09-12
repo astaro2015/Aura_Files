@@ -248,7 +248,7 @@ internal class BackendWorkspaceViewModel(
                 syncPlan = null,
                 message = when {
                     preferredBackendId != null && preferred == null ->
-                        "Облачный backend $preferredBackendId не зарегистрирован. ${cloudRegistrationErrors.joinToString("; ")}".trim()
+                        "Файловый backend $preferredBackendId не зарегистрирован. ${cloudRegistrationErrors.joinToString("; ")}".trim()
                     cloudRegistrationErrors.isNotEmpty() && state.message.isNullOrBlank() ->
                         "Не удалось зарегистрировать облачное подключение: ${cloudRegistrationErrors.joinToString("; ")}"
                     else -> state.message
@@ -652,7 +652,7 @@ internal class BackendWorkspaceViewModel(
     fun openBackendFromNetwork(backendId: String) {
         val descriptor = _state.value.backends.firstOrNull { it.id == backendId }
         if (descriptor == null) {
-            _state.update { it.copy(message = "Подключение $backendId сохранено, но cloud backend не зарегистрирован. Переподключи аккаунт; если ошибка повторится, пришли build.log/скрин сообщения Aura.") }
+            _state.update { it.copy(message = "Подключение $backendId сохранено, но файловый backend не зарегистрирован. Переподключите источник; если ошибка повторится, пришлите build.log или скрин сообщения Aura.") }
             return
         }
         val local = _state.value.backends.firstOrNull { it.kind == StorageBackendKind.LOCAL && it.id != backendId }
