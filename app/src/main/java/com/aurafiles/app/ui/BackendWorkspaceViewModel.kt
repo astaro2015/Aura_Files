@@ -54,6 +54,8 @@ import com.aurafiles.app.transfer.TransferType
 import java.io.File
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.Dispatchers
@@ -694,14 +696,37 @@ internal class BackendWorkspaceViewModel(
             try {
                 val target = withContext(Dispatchers.IO) {
                     val directory = File(getApplication<Application>().cacheDir, "backend-open").apply { mkdirs() }
-                    directory.listFiles()?.filter { file -> System.currentTimeMillis() - file.lastModified() > OPEN_CACHE_MAX_AGE_MS }
-                        ?.forEach { file -> runCatching { file.deleteRecursively() } }
-                    val safeName = item.name.replace(Regex("[\\/:*?\"<>|]"), "_").ifBlank { "file" }
+                    directory.listFiles()?.filter { file ->
+                        file.isFile && file.lastModified() > 0L &&
+                            System.currentTimeMillis() - file.lastModified() > OPEN_CACHE_MAX_AGE_MS
+                    }?.forEach { file -> runCatching { file.delete() } }
+                    requireCacheSpace(directory, item.size, "открытия ${item.name}")
+                    val safeName = item.name.replace(Regex("""[\\/:*?"<>|]"""), "_").ifBlank { "file" }
                     val file = File(directory, "${UUID.randomUUID()}-$safeName")
-                    backend.openRead(item.path).use { handle ->
-                        file.outputStream().buffered().use { output -> handle.input.copyTo(output, DEFAULT_COPY_BUFFER) }
+                    val partial = File(directory, ".${file.name}.part")
+                    try {
+                        backend.openRead(item.path).use { handle ->
+                            partial.outputStream().buffered(DEFAULT_COPY_BUFFER).use { output ->
+                                val buffer = ByteArray(DEFAULT_COPY_BUFFER)
+                                while (true) {
+                                    currentCoroutineContext().ensureActive()
+                                    val read = handle.input.read(buffer)
+                                    if (read < 0) break
+                                    if (read == 0) continue
+                                    require(directory.usableSpace > OPEN_CACHE_SPACE_RESERVE_BYTES) {
+                                        "Недостаточно свободного места для открытия ${item.name}"
+                                    }
+                                    output.write(buffer, 0, read)
+                                }
+                            }
+                        }
+                        require(partial.renameTo(file)) { "Не удалось завершить подготовку ${item.name}" }
+                        file
+                    } catch (error: Throwable) {
+                        partial.delete()
+                        file.delete()
+                        throw error
                     }
-                    file
                 }
                 _state.update {
                     it.copy(
@@ -722,6 +747,16 @@ internal class BackendWorkspaceViewModel(
 
     fun consumeOpenFileRequest() {
         _state.update { it.copy(openFileRequest = null) }
+    }
+
+    private fun requireCacheSpace(directory: File, expectedBytes: Long, purpose: String) {
+        val usable = directory.usableSpace
+        require(usable > OPEN_CACHE_SPACE_RESERVE_BYTES) { "Недостаточно свободного места для $purpose" }
+        if (expectedBytes > 0L) {
+            require(expectedBytes <= usable - OPEN_CACHE_SPACE_RESERVE_BYTES) {
+                "Недостаточно свободного места для $purpose"
+            }
+        }
     }
 
     fun back(left: Boolean) {
@@ -1252,6 +1287,7 @@ internal class BackendWorkspaceViewModel(
         private const val KEY_GOOGLE_AUTH_ACTIVE = "google_auth_active"
         private const val HISTORY_LIMIT = 80
         private const val OPEN_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
+        private const val OPEN_CACHE_SPACE_RESERVE_BYTES = 256L * 1024L * 1024L
         private const val DEFAULT_COPY_BUFFER = 1024 * 1024
         private const val RECENT_LIMIT = 20
     }

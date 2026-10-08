@@ -75,6 +75,7 @@ public final class BookLoader {
         try (ZipInputStream zip = new ZipInputStream(input)) {
             ZipEntry entry; int entries = 0;
             while ((entry = zip.getNextEntry()) != null) {
+                ReaderIoPolicy.throwIfInterrupted("Разбор ZIP-книги");
                 if (++entries > 3000) throw new IOException("Слишком много файлов внутри ZIP");
                 if (entry.isDirectory()) continue;
                 String name = entry.getName().replace('\\', '/');
@@ -126,6 +127,7 @@ public final class BookLoader {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[16384]; int total = 0, read;
         while ((read = input.read(buffer)) != -1) {
+            ReaderIoPolicy.throwIfInterrupted("Чтение книги из ZIP");
             total += read;
             if (total > limit) throw new IOException("Файл внутри ZIP слишком большой");
             out.write(buffer, 0, read);
@@ -147,13 +149,40 @@ public final class BookLoader {
     }
 
     private static void copyToFile(InputStream input, File target) throws IOException {
-        try (InputStream source = input; FileOutputStream output = new FileOutputStream(target)) {
-            byte[] buffer = new byte[16384]; long total = 0; int read;
+        File parent = target.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+            try { input.close(); } catch (IOException ignored) {}
+            throw new IOException("Не удалось создать папку кэша книги");
+        }
+        File part = new File(parent == null ? target.getAbsoluteFile().getParentFile() : parent, target.getName() + ".part");
+        if (part.exists() && !part.delete()) {
+            try { input.close(); } catch (IOException ignored) {}
+            throw new IOException("Не удалось очистить незавершённый кэш книги");
+        }
+        boolean committed = false;
+        try (InputStream source = input; FileOutputStream output = new FileOutputStream(part)) {
+            byte[] buffer = new byte[16384];
+            long total = 0;
+            int read;
             while ((read = source.read(buffer)) != -1) {
+                ReaderIoPolicy.throwIfInterrupted("Кэширование книги");
                 total += read;
                 if (total > 256L * 1024L * 1024L) throw new IOException("Файл слишком большой");
                 output.write(buffer, 0, read);
             }
+            ReaderIoPolicy.throwIfInterrupted("Кэширование книги");
+            output.getFD().sync();
+        } catch (IOException | RuntimeException error) {
+            // A non-empty partial EPUB must never be mistaken for a reusable complete cache entry.
+            if (part.exists()) part.delete();
+            throw error;
+        }
+        try {
+            if (target.exists() && !target.delete()) throw new IOException("Не удалось заменить кэш книги");
+            if (!part.renameTo(target)) throw new IOException("Не удалось завершить запись кэша книги");
+            committed = true;
+        } finally {
+            if (!committed && part.exists()) part.delete();
         }
     }
 

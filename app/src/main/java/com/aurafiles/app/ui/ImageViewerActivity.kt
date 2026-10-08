@@ -179,7 +179,9 @@ private fun ImageViewerScreen(
         sessionImages,
     ) {
         value = if (sessionImages.isNotEmpty()) sessionImages else
-            withContext(Dispatchers.IO) { neighboringImages(context, parentUri, initialUri, initialName) }
+            loadOptionalNeighbors(initialImages) {
+                withContext(Dispatchers.IO) { neighboringImages(context, parentUri, initialUri, initialName) }
+            }
     }
     var deletedUris by remember { mutableStateOf<Set<Uri>>(emptySet()) }
     val images = sourceImages.filterNot { it.uri in deletedUris }

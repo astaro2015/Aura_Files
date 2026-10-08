@@ -5,6 +5,7 @@ import com.aurafiles.app.backend.StorageBackend
 import com.aurafiles.app.backend.StorageBackendKind
 import com.aurafiles.app.backend.StorageItem
 import java.io.IOException
+import java.util.ArrayDeque
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
@@ -66,12 +67,26 @@ class DirectoryComparator {
         recursive: Boolean,
         onProgress: (String) -> Unit,
     ): Map<String, StorageItem> {
+        data class PendingDirectory(val path: String, val relative: String, val depth: Int)
+
         val result = linkedMapOf<String, StorageItem>()
-        suspend fun walk(directoryPath: String, relativeDirectory: String) {
+        val visitedDirectories = mutableSetOf(backend.normalize(root))
+        val pending = ArrayDeque<PendingDirectory>()
+        pending.addLast(PendingDirectory(root, "", 0))
+
+        while (pending.isNotEmpty()) {
             currentCoroutineContext().ensureActive()
-            backend.list(directoryPath).forEach { item ->
+            val current = pending.removeLast()
+            if (current.depth > MAX_RECURSION_DEPTH) {
+                throw IOException(
+                    "Нельзя сравнить/синхронизировать каталог: превышена безопасная глубина $MAX_RECURSION_DEPTH"
+                )
+            }
+            val children = backend.list(current.path)
+            // Stack traversal is intentionally reversed to preserve the provider's visible order.
+            for (item in children.asReversed()) {
                 currentCoroutineContext().ensureActive()
-                val relative = if (relativeDirectory.isBlank()) item.name else "$relativeDirectory/${item.name}"
+                val relative = if (current.relative.isBlank()) item.name else "${current.relative}/${item.name}"
                 if (result.containsKey(relative)) {
                     throw IOException(
                         "Нельзя сравнить/синхронизировать каталог: в хранилище «${backend.descriptor.title}» " +
@@ -80,10 +95,23 @@ class DirectoryComparator {
                 }
                 result[relative] = item
                 onProgress(relative)
-                if (recursive && item.isDirectory) walk(item.path, relative)
+                if (recursive && item.isDirectory && !item.isLink) {
+                    val depth = current.depth + 1
+                    if (depth > MAX_RECURSION_DEPTH) {
+                        throw IOException(
+                            "Нельзя сравнить/синхронизировать каталог: превышена безопасная глубина $MAX_RECURSION_DEPTH"
+                        )
+                    }
+                    val key = backend.normalize(item.path)
+                    if (!visitedDirectories.add(key)) {
+                        throw IOException(
+                            "Нельзя сравнить/синхронизировать каталог: обнаружен цикл $relative"
+                        )
+                    }
+                    pending.addLast(PendingDirectory(item.path, relative, depth))
+                }
             }
         }
-        walk(root, "")
         return result
     }
 
@@ -117,5 +145,6 @@ class DirectoryComparator {
 
         private const val PRECISE_TIMESTAMP_TOLERANCE_MS = 2_000L
         private const val FTP_LIST_TIMESTAMP_TOLERANCE_MS = 60_000L
+        private const val MAX_RECURSION_DEPTH = 256
     }
 }

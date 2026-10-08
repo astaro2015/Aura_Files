@@ -12,6 +12,8 @@ import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.io.IOException
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.UUID
@@ -19,6 +21,8 @@ import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * Aura's transport container for an installed split application.
@@ -37,6 +41,9 @@ object AuraApksBundle {
     private const val BUFFER_SIZE = 256 * 1024
     private const val MAX_PARTS = 256
     private const val MAX_TOTAL_UNCOMPRESSED = 8L * 1024L * 1024L * 1024L
+    private const val CONTAINER_OVERHEAD_BYTES = 64L * 1024L * 1024L
+    private const val CACHE_SPACE_RESERVE_BYTES = 128L * 1024L * 1024L
+    private const val MAX_CONTAINER_BYTES = MAX_TOTAL_UNCOMPRESSED + CONTAINER_OVERHEAD_BYTES
 
     data class InstalledPackageSource(
         val packageName: String,
@@ -86,15 +93,25 @@ object AuraApksBundle {
         }
     }
 
-    fun exportInstalledPackage(context: Context, source: InstalledPackageSource): File {
+    suspend fun exportInstalledPackage(context: Context, source: InstalledPackageSource): File {
         require(source.splitApkPaths.isNotEmpty()) { "Приложение не является SPLIT" }
         val base = File(source.baseApkPath)
         require(base.isFile) { "base.apk приложения недоступен" }
         val splits = source.splitApkPaths.map(::File)
         require(splits.all(File::isFile)) { "Одна или несколько SPLIT-частей недоступны" }
 
+        var expectedPayload = 0L
+        (listOf(base) + splits).forEach { file ->
+            currentCoroutineContext().ensureActive()
+            val size = file.length()
+            require(size > 0L) { "APK недоступен или пуст: ${file.name}" }
+            expectedPayload = Math.addExact(expectedPayload, size)
+            require(expectedPayload <= MAX_TOTAL_UNCOMPRESSED) { "SPLIT-комплект слишком большой" }
+        }
+
         val shareDir = File(context.cacheDir, "shares").apply { mkdirs() }
         cleanOldExports(shareDir)
+        requireCacheSpace(shareDir, Math.addExact(expectedPayload, CONTAINER_OVERHEAD_BYTES))
         val safeLabel = safeFilePart(source.label, source.packageName.substringAfterLast('.'), 48)
         val safeVersion = safeFilePart(source.versionName, source.versionCode.toString(), 24)
         val target = uniqueFile(shareDir, "installed-$safeLabel-$safeVersion.apks")
@@ -102,6 +119,7 @@ object AuraApksBundle {
 
         val writtenParts = mutableListOf<Part>()
         try {
+            currentCoroutineContext().ensureActive()
             ZipOutputStream(BufferedOutputStream(FileOutputStream(temporary), BUFFER_SIZE)).use { zip ->
                 // APKs are already compressed. Re-deflating them wastes CPU and battery.
                 zip.setLevel(Deflater.NO_COMPRESSION)
@@ -138,30 +156,31 @@ object AuraApksBundle {
                 zip.write(manifestBytes)
                 zip.closeEntry()
             }
-            require(temporary.renameTo(target) || run {
-                temporary.copyTo(target, overwrite = true)
-                temporary.delete()
-                true
-            }) { "Не удалось завершить экспорт SPLIT-комплекта" }
+            FileOutputStream(temporary, true).use { it.fd.sync() }
+            currentCoroutineContext().ensureActive()
+            require(temporary.renameTo(target)) { "Не удалось завершить экспорт SPLIT-комплекта" }
             return target
         } catch (error: Throwable) {
             temporary.delete()
-            target.delete()
             throw error
         }
     }
 
-    fun prepareForInstall(context: Context, input: InputStream, displayName: String): PreparedBundle {
+    suspend fun prepareForInstall(context: Context, input: InputStream, displayName: String): PreparedBundle {
         val parent = File(context.cacheDir, "split-install").apply { mkdirs() }
         cleanupOldInstallDirs(parent)
+        requireCacheSpace(parent, 0L)
         val working = File(parent, "${System.currentTimeMillis()}-${UUID.randomUUID()}").apply { mkdirs() }
         val bundleFile = File(working, safeFilePart(displayName, "package.apks", 96).let {
             if (it.lowercase(Locale.ROOT).endsWith(".apks")) it else "$it.apks"
         })
         try {
             BufferedInputStream(input, BUFFER_SIZE).use { source ->
-                BufferedOutputStream(FileOutputStream(bundleFile), BUFFER_SIZE).use { target ->
-                    source.copyTo(target, BUFFER_SIZE)
+                FileOutputStream(bundleFile).use { fileOut ->
+                    val target = BufferedOutputStream(fileOut, BUFFER_SIZE)
+                    copyBoundedCancellable(source, target, MAX_CONTAINER_BYTES, working)
+                    target.flush()
+                    fileOut.fd.sync()
                 }
             }
             return prepareFromFile(context, bundleFile, working)
@@ -171,8 +190,9 @@ object AuraApksBundle {
         }
     }
 
-    private fun prepareFromFile(context: Context, bundleFile: File, working: File): PreparedBundle {
+    private suspend fun prepareFromFile(context: Context, bundleFile: File, working: File): PreparedBundle {
         require(bundleFile.isFile && bundleFile.length() > 0L) { "Файл комплекта пуст или недоступен" }
+        require(bundleFile.length() <= MAX_CONTAINER_BYTES) { "SPLIT-комплект слишком большой" }
         val extractedDir = File(working, "parts").apply { mkdirs() }
         ZipFile(bundleFile).use { zip ->
             val manifestEntry = zip.getEntry(MANIFEST_ENTRY)
@@ -188,8 +208,9 @@ object AuraApksBundle {
 
             val seen = HashSet<String>()
             var totalSize = 0L
-            val extracted = ArrayList<Part>(manifest.parts.size)
-            manifest.parts.forEachIndexed { index, part ->
+            val validatedEntries = ArrayList<Pair<Part, ZipEntry>>(manifest.parts.size)
+            manifest.parts.forEach { part ->
+                currentCoroutineContext().ensureActive()
                 validateArchiveEntryName(part.entryName)
                 require(seen.add(part.entryName.lowercase(Locale.ROOT))) { "Повтор APK-части: ${part.entryName}" }
                 require(part.size > 0L) { "Некорректный размер ${part.entryName}" }
@@ -201,6 +222,13 @@ object AuraApksBundle {
                 if (entry.size >= 0L) {
                     require(entry.size == part.size) { "Размер ${part.entryName} не совпадает с манифестом" }
                 }
+                validatedEntries += part to entry
+            }
+            requireCacheSpace(working, totalSize)
+
+            val extracted = ArrayList<Part>(manifest.parts.size)
+            validatedEntries.forEachIndexed { index, (part, entry) ->
+                currentCoroutineContext().ensureActive()
                 val output = File(extractedDir, "%03d-%s".format(index, safeArchiveName(part.entryName, "part-$index.apk")))
                 val digest = MessageDigest.getInstance("SHA-256")
                 var copied = 0L
@@ -209,12 +237,14 @@ object AuraApksBundle {
                         BufferedOutputStream(FileOutputStream(output), BUFFER_SIZE).use { target ->
                             val buffer = ByteArray(BUFFER_SIZE)
                             while (true) {
+                                currentCoroutineContext().ensureActive()
                                 val read = source.read(buffer)
                                 if (read < 0) break
                                 copied += read
                                 require(copied <= part.size) { "${part.entryName} больше заявленного размера" }
                                 digest.update(buffer, 0, read)
                                 target.write(buffer, 0, read)
+                                requireCacheSpace(working, 0L)
                             }
                         }
                     }
@@ -283,27 +313,65 @@ object AuraApksBundle {
         }
     }
 
-    private fun writeApkPart(zip: ZipOutputStream, file: File, entryName: String, role: String): Part {
+    private suspend fun writeApkPart(zip: ZipOutputStream, file: File, entryName: String, role: String): Part {
         require(file.isFile && file.length() > 0L) { "APK недоступен: ${file.name}" }
+        val expectedSize = file.length()
         val digest = MessageDigest.getInstance("SHA-256")
         zip.putNextEntry(ZipEntry(entryName).apply { time = file.lastModified() })
+        var copied = 0L
         BufferedInputStream(file.inputStream(), BUFFER_SIZE).use { source ->
             val buffer = ByteArray(BUFFER_SIZE)
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val read = source.read(buffer)
                 if (read < 0) break
+                copied = Math.addExact(copied, read.toLong())
+                require(copied <= expectedSize) { "APK изменился во время экспорта: ${file.name}" }
                 digest.update(buffer, 0, read)
                 zip.write(buffer, 0, read)
             }
         }
         zip.closeEntry()
+        require(copied == expectedSize && file.length() == expectedSize) {
+            "APK изменился во время экспорта: ${file.name}"
+        }
         return Part(
             entryName = entryName,
             originalName = file.name,
             role = role,
-            size = file.length(),
+            size = expectedSize,
             sha256 = digest.digest().toHex(),
         )
+    }
+
+    private suspend fun copyBoundedCancellable(
+        input: InputStream,
+        output: OutputStream,
+        maxBytes: Long,
+        cacheDirectory: File,
+    ): Long {
+        val buffer = ByteArray(BUFFER_SIZE)
+        var copied = 0L
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            val read = input.read(buffer)
+            if (read < 0) break
+            copied = Math.addExact(copied, read.toLong())
+            require(copied <= maxBytes) { "Входящий SPLIT-комплект превышает допустимый размер" }
+            output.write(buffer, 0, read)
+            requireCacheSpace(cacheDirectory, 0L)
+        }
+        return copied
+    }
+
+    private fun requireCacheSpace(directory: File, expectedBytes: Long) {
+        val usable = directory.usableSpace
+        if (usable <= CACHE_SPACE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места: Aura сохраняет резерв 128 МиБ")
+        }
+        if (expectedBytes > 0L && expectedBytes > usable - CACHE_SPACE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места для SPLIT-комплекта")
+        }
     }
 
     private fun manifestToJson(manifest: Manifest): JSONObject = JSONObject().apply {

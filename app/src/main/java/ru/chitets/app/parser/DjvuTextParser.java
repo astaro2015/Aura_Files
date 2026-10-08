@@ -11,8 +11,6 @@ import ru.chitets.app.model.ReaderDocument;
 
 /** Builds a normal Chitets reflow document from DjVu TXTa/TXTz hidden text. */
 public final class DjvuTextParser {
-    private static final int MAX_BOOK_BYTES = 512 * 1024 * 1024;
-
     private DjvuTextParser() {}
 
     public static ReaderDocument parse(InputStream input, String fallbackTitle) throws Exception {
@@ -27,6 +25,7 @@ public final class DjvuTextParser {
         int decodedPages = 0;
         int failedPages = 0;
         for (int page = 0; page < document.pageCount(); page++) {
+            ReaderIoPolicy.throwIfInterrupted("Разбор текста DjVu");
             String raw = "";
             boolean failed = false;
             try {
@@ -113,14 +112,21 @@ public final class DjvuTextParser {
 
     private static byte[] readAll(InputStream input) throws IOException {
         try (InputStream in = input; ByteArrayOutputStream out = new ByteArrayOutputStream(4 * 1024 * 1024)) {
+            long limit = ReaderIoPolicy.safeDjvuSourceBytes();
             byte[] buffer = new byte[128 * 1024];
-            int total = 0, read;
+            long total = 0;
+            int read;
             while ((read = in.read(buffer)) != -1) {
+                ReaderIoPolicy.throwIfInterrupted("Чтение текста DjVu");
                 if (read == 0) continue;
                 total += read;
-                if (total > MAX_BOOK_BYTES) throw new IOException("DjVu больше 512 МБ; текстовый режим пока не загружает такие файлы целиком");
+                if (total > limit) {
+                    throw new IOException("DjVu слишком большой для безопасного текстового режима на этом устройстве (лимит около "
+                            + Math.max(1L, limit / (1024L * 1024L)) + " МБ)");
+                }
                 out.write(buffer, 0, read);
             }
+            ReaderIoPolicy.throwIfInterrupted("Чтение текста DjVu");
             return out.toByteArray();
         }
     }

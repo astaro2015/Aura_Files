@@ -334,14 +334,14 @@ public final class ReaderActivity extends Activity {
     }
 
     /**
-     * EPUB pages are rendered from an app-private file:// extraction directory. These file-access
-     * WebSettings calls are deprecated on newer Android because WebViewAssetLoader is preferred,
-     * but retaining them on the compatibility path avoids breaking relative EPUB resources.
+     * EPUB pages are rendered from an app-private file:// extraction directory. Keep ordinary
+     * file resource access for images/styles, but never let JavaScript running from one file URL
+     * read arbitrary sibling file URLs. Android explicitly recommends keeping that bridge off.
      */
     @SuppressWarnings("deprecation")
     private static void configureFileUrlCompatibility(WebSettings webSettings) {
         webSettings.setAllowFileAccess(true);
-        webSettings.setAllowFileAccessFromFileURLs(true);
+        webSettings.setAllowFileAccessFromFileURLs(false);
         webSettings.setAllowUniversalAccessFromFileURLs(false);
     }
 

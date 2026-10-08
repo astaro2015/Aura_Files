@@ -1,5 +1,6 @@
 import java.util.Properties
 import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.jvm.tasks.Jar
 
 plugins {
     id("com.android.application")
@@ -34,6 +35,22 @@ val hasReleaseSigning = listOf(
     releaseKeyPassword,
 ).all { !it.isNullOrBlank() }
 
+// ARSCLib bundles Android and XmlPull API stubs inside its desktop JAR.
+// Packaging them lets R8 rename android.util.AttributeSet in Media3 XML view
+// constructors, so Android's inflater cannot find the real SDK signature.
+val arscLibRaw = configurations.create("arscLibRaw") {
+    isTransitive = false
+}
+val sanitizedArscLib = tasks.register<Jar>("sanitizeArscLib") {
+    archiveFileName.set("ARSCLib-1.4.0-android.jar")
+    destinationDirectory.set(layout.buildDirectory.dir("sanitized-libs"))
+    inputs.property("excludedFrameworkStubs", "android/**;org/xmlpull/v1/**")
+    from({ zipTree(arscLibRaw.singleFile) }) {
+        exclude("android/**")
+        exclude("org/xmlpull/v1/**")
+    }
+}
+
 android {
     namespace = "com.aurafiles.app"
     compileSdk = 36
@@ -42,8 +59,8 @@ android {
         applicationId = "com.aurafiles.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 134
-        versionName = "1.3.4"
+        versionCode = 149
+        versionName = "1.3.19"
         buildConfigField("String", "YANDEX_OAUTH_CLIENT_ID", buildConfigString(yandexOAuthClientId))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -163,12 +180,19 @@ dependencies {
     implementation("com.hierynomus:sshj:0.40.0")
     implementation("org.apache.sshd:sshd-core:2.19.0")
     implementation("org.apache.sshd:sshd-sftp:2.19.0")
-    // SSHJ 0.40.0 was published with Bouncy Castle 1.80; pin a patched current line.
-    implementation("org.bouncycastle:bcprov-jdk18on:1.85")
+    // SMBJ 0.15.0 publishes bcprov 1.85.2, while the matching bcpkix artifact
+    // currently exists as 1.85 (there is no bcpkix 1.85.2 in Maven Central).
+    implementation("org.bouncycastle:bcprov-jdk18on:1.85.2")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.85")
     implementation("org.apache.commons:commons-compress:1.28.0")
+    // Split APK fusion engine: APKEditor-compatible merge primitives without its CLI/smali stack.
+    add("arscLibRaw", "io.github.reandroid:ARSCLib:1.4.0")
+    implementation(files(sanitizedArscLib))
+    // Runtime signing/verifying of fused APK exports on-device.
+    // Android-safe port: upstream AOSP apksig is explicitly host-side / outside-device oriented.
+    implementation("com.github.MuntashirAkon:apksig-android:4.4.0")
     implementation("com.google.android.gms:play-services-auth:21.6.0")
-    implementation("org.tukaani:xz:1.10")
+    implementation("org.tukaani:xz:1.12")
     implementation("com.github.junrar:junrar:8.1.0")
     runtimeOnly("org.slf4j:slf4j-nop:2.0.18")
 

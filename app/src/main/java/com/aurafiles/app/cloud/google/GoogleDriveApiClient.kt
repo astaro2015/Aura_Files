@@ -237,6 +237,7 @@ class GoogleDriveApiClient internal constructor(
             parents = parents,
             canDownload = capabilities?.optBoolean("canDownload", true) ?: true,
             shortcutTargetId = shortcut?.optString("targetId").orEmpty(),
+            trashed = json.optBoolean("trashed", false),
         ).also { require(it.id.isNotBlank()) { "Google Drive вернул файл без id" } }
     }
 
@@ -267,6 +268,6 @@ class GoogleDriveApiClient internal constructor(
         const val UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3/"
         private const val PAGE_SIZE = 1000
         private const val USER_AGENT = "AuraFiles/1.2.4"
-        private const val FILE_FIELDS = "id,name,mimeType,size,modifiedTime,parents,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)"
+        private const val FILE_FIELDS = "id,name,mimeType,size,modifiedTime,parents,trashed,capabilities(canDownload),shortcutDetails(targetId,targetMimeType)"
     }
 }

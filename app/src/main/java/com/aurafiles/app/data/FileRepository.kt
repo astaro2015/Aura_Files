@@ -1,5 +1,6 @@
 package com.aurafiles.app.data
 
+import com.aurafiles.app.AuraFileProvider
 import com.aurafiles.app.util.toHexString
 
 import android.content.Context
@@ -16,7 +17,7 @@ import android.os.storage.StorageManager
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbManager
 import android.provider.DocumentsContract
-import androidx.core.content.FileProvider
+import android.util.AtomicFile
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.model.DeleteAnimationMode
@@ -37,6 +38,7 @@ import java.net.URLConnection
 import java.security.MessageDigest
 import java.nio.file.Files
 import java.nio.file.attribute.FileTime
+import java.util.ArrayDeque
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
@@ -106,9 +108,10 @@ class FileRepository(private val context: Context) {
     }
 
     fun listChildren(directory: DocumentFile): List<FileEntry> {
+        DocumentTreeSafety.requireNotFilesystemSymlink(directory, "Открытие папки")
         return FastDocumentListing.list(context, directory)
             .asSequence()
-            .filterNot { it.name == TRASH_FOLDER || it.name == AuraVault.VAULT_FOLDER }
+            .filterNot { it.name == TRASH_FOLDER || AuraVault.isVaultFolder(it.name) }
             .map { info ->
                 FileEntry(
                     document = info.document,
@@ -131,7 +134,7 @@ class FileRepository(private val context: Context) {
     fun createFolder(parent: DocumentFile, requestedName: String): DocumentFile {
         val name = requestedName.trim()
         require(name.isNotEmpty()) { "Введите название папки" }
-        require(name != AuraVault.VAULT_FOLDER && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
+        require(!AuraVault.isVaultFolder(name) && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
         require(parent.findFile(name) == null) { "Папка с таким названием уже существует" }
         return requireNotNull(parent.createDirectory(name)) { "Не удалось создать папку" }
     }
@@ -139,7 +142,7 @@ class FileRepository(private val context: Context) {
     fun rename(entry: FileEntry, requestedName: String): Uri {
         val name = requestedName.trim()
         require(name.isNotEmpty()) { "Введите новое название" }
-        require(name != AuraVault.VAULT_FOLDER && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
+        require(!AuraVault.isVaultFolder(name) && name != TRASH_FOLDER) { "Это имя зарезервировано Aura Files" }
         val oldUri = entry.uri
         require(entry.document.renameTo(name)) { "Не удалось переименовать объект" }
         replaceFavoriteUri(oldUri, entry.document.uri)
@@ -147,27 +150,56 @@ class FileRepository(private val context: Context) {
     }
 
     fun delete(entry: FileEntry) {
-        require(entry.document.delete()) { "Не удалось удалить ${entry.name}" }
+        val parentUri = requireNotNull(entry.parentUri) { "Не удалось определить родительскую папку ${entry.name}" }
+        when (deleteDocumentAndProbe(entry.document, parentUri)) {
+            LocalDeleteOutcome.COMMITTED -> Unit
+            LocalDeleteOutcome.NOT_COMMITTED -> throw IOException("Не удалось удалить ${entry.name}")
+            LocalDeleteOutcome.AMBIGUOUS -> throw IOException(
+                "Состояние ${entry.name} после удаления неизвестно; Aura не выполняет дополнительное удаление"
+            )
+        }
     }
 
     fun moveToTrash(root: DocumentFile, entry: FileEntry): TrashRecord {
         val originalParentUri = requireNotNull(entry.parentUri) {
             "Не удалось определить исходную папку"
         }
-        val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory }
-            ?: root.createDirectory(TRASH_FOLDER)
+        val trash = trashDirectory(root, create = true)
             ?: throw IOException("Не удалось создать корзину")
-        val moved = if (trash.findFile(entry.name) == null) {
+        val moved = if (findUniqueChildStrict(trash, entry.name) == null) {
             tryFastMove(entry.document, originalParentUri, trash)
         } else null
-        val copied = moved ?: copyDocument(entry.document, trash).also { copy ->
-            if (!entry.document.delete()) {
-                copy.delete()
-                throw IOException("Не удалось переместить ${entry.name} в корзину")
+        val trashed = moved ?: run {
+            val copy = copyDocument(entry.document, trash)
+            when (deleteDocumentAndProbe(entry.document, originalParentUri)) {
+                LocalDeleteOutcome.COMMITTED -> copy
+                LocalDeleteOutcome.NOT_COMMITTED -> {
+                    rollbackSafetyCopy(trash, copy)
+                    throw IOException("Не удалось переместить ${entry.name} в корзину; исходник сохранён")
+                }
+                LocalDeleteOutcome.AMBIGUOUS -> {
+                    // Do not destroy the completed trash copy: the provider may have deleted the
+                    // source and only lost the response. Persist the known original mapping before
+                    // reporting ambiguity; if persistence itself is interrupted, listTrash() still
+                    // recovers the physical orphan conservatively.
+                    val safetyRecord = TrashRecord(
+                        entry = copy.toEntry(trash.uri),
+                        originalParentUri = originalParentUri,
+                        originalName = entry.name,
+                        deletedAt = System.currentTimeMillis(),
+                        originalUri = entry.uri,
+                        size = entry.size,
+                    )
+                    saveTrashMetadata(loadTrashMetadata() + safetyRecord.toStoredTrashRecord())
+                    throw IOException(
+                        "Состояние ${entry.name} после копирования в корзину неизвестно; " +
+                            "страховочная копия и путь восстановления сохранены"
+                    )
+                }
             }
         }
         val record = TrashRecord(
-            entry = copied.toEntry(trash.uri),
+            entry = trashed.toEntry(trash.uri),
             originalParentUri = originalParentUri,
             originalName = entry.name,
             deletedAt = System.currentTimeMillis(),
@@ -179,14 +211,20 @@ class FileRepository(private val context: Context) {
     }
 
     fun listTrash(root: DocumentFile): List<TrashRecord> {
-        val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory } ?: return emptyList()
-        val documents = FastDocumentListing.list(context, trash).associateBy { it.uri.toString() }
+        val trash = trashDirectory(root, create = false) ?: return emptyList()
+        val documents = FastDocumentListing.listStrict(context, trash)
+        val byIdentity = documents.associateBy { DocumentTreeSafety.identityKey(it.uri) }
         val metadata = loadTrashMetadata()
-        val survivingMetadata = metadata.filter { it.uri.toString() in documents }
-        if (survivingMetadata.size != metadata.size) saveTrashMetadata(survivingMetadata)
-        return survivingMetadata.mapNotNull { stored ->
-            val info = documents[stored.uri.toString()] ?: return@mapNotNull null
-            TrashRecord(
+        val matchedKeys = mutableSetOf<String>()
+        val records = mutableListOf<TrashRecord>()
+        val normalizedMetadata = mutableListOf<StoredTrashRecord>()
+
+        metadata.forEach { stored ->
+            val key = DocumentTreeSafety.identityKey(stored.uri)
+            val info = byIdentity[key] ?: return@forEach
+            matchedKeys += key
+            normalizedMetadata += stored
+            records += TrashRecord(
                 entry = FileEntry(
                     document = info.document,
                     name = info.name,
@@ -198,25 +236,82 @@ class FileRepository(private val context: Context) {
                     parentUri = trash.uri,
                 ),
                 originalParentUri = stored.originalParentUri,
-                originalName = stored.originalName,
-                deletedAt = stored.deletedAt,
+                originalName = stored.originalName.ifBlank { info.name },
+                deletedAt = stored.deletedAt.takeIf { it > 0L } ?: info.modifiedAt.takeIf { it > 0L } ?: 0L,
                 originalUri = stored.originalUri,
                 size = stored.size.takeIf { it > 0L } ?: info.size,
             )
-        }.sortedByDescending(TrashRecord::deletedAt)
+        }
+
+        // A process/power loss can happen after a physical move/copy and before metadata commit.
+        // Surface such objects rather than leaving invisible data in .AuraTrash. The original
+        // parent is unknowable, so restore falls back to the attached root.
+        documents.forEach { info ->
+            val key = DocumentTreeSafety.identityKey(info.uri)
+            if (key in matchedKeys) return@forEach
+            val recovered = StoredTrashRecord(
+                uri = info.uri,
+                originalParentUri = root.uri,
+                originalName = info.name,
+                deletedAt = info.modifiedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
+                originalUri = null,
+                size = info.size,
+            )
+            normalizedMetadata += recovered
+            records += TrashRecord(
+                entry = FileEntry(
+                    document = info.document,
+                    name = info.name,
+                    uri = info.uri,
+                    isDirectory = info.isDirectory,
+                    mimeType = info.mimeType,
+                    size = info.size,
+                    modifiedAt = info.modifiedAt,
+                    parentUri = trash.uri,
+                ),
+                originalParentUri = root.uri,
+                originalName = info.name,
+                deletedAt = recovered.deletedAt,
+                originalUri = null,
+                size = info.size,
+            )
+        }
+
+        if (normalizedMetadata != metadata) saveTrashMetadata(normalizedMetadata)
+        return records.sortedByDescending(TrashRecord::deletedAt)
     }
 
     fun restoreFromTrash(root: DocumentFile, record: TrashRecord): FileEntry {
+        val trash = trashDirectory(root, create = false)
+            ?: throw IOException("Корзина недоступна")
+        val trashIdentity = DocumentTreeSafety.identityKey(trash.uri)
+        val actualParentIdentity = record.entry.parentUri?.let(DocumentTreeSafety::identityKey)
+        if (actualParentIdentity != null && actualParentIdentity != trashIdentity) {
+            throw IOException("Источник восстановления больше не находится в корзине")
+        }
         val originalParent = documentFromUri(record.originalParentUri)
             ?.takeIf { it.exists() && it.isDirectory && it.canWrite() }
-            ?: root
-        val moved = if (originalParent.findFile(record.originalName) == null) {
-            tryFastMove(record.entry.document, record.entry.parentUri ?: record.entry.uri, originalParent)
+            ?.also { DocumentTreeSafety.requireNotFilesystemSymlink(it, "Восстановление из корзины") }
+            ?: root.also { DocumentTreeSafety.requireNotFilesystemSymlink(it, "Восстановление из корзины") }
+        val moved = if (findUniqueChildStrict(originalParent, record.originalName) == null) {
+            tryFastMove(record.entry.document, trash.uri, originalParent)
         } else null
-        val restored = moved ?: copyDocument(record.entry.document, originalParent, record.originalName).also { copy ->
-            if (!record.entry.document.delete()) {
-                copy.delete()
-                throw IOException("Не удалось удалить копию из корзины")
+        val restored = moved ?: run {
+            val copy = copyDocument(record.entry.document, originalParent, record.originalName)
+            when (deleteDocumentAndProbe(record.entry.document, trash.uri)) {
+                LocalDeleteOutcome.COMMITTED -> copy
+                LocalDeleteOutcome.NOT_COMMITTED -> {
+                    rollbackSafetyCopy(originalParent, copy)
+                    throw IOException("Не удалось удалить исходник из корзины; восстановленная копия отменена")
+                }
+                LocalDeleteOutcome.AMBIGUOUS -> {
+                    // Keep both copies and metadata. Removing the restored file here could delete
+                    // the only surviving bytes if the trash delete actually committed.
+                    throw IOException(
+                        "Состояние файла в корзине после восстановления неизвестно; " +
+                            "восстановленная копия сохранена"
+                    )
+                }
             }
         }
         removeTrashRecord(record.entry.uri)
@@ -224,29 +319,47 @@ class FileRepository(private val context: Context) {
     }
 
     fun permanentlyDelete(record: TrashRecord) {
-        require(record.entry.document.delete()) { "Не удалось удалить ${record.entry.name}" }
-        removeTrashRecord(record.entry.uri)
+        val parentUri = requireNotNull(record.entry.parentUri) { "Не удалось определить корзину" }
+        when (deleteDocumentAndProbe(record.entry.document, parentUri)) {
+            LocalDeleteOutcome.COMMITTED -> removeTrashRecord(record.entry.uri)
+            LocalDeleteOutcome.NOT_COMMITTED -> throw IOException("Не удалось удалить ${record.entry.name}")
+            LocalDeleteOutcome.AMBIGUOUS -> throw IOException(
+                "Состояние ${record.entry.name} после удаления неизвестно; запись корзины сохранена"
+            )
+        }
     }
 
     fun emptyTrash(root: DocumentFile) {
-        val trash = root.findFile(TRASH_FOLDER)?.takeIf { it.isDirectory } ?: return
-        val children = FastDocumentListing.list(context, trash)
-        val removedUris = children.map { it.uri }.toSet()
+        val trash = trashDirectory(root, create = false) ?: return
+        val children = FastDocumentListing.listStrict(context, trash)
+        var metadata = loadTrashMetadata()
         children.forEach { child ->
-            require(child.document.delete()) { "Не удалось удалить ${child.name}" }
+            when (deleteDocumentAndProbe(child.document, trash.uri)) {
+                LocalDeleteOutcome.COMMITTED -> {
+                    val childIdentity = DocumentTreeSafety.identityKey(child.uri)
+                    val updated = metadata.filterNot { DocumentTreeSafety.identityKey(it.uri) == childIdentity }
+                    if (updated != metadata) {
+                        saveTrashMetadata(updated)
+                        metadata = updated
+                    }
+                }
+                LocalDeleteOutcome.NOT_COMMITTED -> throw IOException("Не удалось удалить ${child.name}")
+                LocalDeleteOutcome.AMBIGUOUS -> throw IOException(
+                    "Состояние ${child.name} после удаления неизвестно; очистка корзины остановлена"
+                )
+            }
         }
-        saveTrashMetadata(loadTrashMetadata().filterNot { it.uri in removedUris })
     }
 
     /**
-     * Legacy favourites used to be URI bookmarks. Since 1.3.1 the visible "Избранное" is a
+     * Legacy favourites used to be URI bookmarks. Since 1.3.1 the visible vault (now "Сейф") is a
      * device-bound encrypted vault, so normal storage entries are never considered already
      * favourited: moving a file there removes the original.
      */
     fun favoriteUris(): Set<Uri> = emptySet()
 
     fun moveToFavorite(entry: FileEntry): FileEntry {
-        require(!entry.isDirectory) { "Папки пока нельзя помещать в защищённое Избранное" }
+        require(!entry.isDirectory) { "Папки пока нельзя помещать в Сейф" }
         val moved = vault.moveInto(entry)
         // Old URI bookmarks are intentionally discarded only after the new vault is actually
         // used; upgrading the app never moves a user's files without an explicit action.
@@ -257,7 +370,7 @@ class FileRepository(private val context: Context) {
     fun moveToFavorites(entries: List<FileEntry>): List<FileEntry> {
         require(entries.isNotEmpty()) { "Нет файлов для перемещения" }
         require(entries.none(FileEntry::isDirectory)) {
-            "Папки пока нельзя помещать в защищённое Избранное"
+            "Папки пока нельзя помещать в Сейф"
         }
         entries.forEach(::moveToFavorite)
         return favoriteEntries()
@@ -312,53 +425,161 @@ class FileRepository(private val context: Context) {
         preferences.edit().putString(KEY_DELETE_ANIMATION, value.name).apply()
     }
 
-    fun batchRename(entries: List<FileEntry>, newNames: List<String>): List<Uri> {
+    fun recoverPendingBatchRename(): String? = synchronized(BATCH_RENAME_LOCK) {
+        val journal = loadBatchRenameJournal() ?: return@synchronized null
+        val initialPhase = journal.phase
+        val store = RepositoryBatchRenameNameStore()
+        var latest = journal
+        val persist: (BatchRenameJournal) -> Unit = { state ->
+            persistBatchRenameJournal(state)
+            latest = state
+        }
+        try {
+            latest = when (latest.phase) {
+                BatchRenamePhase.PREPARE,
+                BatchRenamePhase.FINALIZE -> BatchRenameJournalEngine.continueForward(latest, store, persist)
+                BatchRenamePhase.ROLLBACK_STAGE,
+                BatchRenamePhase.ROLLBACK_RESTORE -> BatchRenameJournalEngine.continueRollback(latest, store, persist)
+            }
+            finishRecoveredBatchRename(latest)
+            when (initialPhase) {
+                BatchRenamePhase.PREPARE,
+                BatchRenamePhase.FINALIZE -> "Незавершённое пакетное переименование завершено после перезапуска"
+                BatchRenamePhase.ROLLBACK_STAGE,
+                BatchRenamePhase.ROLLBACK_RESTORE -> "Откат незавершённого пакетного переименования завершён"
+            }
+        } catch (forwardError: Exception) {
+            if (latest.phase == BatchRenamePhase.ROLLBACK_STAGE || latest.phase == BatchRenamePhase.ROLLBACK_RESTORE) {
+                throw forwardError
+            }
+            // If continuing the requested operation is no longer safe, switch durably to rollback.
+            // beginRollback records the exact forward phase/step so a crash during rollback can
+            // still identify which visible name belongs to each selected object.
+            val persisted = loadBatchRenameJournal() ?: latest
+            latest = BatchRenameJournalEngine.beginRollback(persisted, persist)
+            try {
+                latest = BatchRenameJournalEngine.continueRollback(latest, store, persist)
+                verifyBatchRenameOriginals(latest)
+                require(preferences.edit().putStringSet(KEY_FAVORITES, latest.favoriteUris).commit()) {
+                    "Не удалось восстановить состояние после отката пакетного переименования"
+                }
+                clearBatchRenameIndexReconcileMarker()
+                clearBatchRenameJournal()
+                "Незавершённое пакетное переименование безопасно отменено после перезапуска"
+            } catch (rollbackError: Exception) {
+                throw IOException(
+                    "Не удалось ни завершить, ни безопасно откатить пакетное переименование; журнал сохранён",
+                    rollbackError,
+                ).also { it.addSuppressed(forwardError) }
+            }
+        }
+    }
+
+    fun batchRename(entries: List<FileEntry>, newNames: List<String>): List<Uri> = synchronized(BATCH_RENAME_LOCK) {
+        // A journal left by a killed process always has priority over a new destructive action.
+        recoverPendingBatchRename()
+        batchRenameLocked(entries, newNames)
+    }
+
+    private fun batchRenameLocked(entries: List<FileEntry>, newNames: List<String>): List<Uri> {
         require(entries.isNotEmpty() && entries.size == newNames.size) { "Некорректный список имён" }
+        require(entries.size <= BATCH_RENAME_MAX_ENTRIES) { "Слишком много объектов для одного пакетного переименования" }
         val cleaned = newNames.map(String::trim)
         require(cleaned.none(String::isBlank)) { "Новое имя не может быть пустым" }
-        require(cleaned.none { it == AuraVault.VAULT_FOLDER || it == TRASH_FOLDER }) { "Это имя зарезервировано Aura Files" }
+        require(cleaned.none { AuraVault.isVaultFolder(it) || it == TRASH_FOLDER }) { "Это имя зарезервировано Aura Files" }
         require(cleaned.distinctBy(String::lowercase).size == cleaned.size) { "Новые имена повторяются" }
 
-        entries.zip(cleaned).groupBy { it.first.parentUri }.forEach { (parentUri, changes) ->
-            val parent = parentUri?.let(::documentFromUri)
-            if (parent != null) {
-                val selectedUris = changes.map { it.first.uri }.toSet()
-                changes.forEach { (_, requestedName) ->
-                    val collision = parent.findFile(requestedName)
-                    require(collision == null || collision.uri in selectedUris) {
-                        "Имя $requestedName уже занято"
-                    }
+        val parentUris = entries.map { entry ->
+            requireNotNull(entry.parentUri) { "Не удалось определить папку для ${entry.name}" }
+        }
+        val parents = parentUris.distinct().associateWith { parentUri ->
+            requireNotNull(documentFromUri(parentUri)?.takeIf { it.exists() && it.isDirectory && it.canWrite() }) {
+                "Не удалось открыть папку для пакетного переименования"
+            }
+        }
+
+        entries.indices.groupBy { parentUris[it] }.forEach { (parentUri, indexes) ->
+            val parent = requireNotNull(parents[parentUri])
+            val selectedUris = indexes.map { entries[it].uri }.toSet()
+            val originalNames = indexes.map { entries[it].name }
+            require(originalNames.distinctBy(String::lowercase).size == originalNames.size) {
+                "В папке есть выбранные объекты с одинаковыми именами; безопасное восстановление невозможно"
+            }
+            indexes.forEach { index ->
+                val collision = parent.findFile(cleaned[index])
+                require(collision == null || collision.uri in selectedUris) {
+                    "Имя ${cleaned[index]} уже занято"
                 }
             }
         }
 
-        val originals = entries.map(FileEntry::name)
-        val originalUris = entries.map(FileEntry::uri)
-        val favoriteSnapshot = favoriteUris()
-        val mutated = BooleanArray(entries.size)
+        val reservedByParent = mutableMapOf<Uri, MutableSet<String>>()
+        entries.indices.forEach { index ->
+            val reserved = reservedByParent.getOrPut(parentUris[index]) { linkedSetOf() }
+            reserved += entries[index].name.lowercase()
+            reserved += cleaned[index].lowercase()
+        }
+        val items = entries.indices.map { index ->
+            val parentUri = parentUris[index]
+            val parent = requireNotNull(parents[parentUri])
+            val reserved = requireNotNull(reservedByParent[parentUri])
+            BatchRenameJournalItem(
+                parentKey = parentUri.toString(),
+                originalUri = entries[index].uri.toString(),
+                originalName = entries[index].name,
+                temporaryName = allocateBatchRenameServiceName(parent, ".aura-rename-", reserved),
+                targetName = cleaned[index],
+                rollbackName = allocateBatchRenameServiceName(parent, ".aura-rollback-", reserved),
+            )
+        }
+        var latest = BatchRenameJournal(
+            operationId = UUID.randomUUID().toString(),
+            phase = BatchRenamePhase.PREPARE,
+            step = 0,
+            items = items,
+            favoriteUris = favoriteUris().map(Uri::toString).toSet(),
+        )
+        // Complete plan, original URIs and all unique service names are fsync'd before mutation #1.
+        persistBatchRenameJournal(latest)
+        val store = RepositoryBatchRenameNameStore()
+        val persist: (BatchRenameJournal) -> Unit = { state ->
+            persistBatchRenameJournal(state)
+            latest = state
+        }
+
         try {
-            entries.forEachIndexed { index, entry ->
-                require(entry.document.renameTo(".aura-${UUID.randomUUID()}")) {
-                    "Не удалось подготовить ${entry.name} к переименованию"
-                }
-                mutated[index] = true
+            latest = BatchRenameJournalEngine.continueForward(latest, store, persist)
+            val finalUris = verifyBatchRenameFinal(latest)
+            val replacements = latest.items.map(BatchRenameJournalItem::originalUri).zip(finalUris.map(Uri::toString)).toMap()
+            val updatedFavorites = latest.favoriteUris.map { replacements[it] ?: it }.toSet()
+            require(preferences.edit().putStringSet(KEY_FAVORITES, updatedFavorites).commit()) {
+                "Не удалось синхронно сохранить состояние пакетного переименования"
             }
-            entries.zip(cleaned).forEach { (entry, requestedName) ->
-                require(entry.document.renameTo(requestedName)) { "Не удалось переименовать ${entry.name}" }
-            }
-            val finalUris = entries.map { it.document.uri }
-            val replacements = originalUris.zip(finalUris).toMap()
-            val updatedFavorites = favoriteSnapshot.map { replacements[it] ?: it }.map(Uri::toString).toSet()
-            preferences.edit().putStringSet(KEY_FAVORITES, updatedFavorites).apply()
+            persistBatchRenameIndexReconcileMarker(latest.operationId)
+            clearBatchRenameJournal()
             return finalUris
-        } catch (error: Throwable) {
-            val rollbackFailures = rollbackBatchRename(entries, originals, mutated)
-            if (rollbackFailures.isNotEmpty()) {
+        } catch (error: Exception) {
+            val rollbackFailure = runCatching {
+                val persisted = loadBatchRenameJournal() ?: latest
+                latest = if (persisted.phase == BatchRenamePhase.PREPARE || persisted.phase == BatchRenamePhase.FINALIZE) {
+                    BatchRenameJournalEngine.beginRollback(persisted, persist)
+                } else {
+                    persisted
+                }
+                latest = BatchRenameJournalEngine.continueRollback(latest, store, persist)
+                verifyBatchRenameOriginals(latest)
+                require(preferences.edit().putStringSet(KEY_FAVORITES, latest.favoriteUris).commit()) {
+                    "Не удалось восстановить состояние после отката пакетного переименования"
+                }
+                clearBatchRenameIndexReconcileMarker()
+                clearBatchRenameJournal()
+            }.exceptionOrNull()
+            if (rollbackFailure != null) {
                 throw IOException(
                     buildString {
                         append(error.message ?: "Пакетное переименование не завершено")
-                        append(". Не удалось вернуть исходные имена: ")
-                        append(rollbackFailures.joinToString())
+                        append(". Автоматическое восстановление тоже не завершено; журнал сохранён: ")
+                        append(rollbackFailure.message ?: rollbackFailure.javaClass.simpleName)
                     },
                     error,
                 )
@@ -367,34 +588,273 @@ class FileRepository(private val context: Context) {
         }
     }
 
-    /**
-     * Rollback is also two-phase. First free every original name that may now be occupied by
-     * another selected file, then restore originals. This covers swaps and rename cycles.
-     */
-    private fun rollbackBatchRename(
-        entries: List<FileEntry>,
-        originals: List<String>,
-        mutated: BooleanArray,
-    ): List<String> {
-        entries.indices.filter { mutated[it] && entries[it].document.name != originals[it] }.forEach { index ->
-            runCatching { entries[index].document.renameTo(".aura-rollback-${UUID.randomUUID()}") }
-        }
-
-        var remaining = entries.indices
-            .filter { mutated[it] && entries[it].document.name != originals[it] }
-            .toMutableSet()
-        repeat(entries.size + 1) {
-            if (remaining.isEmpty()) return@repeat
-            var progressed = false
-            remaining.toList().forEach { index ->
-                if (runCatching { entries[index].document.renameTo(originals[index]) }.getOrDefault(false)) {
-                    remaining.remove(index)
-                    progressed = true
+    private fun finishRecoveredBatchRename(journal: BatchRenameJournal) {
+        when (journal.phase) {
+            BatchRenamePhase.FINALIZE -> {
+                val finalUris = verifyBatchRenameFinal(journal)
+                val replacements = journal.items.map(BatchRenameJournalItem::originalUri)
+                    .zip(finalUris.map(Uri::toString))
+                    .toMap()
+                val updatedFavorites = journal.favoriteUris.map { replacements[it] ?: it }.toSet()
+                require(preferences.edit().putStringSet(KEY_FAVORITES, updatedFavorites).commit()) {
+                    "Не удалось синхронно сохранить восстановленное пакетное переименование"
                 }
+                persistBatchRenameIndexReconcileMarker(journal.operationId)
             }
-            if (!progressed) return@repeat
+            BatchRenamePhase.ROLLBACK_RESTORE -> {
+                verifyBatchRenameOriginals(journal)
+                require(preferences.edit().putStringSet(KEY_FAVORITES, journal.favoriteUris).commit()) {
+                    "Не удалось восстановить состояние после отката пакетного переименования"
+                }
+                clearBatchRenameIndexReconcileMarker()
+            }
+            BatchRenamePhase.PREPARE,
+            BatchRenamePhase.ROLLBACK_STAGE -> throw IOException("Журнал остановился в незавершённой фазе ${journal.phase}")
         }
-        return remaining.map { originals[it] }
+        clearBatchRenameJournal()
+    }
+
+    private fun verifyBatchRenameOriginals(journal: BatchRenameJournal) {
+        require(journal.phase == BatchRenamePhase.ROLLBACK_RESTORE && journal.step == journal.items.size) {
+            "Откат пакетного переименования не завершён"
+        }
+        journal.items.forEach { item ->
+            val original = findUniqueJournalDocument(item.parentKey, item.originalName)
+            require(original != null) { "Не удалось подтвердить исходный объект ${item.originalName}" }
+            require(findUniqueJournalDocument(item.parentKey, item.temporaryName) == null) {
+                "Остался временный объект ${item.temporaryName}"
+            }
+            require(findUniqueJournalDocument(item.parentKey, item.rollbackName) == null) {
+                "Остался страховочный объект ${item.rollbackName}"
+            }
+        }
+    }
+
+    private fun verifyBatchRenameFinal(journal: BatchRenameJournal): List<Uri> {
+        require(journal.phase == BatchRenamePhase.FINALIZE && journal.step == journal.items.size) {
+            "Пакетное переименование не дошло до подтверждённого финала"
+        }
+        return journal.items.map { item ->
+            val target = requireNotNull(findUniqueJournalDocument(item.parentKey, item.targetName)) {
+                "Не удалось подтвердить итоговое имя ${item.targetName}"
+            }
+            require(findUniqueJournalDocument(item.parentKey, item.temporaryName) == null) {
+                "Остался временный объект ${item.temporaryName}"
+            }
+            require(findUniqueJournalDocument(item.parentKey, item.rollbackName) == null) {
+                "Остался страховочный объект ${item.rollbackName}"
+            }
+            target.uri
+        }
+    }
+
+    private inner class RepositoryBatchRenameNameStore : BatchRenameNameStore {
+        override fun exists(parentKey: String, name: String): Boolean =
+            findUniqueJournalDocument(parentKey, name) != null
+
+        override fun rename(parentKey: String, fromName: String, toName: String): Boolean {
+            if (fromName == toName) return true
+            val source = findUniqueJournalDocument(parentKey, fromName) ?: return false
+            if (findUniqueJournalDocument(parentKey, toName) != null) return false
+            return source.renameTo(toName)
+        }
+    }
+
+    private fun findUniqueJournalDocument(parentKey: String, name: String): DocumentFile? {
+        val parent = requireNotNull(documentFromUri(Uri.parse(parentKey))?.takeIf { it.exists() && it.isDirectory && it.canWrite() }) {
+            "Папка незавершённого переименования недоступна: $parentKey"
+        }
+        val matches = FastDocumentListing.list(context, parent).filter { it.name == name }
+        require(matches.size <= 1) { "Имя $name неоднозначно: найдено объектов ${matches.size}" }
+        return matches.singleOrNull()?.document
+    }
+
+    private fun allocateBatchRenameServiceName(
+        parent: DocumentFile,
+        prefix: String,
+        reservedLowercase: MutableSet<String>,
+    ): String {
+        repeat(BATCH_RENAME_SERVICE_NAME_ATTEMPTS) {
+            val candidate = "$prefix${UUID.randomUUID()}"
+            val key = candidate.lowercase()
+            if (key !in reservedLowercase && parent.findFile(candidate) == null) {
+                reservedLowercase += key
+                return candidate
+            }
+        }
+        throw IOException("Не удалось подобрать безопасное служебное имя для пакетного переименования")
+    }
+
+    private fun batchRenameJournalFile(): File = File(context.noBackupFilesDir, BATCH_RENAME_JOURNAL_FILE)
+
+    private fun batchRenameIndexReconcileMarkerFile(): File =
+        File(context.noBackupFilesDir, BATCH_RENAME_INDEX_RECONCILE_FILE)
+
+    /**
+     * True after file names are durably committed but before the index/cache layer has
+     * acknowledged those URI changes. The marker deliberately survives process death.
+     */
+    fun hasPendingBatchRenameIndexReconciliation(): Boolean {
+        val file = batchRenameIndexReconcileMarkerFile()
+        return file.exists() || File(file.path + ".bak").exists()
+    }
+
+    /** Call only after the stale URI index has been updated or safely discarded. */
+    fun confirmBatchRenameIndexReconciled() {
+        AtomicFile(batchRenameIndexReconcileMarkerFile()).delete()
+    }
+
+    private fun persistBatchRenameIndexReconcileMarker(operationId: String) {
+        val atomic = AtomicFile(batchRenameIndexReconcileMarkerFile())
+        val output = atomic.startWrite()
+        try {
+            output.write(
+                JSONObject()
+                    .put("version", 1)
+                    .put("operationId", operationId)
+                    .put("committedAt", System.currentTimeMillis())
+                    .toString()
+                    .toByteArray(Charsets.UTF_8)
+            )
+            output.fd.sync()
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            atomic.failWrite(output)
+            throw error
+        }
+    }
+
+    private fun clearBatchRenameIndexReconcileMarker() {
+        AtomicFile(batchRenameIndexReconcileMarkerFile()).delete()
+    }
+
+    private fun persistBatchRenameJournal(journal: BatchRenameJournal) {
+        val atomic = AtomicFile(batchRenameJournalFile())
+        val output = atomic.startWrite()
+        try {
+            output.write(journal.toJson().toString().toByteArray(Charsets.UTF_8))
+            output.fd.sync()
+            atomic.finishWrite(output)
+        } catch (error: Throwable) {
+            atomic.failWrite(output)
+            throw error
+        }
+    }
+
+    private fun loadBatchRenameJournal(): BatchRenameJournal? {
+        val file = batchRenameJournalFile()
+        val backup = File(file.path + ".bak")
+        if (!file.exists() && !backup.exists()) return null
+        val raw = try {
+            AtomicFile(file).openRead().bufferedReader(Charsets.UTF_8).use { it.readText() }
+        } catch (error: Throwable) {
+            throw IOException("Не удалось прочитать журнал пакетного переименования", error)
+        }
+        return try {
+            batchRenameJournalFromJson(JSONObject(raw))
+        } catch (error: Throwable) {
+            throw IOException("Журнал пакетного переименования повреждён; автоматические действия остановлены", error)
+        }
+    }
+
+    private fun clearBatchRenameJournal() {
+        AtomicFile(batchRenameJournalFile()).delete()
+    }
+
+    private fun BatchRenameJournal.toJson(): JSONObject = JSONObject()
+        .put("version", BATCH_RENAME_JOURNAL_VERSION)
+        .put("operationId", operationId)
+        .put("phase", phase.name)
+        .put("step", step)
+        .put("rollbackSourcePhase", rollbackSourcePhase?.name.orEmpty())
+        .put("rollbackSourceStep", rollbackSourceStep)
+        .put("favoriteUris", JSONArray().apply { favoriteUris.forEach { put(it) } })
+        .put("items", JSONArray().apply {
+            items.forEach { item ->
+                put(
+                    JSONObject()
+                        .put("parentKey", item.parentKey)
+                        .put("originalUri", item.originalUri)
+                        .put("originalName", item.originalName)
+                        .put("temporaryName", item.temporaryName)
+                        .put("targetName", item.targetName)
+                        .put("rollbackName", item.rollbackName)
+                )
+            }
+        })
+
+    private fun batchRenameJournalFromJson(json: JSONObject): BatchRenameJournal {
+        require(json.getInt("version") == BATCH_RENAME_JOURNAL_VERSION) { "Неподдерживаемая версия журнала" }
+        val operationId = json.getString("operationId")
+        require(runCatching { UUID.fromString(operationId) }.isSuccess) { "Некорректный ID журнала" }
+        val array = json.getJSONArray("items")
+        require(array.length() in 1..BATCH_RENAME_MAX_ENTRIES) { "Некорректное число записей журнала" }
+        val items = buildList {
+            for (index in 0 until array.length()) {
+                val item = array.getJSONObject(index)
+                add(
+                    BatchRenameJournalItem(
+                        parentKey = item.getString("parentKey"),
+                        originalUri = item.getString("originalUri"),
+                        originalName = item.getString("originalName"),
+                        temporaryName = item.getString("temporaryName"),
+                        targetName = item.getString("targetName"),
+                        rollbackName = item.getString("rollbackName"),
+                    )
+                )
+            }
+        }
+        validateBatchRenameJournalItems(items)
+        val phase = BatchRenamePhase.valueOf(json.getString("phase"))
+        val step = json.getInt("step")
+        require(step in 0..items.size) { "Некорректный шаг журнала" }
+        val rollbackSourcePhase = json.optString("rollbackSourcePhase").takeIf(String::isNotBlank)?.let { BatchRenamePhase.valueOf(it) }
+        val rollbackSourceStep = json.optInt("rollbackSourceStep", 0)
+        if (phase == BatchRenamePhase.ROLLBACK_STAGE || phase == BatchRenamePhase.ROLLBACK_RESTORE) {
+            require(rollbackSourcePhase == BatchRenamePhase.PREPARE || rollbackSourcePhase == BatchRenamePhase.FINALIZE) {
+                "В журнале отката отсутствует исходная фаза"
+            }
+            require(rollbackSourceStep in 0..items.size) { "Некорректный исходный шаг отката" }
+        }
+        val favoriteUris = json.optJSONArray("favoriteUris")?.let { favorites ->
+            buildSet {
+                for (index in 0 until favorites.length()) add(favorites.getString(index))
+            }
+        }.orEmpty()
+        return BatchRenameJournal(
+            operationId = operationId,
+            phase = phase,
+            step = step,
+            items = items,
+            favoriteUris = favoriteUris,
+            rollbackSourcePhase = rollbackSourcePhase,
+            rollbackSourceStep = rollbackSourceStep,
+        )
+    }
+
+    private fun validateBatchRenameJournalItems(items: List<BatchRenameJournalItem>) {
+        require(items.map { it.originalUri }.distinct().size == items.size) { "URI записей журнала повторяются" }
+        items.forEach { item ->
+            require(item.parentKey.isNotBlank() && item.originalUri.isNotBlank())
+            require(item.originalName.isNotBlank() && item.targetName.isNotBlank())
+            require(item.temporaryName.startsWith(".aura-rename-") && item.rollbackName.startsWith(".aura-rollback-"))
+        }
+        items.groupBy(BatchRenameJournalItem::parentKey).values.forEach { siblings ->
+            val originals = siblings.map { it.originalName.lowercase() }
+            val targets = siblings.map { it.targetName.lowercase() }
+            val temps = siblings.map { it.temporaryName.lowercase() }
+            val rollbacks = siblings.map { it.rollbackName.lowercase() }
+            require(originals.distinct().size == originals.size) { "Исходные имена журнала неоднозначны" }
+            require(targets.distinct().size == targets.size) { "Целевые имена журнала неоднозначны" }
+            require(temps.distinct().size == temps.size && rollbacks.distinct().size == rollbacks.size) {
+                "Служебные имена журнала повторяются"
+            }
+            val visible = (originals + targets).toSet()
+            require(temps.none { it in visible } && rollbacks.none { it in visible }) {
+                "Служебное имя журнала пересекается с пользовательским"
+            }
+            require(temps.toSet().intersect(rollbacks.toSet()).isEmpty()) { "Служебные имена журнала пересекаются" }
+        }
     }
 
     fun sha256(entry: FileEntry): String = contentHash(entry)
@@ -443,6 +903,10 @@ class FileRepository(private val context: Context) {
     fun createZip(entries: List<FileEntry>, destination: DocumentFile, requestedName: String): DocumentFile {
         require(entries.isNotEmpty()) { "Выберите файлы для архива" }
         require(destination.isDirectory && destination.canWrite()) { "Папка недоступна для записи" }
+        DocumentTreeSafety.requireNotFilesystemSymlink(destination, "Создание ZIP")
+        // Preflight before creating the archive itself. Otherwise choosing a destination inside
+        // a selected directory can make the newly-created ZIP become part of its own input tree.
+        entries.forEach { preflightRecursiveSource(it.document, destination, "Создание ZIP") }
         val cleanName = requestedName.trim().ifEmpty { "Архив" }
         val archiveName = if (cleanName.endsWith(".zip", ignoreCase = true)) cleanName else "$cleanName.zip"
         val targetName = uniqueName(destination, archiveName)
@@ -453,7 +917,15 @@ class FileRepository(private val context: Context) {
             val rawOutput = resolver.openOutputStream(archive.uri, "w")
                 ?: throw IOException("Не удалось открыть архив для записи")
             ZipOutputStream(rawOutput.buffered()).use { zip ->
-                entries.forEach { addToZip(zip, it.document, ArchiveSafety.safeSegment(it.name)) }
+                entries.forEach { entry ->
+                    addToZip(
+                        zip,
+                        entry.document,
+                        ArchiveSafety.safeSegment(entry.name),
+                        depth = 0,
+                        visitedDirectories = mutableSetOf(),
+                    )
+                }
             }
             return archive
         } catch (error: Throwable) {
@@ -522,21 +994,45 @@ class FileRepository(private val context: Context) {
     fun analyze(root: DocumentFile, maxFiles: Int = MAX_ANALYZED_FILES): StorageAnalysis {
         val files = mutableListOf<FileEntry>()
         var limitReached = false
+        data class PendingDirectory(val directory: DocumentFile, val depth: Int)
 
-        fun walk(directory: DocumentFile) {
-            if (limitReached) return
-            directory.listFiles().forEach { child ->
-                if (limitReached) return@forEach
-                if (child.name == TRASH_FOLDER || child.name == AuraVault.VAULT_FOLDER) return@forEach
+        DocumentTreeSafety.requireNotFilesystemSymlink(root, "Анализ хранилища")
+        val visitedDirectories = mutableSetOf<String>()
+        DocumentTreeSafety.requireUniqueDirectoryVisit(root, 0, visitedDirectories, "Анализ хранилища")
+        val pending = ArrayDeque<PendingDirectory>()
+        pending.addLast(PendingDirectory(root, 0))
+
+        while (pending.isNotEmpty() && !limitReached) {
+            val current = pending.removeLast()
+            val children = FastDocumentListing.listStrict(context, current.directory)
+            for (child in children.asReversed()) {
+                if (limitReached) break
+                if (child.name == TRASH_FOLDER || AuraVault.isVaultFolder(child.name)) continue
+                if (DocumentTreeSafety.isFilesystemSymlink(child.document)) continue
                 if (child.isDirectory) {
-                    walk(child)
+                    val depth = current.depth + 1
+                    DocumentTreeSafety.requireUniqueDirectoryVisit(
+                        child.document,
+                        depth,
+                        visitedDirectories,
+                        "Анализ хранилища",
+                    )
+                    pending.addLast(PendingDirectory(child.document, depth))
                 } else {
-                    files += child.toEntry(directory.uri)
+                    files += FileEntry(
+                        document = child.document,
+                        name = child.name,
+                        uri = child.uri,
+                        isDirectory = false,
+                        mimeType = child.mimeType,
+                        size = child.size,
+                        modifiedAt = child.modifiedAt,
+                        parentUri = current.directory.uri,
+                    )
                     if (files.size >= maxFiles) limitReached = true
                 }
             }
         }
-        walk(root)
 
         val categories = FileCategory.entries.map { category ->
             val matching = files.filter { it.matchesCategory(category) }
@@ -685,7 +1181,7 @@ class FileRepository(private val context: Context) {
                 SharedItem(
                     name = archive.name,
                     mimeType = "application/zip",
-                    uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", archive),
+                    uri = AuraFileProvider.uriForFile(context, archive),
                 )
             } else {
                 SharedItem(entry.name, entry.mimeType ?: "application/octet-stream", externallyAccessibleUri(entry))
@@ -722,7 +1218,13 @@ class FileRepository(private val context: Context) {
         val target = File(shareDirectory, "$baseName-${UUID.randomUUID().toString().take(8)}.zip")
         try {
             ZipOutputStream(target.outputStream().buffered()).use { zip ->
-                addToZip(zip, entry.document, ArchiveSafety.safeSegment(entry.name))
+                addToZip(
+                    zip,
+                    entry.document,
+                    ArchiveSafety.safeSegment(entry.name),
+                    depth = 0,
+                    visitedDirectories = mutableSetOf(),
+                )
             }
             return target
         } catch (error: Throwable) {
@@ -776,17 +1278,81 @@ class FileRepository(private val context: Context) {
         return (mounted + hardware).distinctBy(StorageVolumeInfo::id)
     }
 
+    private fun preflightRecursiveSource(
+        source: DocumentFile,
+        destination: DocumentFile,
+        operation: String,
+    ) {
+        DocumentTreeSafety.requireNotFilesystemSymlink(destination, operation)
+        DocumentTreeSafety.requireNotFilesystemSymlink(source, operation)
+        if (!source.isDirectory) return
+        if (DocumentTreeSafety.isSameOrDescendantFile(destination, source) == true) {
+            throw IOException("$operation: папку нельзя поместить внутрь самой себя или её потомка")
+        }
+
+        val destinationKey = DocumentTreeSafety.identityKey(destination)
+        val visited = mutableSetOf<String>()
+        data class PendingDirectory(val directory: DocumentFile, val depth: Int)
+        val rootKey = DocumentTreeSafety.requireUniqueDirectoryVisit(source, 0, visited, operation)
+        if (rootKey == destinationKey) {
+            throw IOException("$operation: исходная папка и папка назначения совпадают")
+        }
+        val pending = ArrayDeque<PendingDirectory>()
+        pending.addLast(PendingDirectory(source, 0))
+        while (pending.isNotEmpty()) {
+            val current = pending.removeLast()
+            for (child in FastDocumentListing.listStrict(context, current.directory)) {
+                DocumentTreeSafety.requireNotFilesystemSymlink(child.document, operation)
+                if (!child.isDirectory) continue
+                val depth = current.depth + 1
+                val key = DocumentTreeSafety.requireUniqueDirectoryVisit(child.document, depth, visited, operation)
+                if (key == destinationKey) {
+                    throw IOException("$operation: папку нельзя поместить внутрь самой себя или её потомка")
+                }
+                pending.addLast(PendingDirectory(child.document, depth))
+            }
+        }
+    }
+
     private fun copyDocument(
         source: DocumentFile,
         destination: DocumentFile,
         preferredName: String? = null,
     ): DocumentFile {
+        preflightRecursiveSource(source, destination, "Копирование")
+        return copyDocumentRecursive(
+            source = source,
+            destination = destination,
+            preferredName = preferredName,
+            depth = 0,
+            visitedDirectories = mutableSetOf(),
+        )
+    }
+
+    private fun copyDocumentRecursive(
+        source: DocumentFile,
+        destination: DocumentFile,
+        preferredName: String?,
+        depth: Int,
+        visitedDirectories: MutableSet<String>,
+    ): DocumentFile {
+        DocumentTreeSafety.requireDepth(depth, "Копирование")
+        DocumentTreeSafety.requireNotFilesystemSymlink(source, "Копирование")
         return if (source.isDirectory) {
+            DocumentTreeSafety.requireUniqueDirectoryVisit(source, depth, visitedDirectories, "Копирование")
             val folderName = uniqueName(destination, preferredName ?: source.name ?: "Новая папка")
             val copiedFolder = destination.createDirectory(folderName)
                 ?: throw IOException("Не удалось создать папку $folderName")
             try {
-                source.listFiles().forEach { child -> copyDocument(child, copiedFolder) }
+                FastDocumentListing.listStrict(context, source).forEach { child ->
+                    copyDocumentRecursive(
+                        source = child.document,
+                        destination = copiedFolder,
+                        preferredName = null,
+                        depth = depth + 1,
+                        visitedDirectories = visitedDirectories,
+                    )
+                }
                 copiedFolder
             } catch (error: Throwable) {
                 copiedFolder.delete()
@@ -820,13 +1386,28 @@ class FileRepository(private val context: Context) {
         }
     }
 
-    private fun addToZip(zip: ZipOutputStream, source: DocumentFile, path: String) {
+    private fun addToZip(
+        zip: ZipOutputStream,
+        source: DocumentFile,
+        path: String,
+        depth: Int,
+        visitedDirectories: MutableSet<String>,
+    ) {
+        DocumentTreeSafety.requireDepth(depth, "Создание ZIP")
+        DocumentTreeSafety.requireNotFilesystemSymlink(source, "Создание ZIP")
         if (source.isDirectory) {
+            DocumentTreeSafety.requireUniqueDirectoryVisit(source, depth, visitedDirectories, "Создание ZIP")
             val directoryPath = "$path/"
             zip.putNextEntry(ZipEntry(directoryPath))
             zip.closeEntry()
-            source.listFiles().forEach { child ->
-                addToZip(zip, child, "$path/${ArchiveSafety.safeSegment(child.name ?: "Без названия")}")
+            FastDocumentListing.listStrict(context, source).forEach { child ->
+                addToZip(
+                    zip,
+                    child.document,
+                    "$path/${ArchiveSafety.safeSegment(child.name)}",
+                    depth + 1,
+                    visitedDirectories,
+                )
             }
         } else {
             zip.putNextEntry(ZipEntry(path).apply {
@@ -917,11 +1498,7 @@ class FileRepository(private val context: Context) {
     private fun externallyAccessibleUri(entry: FileEntry): Uri {
         if (entry.uri.scheme != "file") return entry.uri
         val path = requireNotNull(entry.uri.path) { "Не удалось определить путь файла" }
-        return FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            File(path),
-        )
+        return AuraFileProvider.uriForFile(context, File(path))
     }
 
     private data class StoredTrashRecord(
@@ -984,7 +1561,9 @@ class FileRepository(private val context: Context) {
                     .put("size", record.size)
             )
         }
-        preferences.edit().putString(KEY_TRASH_RECORDS, array.toString()).apply()
+        if (!preferences.edit().putString(KEY_TRASH_RECORDS, array.toString()).commit()) {
+            throw IOException("Не удалось надёжно сохранить состояние корзины")
+        }
     }
 
     private fun removeTrashRecord(uri: Uri) {
@@ -1007,21 +1586,124 @@ class FileRepository(private val context: Context) {
         }
     }
 
+    private enum class LocalDeleteOutcome { COMMITTED, NOT_COMMITTED, AMBIGUOUS }
+
+    private fun trashDirectory(root: DocumentFile, create: Boolean): DocumentFile? {
+        DocumentTreeSafety.requireNotFilesystemSymlink(root, "Корзина")
+        val existing = findUniqueChildStrict(root, TRASH_FOLDER)
+        val trash = when {
+            existing != null -> {
+                if (!existing.isDirectory) throw IOException("$TRASH_FOLDER существует, но не является папкой")
+                existing
+            }
+            create -> root.createDirectory(TRASH_FOLDER)
+                ?: throw IOException("Не удалось создать корзину")
+            else -> null
+        }
+        trash?.let { DocumentTreeSafety.requireNotFilesystemSymlink(it, "Корзина") }
+        return trash
+    }
+
+    private fun findUniqueChildStrict(parent: DocumentFile, name: String): DocumentFile? {
+        val matches = FastDocumentListing.listStrict(context, parent).filter { it.name == name }
+        if (matches.size > 1) throw IOException("Найдено несколько объектов с именем $name")
+        return matches.singleOrNull()?.document
+    }
+
+    private fun findIdentityStrict(parent: DocumentFile, uri: Uri): DocumentFile? {
+        val key = DocumentTreeSafety.identityKey(uri)
+        val matches = FastDocumentListing.listStrict(context, parent)
+            .filter { DocumentTreeSafety.identityKey(it.uri) == key }
+        if (matches.size > 1) throw IOException("Провайдер вернул неоднозначный идентификатор документа")
+        return matches.singleOrNull()?.document
+    }
+
+    private fun deleteDocumentAndProbe(document: DocumentFile, parentUri: Uri): LocalDeleteOutcome {
+        try {
+            document.delete()
+        } catch (_: Exception) {
+            // A provider may commit deletion and lose/throw the response. Probe below.
+        }
+        val parent = documentFromUri(parentUri) ?: return LocalDeleteOutcome.AMBIGUOUS
+        val remaining = try {
+            findIdentityStrict(parent, document.uri)
+        } catch (_: Exception) {
+            return LocalDeleteOutcome.AMBIGUOUS
+        }
+        return if (remaining == null) LocalDeleteOutcome.COMMITTED else LocalDeleteOutcome.NOT_COMMITTED
+    }
+
+    private fun rollbackSafetyCopy(parent: DocumentFile, copy: DocumentFile) {
+        val outcome = deleteDocumentAndProbe(copy, parent.uri)
+        if (outcome != LocalDeleteOutcome.COMMITTED) {
+            throw IOException("Исходник сохранён, но страховочную копию не удалось безопасно убрать; оставлены обе копии")
+        }
+    }
+
     private fun tryFastMove(source: DocumentFile, sourceParentUri: Uri, destination: DocumentFile): DocumentFile? {
+        DocumentTreeSafety.requireNotFilesystemSymlink(source, "Перемещение")
+        DocumentTreeSafety.requireNotFilesystemSymlink(destination, "Перемещение")
+        val sourceName = source.name ?: return null
+        if (findUniqueChildStrict(destination, sourceName) != null) return null
+
         val directSource = resolveDirectFile(source.uri)
         val directDestination = resolveDirectFile(destination.uri)
         if (directSource != null && directDestination?.isDirectory == true) {
-            val target = File(directDestination, source.name ?: directSource.name)
-            if (!target.exists() && directSource.renameTo(target)) return DocumentFile.fromFile(target)
+            val target = File(directDestination, sourceName)
+            if (target.exists()) return null
+            try {
+                directSource.renameTo(target)
+            } catch (_: Exception) {
+                // Reconcile actual filesystem state below.
+            }
+            val sourceExists = directSource.exists()
+            val targetExists = target.exists()
+            return when {
+                !sourceExists && targetExists -> DocumentFile.fromFile(target)
+                sourceExists && !targetExists -> null
+                else -> throw IOException(
+                    "Не удалось однозначно подтвердить быстрое перемещение $sourceName; fallback не выполняется"
+                )
+            }
         }
         if (source.uri.scheme != "content" || sourceParentUri.scheme != "content" || destination.uri.scheme != "content") {
             return null
         }
         if (source.uri.authority != destination.uri.authority) return null
-        val movedUri = runCatching {
-            DocumentsContract.moveDocument(resolver, source.uri, sourceParentUri, destination.uri)
-        }.getOrNull() ?: return null
-        return DocumentFile.fromSingleUri(context, movedUri)
+
+        var movedUri: Uri? = null
+        try {
+            movedUri = DocumentsContract.moveDocument(resolver, source.uri, sourceParentUri, destination.uri)
+        } catch (_: Exception) {
+            // Lost ACK is reconciled below. Never blindly retry a destructive move.
+        }
+        val sourceParent = documentFromUri(sourceParentUri)
+            ?: throw IOException("Не удалось проверить исходную папку после перемещения $sourceName")
+        val sourceStillPresent = try {
+            findIdentityStrict(sourceParent, source.uri) != null
+        } catch (error: Exception) {
+            throw IOException("Не удалось проверить исходник после перемещения $sourceName", error)
+        }
+        if (movedUri == null) {
+            if (sourceStillPresent) return null
+            // The move may have committed but there is no returned destination identity. A
+            // same-name destination could have been created concurrently, so do not guess.
+            throw IOException(
+                "Перемещение $sourceName могло завершиться, но подтверждение потеряно; fallback не выполняется"
+            )
+        }
+        val destinationDocument = try {
+            findIdentityStrict(destination, movedUri)
+        } catch (error: Exception) {
+            throw IOException("Не удалось проверить результат перемещения $sourceName", error)
+        }
+        return when {
+            !sourceStillPresent && destinationDocument != null -> destinationDocument
+            sourceStillPresent && destinationDocument == null -> null
+            else -> throw IOException(
+                "Не удалось однозначно подтвердить перемещение $sourceName; fallback не выполняется"
+            )
+        }
     }
 
     private fun DocumentFile.toEntry(parentUri: Uri? = null): FileEntry {
@@ -1060,5 +1742,11 @@ class FileRepository(private val context: Context) {
         const val MAX_ZIP_ENTRIES = 20_000
         const val MAX_EXTRACTED_BYTES = 4L * 1024L * 1024L * 1024L
         const val TEMP_SHARE_MAX_AGE_MILLIS = 24L * 60L * 60L * 1_000L
+        const val BATCH_RENAME_JOURNAL_FILE = "batch-rename-journal-v1.json"
+        const val BATCH_RENAME_INDEX_RECONCILE_FILE = "batch-rename-index-reconcile-v1.json"
+        const val BATCH_RENAME_JOURNAL_VERSION = 1
+        const val BATCH_RENAME_MAX_ENTRIES = 10_000
+        const val BATCH_RENAME_SERVICE_NAME_ATTEMPTS = 64
+        val BATCH_RENAME_LOCK = Any()
     }
 }

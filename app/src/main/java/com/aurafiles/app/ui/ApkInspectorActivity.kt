@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -18,22 +19,19 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
-import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.tools.ApkInfo
 import com.aurafiles.app.tools.ApkInspector
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class ApkInspectorActivity : ComponentActivity() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var temporary: File? = null
     private lateinit var originalUri: Uri
     private var displayName: String = "app.apk"
@@ -44,20 +42,22 @@ class ApkInspectorActivity : ComponentActivity() {
         displayName = intent.getStringExtra(EXTRA_NAME).orEmpty().ifBlank { "app.apk" }
         val loading = TextView(this).apply { text = "Чтение APK…"; gravity = Gravity.CENTER; textSize = 18f }
         setContentView(loading)
-        scope.launch {
-            runCatching { withContext(Dispatchers.IO) { ApkInspector(this@ApkInspectorActivity).inspect(originalUri, displayName) } }
-                .onSuccess { result ->
-                    temporary = result.temporaryFile
-                    showInfo(result.info)
+        lifecycleScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    ApkInspector(this@ApkInspectorActivity).inspect(originalUri, displayName)
                 }
-                .onFailure { error ->
-                    loading.text = "Не удалось прочитать APK\n${error.message.orEmpty()}"
-                }
+                temporary = result.temporaryFile
+                showInfo(result.info)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                loading.text = "Не удалось прочитать APK\n${error.message.orEmpty()}"
+            }
         }
     }
 
     override fun onDestroy() {
-        scope.cancel()
         // Do not delete the shared APK here: Package Installer or a chosen app may
         // still be reading the granted FileProvider URI after this Activity closes.
         super.onDestroy()
@@ -138,7 +138,7 @@ class ApkInspectorActivity : ComponentActivity() {
     }
 
     private fun temporaryUri(): Uri? = temporary?.takeIf(File::exists)?.let {
-        FileProvider.getUriForFile(this, "$packageName.fileprovider", it)
+        AuraFileProvider.uriForFile(this, it)
     }
 
     private fun copy(label: String, value: String) {

@@ -266,7 +266,7 @@ class FtpServer(
                 return
             }
             val documents = if (target.isDirectory) {
-                target.listFiles().filterNot { it.name == TRASH_FOLDER || it.name == AuraVault.VAULT_FOLDER }
+                target.listFiles().filterNot { it.name == TRASH_FOLDER || it.name?.let(AuraVault::isVaultFolder) == true }
             } else listOf(target)
             withDataConnection("Открываем список") { data ->
                 val output = BufferedWriter(OutputStreamWriter(data.getOutputStream(), StandardCharsets.UTF_8))
@@ -478,7 +478,7 @@ class FtpServer(
         }
 
         private fun isReservedName(name: String): Boolean =
-            name == TRASH_FOLDER || name == AuraVault.VAULT_FOLDER
+            name == TRASH_FOLDER || AuraVault.isVaultFolder(name)
 
         private fun virtualPath(rawPath: String): String {
             val raw = rawPath.trim().ifEmpty { cwd }

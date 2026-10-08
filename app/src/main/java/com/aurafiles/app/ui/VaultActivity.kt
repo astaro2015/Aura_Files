@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
@@ -69,17 +70,26 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.documentfile.provider.DocumentFile
 import com.aurafiles.app.data.AuraVault
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.model.isReaderSupported
 import com.aurafiles.app.ui.theme.AuraFilesTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
+
+private suspend fun <T> vaultResult(block: suspend () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
+}
 
 class VaultActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -115,7 +125,7 @@ class VaultActivity : ComponentActivity() {
             openingId = item.encryptedFile.name
             status = "Готовим ${item.name}…"
             scope.launch {
-                val prepared = runCatching { withContext(Dispatchers.IO) { preparePlainEntry(vault, item) } }
+                val prepared = vaultResult { withContext(Dispatchers.IO) { preparePlainEntry(vault, item) } }
                 openingId = null
                 prepared.onSuccess { entry ->
                     status = null
@@ -146,7 +156,7 @@ class VaultActivity : ComponentActivity() {
             scope.launch {
                 busy = true
                 status = "Возвращаем ${item.name}…"
-                runCatching { withContext(Dispatchers.IO) { vault.restore(item, destination) } }
+                vaultResult { withContext(Dispatchers.IO) { vault.restore(item, destination) } }
                     .onSuccess {
                         status = "${item.name} возвращён в обычное хранилище"
                         refreshToken += 1
@@ -157,7 +167,9 @@ class VaultActivity : ComponentActivity() {
         }
 
         LaunchedEffect(refreshToken) {
-            listing = withContext(Dispatchers.IO) { vault.list() }
+            vaultResult { withContext(Dispatchers.IO) { vault.list() } }
+                .onSuccess { listing = it }
+                .onFailure { error -> status = error.message ?: "Не удалось проверить состояние Сейфа" }
         }
 
         Scaffold(containerColor = MaterialTheme.colorScheme.background) { padding ->
@@ -176,7 +188,7 @@ class VaultActivity : ComponentActivity() {
                     Icon(Icons.Rounded.Lock, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(9.dp))
                     Column(Modifier.weight(1f)) {
-                        Text("Избранное", fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Сейф", fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
                         Text(
                             "Зашифровано и привязано к этому устройству",
                             fontSize = 11.sp,
@@ -202,7 +214,7 @@ class VaultActivity : ComponentActivity() {
                     }
                     !vault.available() -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                         Text(
-                            "Для защищённого Избранного нужен доступ Aura Files «Весь накопитель».",
+                            "Для Сейфа нужен доступ Aura Files «Весь накопитель».",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -211,7 +223,7 @@ class VaultActivity : ComponentActivity() {
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            "Пока пусто. Добавляйте файлы через пункт «В избранное» — исходник будет перемещён сюда и зашифрован.",
+                            "Пока пусто. Добавляйте файлы через пункт «В Сейф» — исходник будет перемещён сюда и зашифрован.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
@@ -268,14 +280,14 @@ class VaultActivity : ComponentActivity() {
         deleteItem?.let { item ->
             AlertDialog(
                 onDismissRequest = { deleteItem = null },
-                title = { Text("Удалить из Избранного?") },
+                title = { Text("Удалить из Сейфа?") },
                 text = { Text("${item.name} будет удалён безвозвратно. Обычной копии файла уже нет.") },
                 confirmButton = {
                     Button(onClick = {
                         deleteItem = null
                         scope.launch {
                             busy = true
-                            runCatching { withContext(Dispatchers.IO) { vault.delete(item) } }
+                            vaultResult { withContext(Dispatchers.IO) { vault.delete(item) } }
                                 .onSuccess {
                                     status = "${item.name} удалён"
                                     refreshToken += 1
@@ -381,7 +393,7 @@ class VaultActivity : ComponentActivity() {
 
     private fun preparePlainEntry(vault: AuraVault, item: AuraVault.Item): FileEntry {
         val file = vault.preparePlainFile(item)
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val uri = AuraFileProvider.uriForFile(this, file)
         return FileEntry(
             document = DocumentFile.fromFile(file),
             name = item.name,
@@ -410,26 +422,30 @@ class VaultActivity : ComponentActivity() {
     }
 
     private fun shareVaultItem(vault: AuraVault, item: AuraVault.Item) {
-        Thread {
-            runCatching {
-                val file = vault.preparePlainFile(item)
-                val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        lifecycleScope.launch {
+            try {
+                val file = withContext(Dispatchers.IO) { vault.preparePlainFile(item) }
+                val uri = AuraFileProvider.uriForFile(this@VaultActivity, file)
                 val intent = Intent(Intent.ACTION_SEND).apply {
                     type = mimeFor(item)
                     putExtra(Intent.EXTRA_STREAM, uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                runOnUiThread {
-                    try {
-                        startActivity(Intent.createChooser(intent, "Поделиться файлом"))
-                    } catch (_: ActivityNotFoundException) {
-                        Toast.makeText(this, "Нет приложения для отправки файла", Toast.LENGTH_SHORT).show()
-                    }
+                try {
+                    startActivity(Intent.createChooser(intent, "Поделиться файлом"))
+                } catch (_: ActivityNotFoundException) {
+                    Toast.makeText(this@VaultActivity, "Нет приложения для отправки файла", Toast.LENGTH_SHORT).show()
                 }
-            }.onFailure { error ->
-                runOnUiThread { Toast.makeText(this, error.message ?: "Не удалось подготовить файл", Toast.LENGTH_LONG).show() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Toast.makeText(
+                    this@VaultActivity,
+                    error.message ?: "Не удалось подготовить файл",
+                    Toast.LENGTH_LONG,
+                ).show()
             }
-        }.start()
+        }
     }
 
     private fun mimeFor(item: AuraVault.Item): String {

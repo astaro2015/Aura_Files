@@ -53,9 +53,14 @@ import com.aurafiles.app.tools.AuraApksBundle
 import com.aurafiles.app.ui.theme.AuraFilesTheme
 import java.io.File
 import java.io.InputStream
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 class SplitPackageInstallerActivity : ComponentActivity() {
     private var prepared: AuraApksBundle.PreparedBundle? = null
@@ -133,12 +138,18 @@ class SplitPackageInstallerActivity : ComponentActivity() {
             ?: "package.apks"
         state = ScreenState(loading = true, title = displayName)
         lifecycleScope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    openInput(uri).use { input ->
-                        AuraApksBundle.prepareForInstall(this@SplitPackageInstallerActivity, input, displayName)
+            val result = try {
+                Result.success(
+                    withContext(Dispatchers.IO) {
+                        openInput(uri).use { input ->
+                            AuraApksBundle.prepareForInstall(this@SplitPackageInstallerActivity, input, displayName)
+                        }
                     }
-                }
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Result.failure(error)
             }
             result.onSuccess { bundle ->
                 prepared = bundle
@@ -190,8 +201,15 @@ class SplitPackageInstallerActivity : ComponentActivity() {
         state = state.copy(installing = true, installEnabled = false, status = STATUS_PREPARING, error = null)
         installStarted = true
         lifecycleScope.launch {
-            val result = runCatching {
-                withContext(Dispatchers.IO) { createAndCommitSession(bundle) }
+            val result = try {
+                Result.success(withContext(Dispatchers.IO) { createAndCommitSession(bundle) })
+            } catch (cancelled: CancellationException) {
+                installStarted = false
+                bundle.cleanup()
+                prepared = null
+                throw cancelled
+            } catch (error: Throwable) {
+                Result.failure(error)
             }
             result.onSuccess { sessionId ->
                 bundle.cleanup()
@@ -217,7 +235,7 @@ class SplitPackageInstallerActivity : ComponentActivity() {
         }
     }
 
-    private fun createAndCommitSession(bundle: AuraApksBundle.PreparedBundle): Int {
+    private suspend fun createAndCommitSession(bundle: AuraApksBundle.PreparedBundle): Int {
         val installer = packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
             setAppPackageName(bundle.manifest.packageName)
@@ -229,27 +247,42 @@ class SplitPackageInstallerActivity : ComponentActivity() {
             }
         }
         val sessionId = installer.createSession(params)
+        val callbackNonce = UUID.randomUUID().toString()
+        var callbackRecordSaved = false
         try {
             installer.openSession(sessionId).use { session ->
                 bundle.parts.forEachIndexed { index, part ->
+                    currentCoroutineContext().ensureActive()
                     val source = requireNotNull(part.file) { "APK-часть не подготовлена: ${part.originalName}" }
                     require(source.isFile && source.length() == part.size) { "APK-часть повреждена: ${part.originalName}" }
                     val sessionName = if (part.isBase) "base.apk" else "split-%03d.apk".format(index)
                     source.inputStream().buffered(256 * 1024).use { input ->
                         session.openWrite(sessionName, 0L, source.length()).use { output ->
-                            input.copyTo(output, 256 * 1024)
+                            val buffer = ByteArray(256 * 1024)
+                            var copied = 0L
+                            while (true) {
+                                currentCoroutineContext().ensureActive()
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                copied = Math.addExact(copied, read.toLong())
+                                require(copied <= part.size) { "APK-часть изменилась во время установки: ${part.originalName}" }
+                                output.write(buffer, 0, read)
+                            }
+                            require(copied == part.size) { "APK-часть обрезана: ${part.originalName}" }
                             session.fsync(output)
                         }
                     }
                 }
 
+                currentCoroutineContext().ensureActive()
+                saveInstallCallbackRecord(sessionId, callbackNonce, bundle)
+                callbackRecordSaved = true
+
                 val callbackIntent = Intent(this, SplitPackageInstallerActivity::class.java).apply {
                     action = ACTION_INSTALL_RESULT
                     flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    putExtra(EXTRA_LABEL, bundle.manifest.label)
-                    putExtra(EXTRA_PACKAGE, bundle.manifest.packageName)
-                    putExtra(EXTRA_VERSION, bundle.manifest.versionName)
                     putExtra(EXTRA_SESSION_ID, sessionId)
+                    putExtra(EXTRA_CALLBACK_NONCE, callbackNonce)
                 }
                 val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
@@ -263,15 +296,27 @@ class SplitPackageInstallerActivity : ComponentActivity() {
             }
             return sessionId
         } catch (error: Throwable) {
+            if (callbackRecordSaved) removeInstallCallbackRecord(sessionId)
             runCatching { installer.abandonSession(sessionId) }
             throw error
         }
     }
 
     private fun handleInstallResult(resultIntent: Intent) {
-        val label = resultIntent.getStringExtra(EXTRA_LABEL).orEmpty().ifBlank { "Приложение" }
-        val packageName = resultIntent.getStringExtra(EXTRA_PACKAGE).orEmpty()
-        val version = resultIntent.getStringExtra(EXTRA_VERSION).orEmpty()
+        val sessionId = resultIntent.getIntExtra(EXTRA_SESSION_ID, -1)
+        val nonce = resultIntent.getStringExtra(EXTRA_CALLBACK_NONCE).orEmpty()
+        val callback = loadInstallCallbackRecord(sessionId)
+        if (sessionId < 0 || nonce.isBlank() || callback == null || callback.nonce != nonce) {
+            installStarted = false
+            state = ScreenState(
+                title = "SPLIT-комплект",
+                error = "Отклонён неподтверждённый ответ установщика",
+            )
+            return
+        }
+        val label = callback.label.ifBlank { "Приложение" }
+        val packageName = callback.packageName
+        val version = callback.versionName
         val status = resultIntent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
         val systemMessage = resultIntent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE).orEmpty()
         when (status) {
@@ -305,6 +350,7 @@ class SplitPackageInstallerActivity : ComponentActivity() {
                 }
             }
             PackageInstaller.STATUS_SUCCESS -> {
+                removeInstallCallbackRecord(sessionId)
                 installStarted = false
                 state = ScreenState(
                     title = label,
@@ -313,6 +359,7 @@ class SplitPackageInstallerActivity : ComponentActivity() {
                 )
             }
             else -> {
+                removeInstallCallbackRecord(sessionId)
                 installStarted = false
                 val friendly = packageInstallerFailure(status)
                 state = ScreenState(
@@ -326,6 +373,81 @@ class SplitPackageInstallerActivity : ComponentActivity() {
             }
         }
     }
+
+    private data class InstallCallbackRecord(
+        val nonce: String,
+        val label: String,
+        val packageName: String,
+        val versionName: String,
+        val createdAt: Long,
+    )
+
+    private fun saveInstallCallbackRecord(
+        sessionId: Int,
+        nonce: String,
+        bundle: AuraApksBundle.PreparedBundle,
+    ) {
+        cleanupOldInstallCallbackRecords()
+        val json = JSONObject()
+            .put("nonce", nonce)
+            .put("label", bundle.manifest.label)
+            .put("packageName", bundle.manifest.packageName)
+            .put("versionName", bundle.manifest.versionName)
+            .put("createdAt", System.currentTimeMillis())
+            .toString()
+        val saved = getSharedPreferences(CALLBACK_PREFS, MODE_PRIVATE)
+            .edit()
+            .putString(callbackKey(sessionId), json)
+            .commit()
+        require(saved) { "Не удалось надёжно сохранить состояние установки" }
+    }
+
+    private fun loadInstallCallbackRecord(sessionId: Int): InstallCallbackRecord? {
+        if (sessionId < 0) return null
+        val raw = getSharedPreferences(CALLBACK_PREFS, MODE_PRIVATE)
+            .getString(callbackKey(sessionId), null) ?: return null
+        return runCatching {
+            val json = JSONObject(raw)
+            val nonce = json.getString("nonce")
+            val packageName = json.getString("packageName")
+            require(nonce.isNotBlank() && packageName.isNotBlank())
+            InstallCallbackRecord(
+                nonce = nonce,
+                label = json.optString("label"),
+                packageName = packageName,
+                versionName = json.optString("versionName"),
+                createdAt = json.optLong("createdAt", 0L),
+            )
+        }.getOrNull()
+    }
+
+    private fun removeInstallCallbackRecord(sessionId: Int) {
+        if (sessionId < 0) return
+        getSharedPreferences(CALLBACK_PREFS, MODE_PRIVATE)
+            .edit()
+            .remove(callbackKey(sessionId))
+            .commit()
+    }
+
+    private fun cleanupOldInstallCallbackRecords() {
+        val preferences = getSharedPreferences(CALLBACK_PREFS, MODE_PRIVATE)
+        val cutoff = System.currentTimeMillis() - CALLBACK_RECORD_MAX_AGE_MS
+        val editor = preferences.edit()
+        var changed = false
+        preferences.all.forEach { (key, value) ->
+            if (!key.startsWith(CALLBACK_KEY_PREFIX)) return@forEach
+            val createdAt = (value as? String)?.let { raw ->
+                runCatching { JSONObject(raw).optLong("createdAt", 0L) }.getOrDefault(0L)
+            } ?: 0L
+            if (createdAt <= 0L || createdAt < cutoff) {
+                editor.remove(key)
+                changed = true
+            }
+        }
+        if (changed) editor.commit()
+    }
+
+    private fun callbackKey(sessionId: Int): String = "$CALLBACK_KEY_PREFIX$sessionId"
 
     private fun packageInstallerFailure(status: Int): String = when (status) {
         PackageInstaller.STATUS_FAILURE_BLOCKED -> "Установка заблокирована системой или политикой устройства"
@@ -371,11 +493,12 @@ class SplitPackageInstallerActivity : ComponentActivity() {
         private const val ACTION_INSTALL_RESULT = "com.aurafiles.app.action.SPLIT_INSTALL_RESULT"
         private const val EXTRA_URI = "split_uri"
         private const val EXTRA_NAME = "split_name"
-        private const val EXTRA_LABEL = "split_label"
-        private const val EXTRA_PACKAGE = "split_package"
-        private const val EXTRA_VERSION = "split_version"
         private const val EXTRA_SESSION_ID = "split_session_id"
+        private const val EXTRA_CALLBACK_NONCE = "split_callback_nonce"
         private const val STATUS_PREPARING = "Подготавливаем установку…"
+        private const val CALLBACK_PREFS = "aura_split_install_callbacks"
+        private const val CALLBACK_KEY_PREFIX = "session_"
+        private const val CALLBACK_RECORD_MAX_AGE_MS = 24L * 60L * 60L * 1000L
 
         fun start(context: Context, entry: FileEntry) {
             context.startActivity(

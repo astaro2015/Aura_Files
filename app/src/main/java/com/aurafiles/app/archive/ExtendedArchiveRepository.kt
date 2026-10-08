@@ -263,6 +263,8 @@ class ExtendedArchiveRepository(private val context: Context) {
         val safePath = ArchiveSafety.safePath(virtualPath).joinToString("/")
         require(safePath.isNotBlank()) { "Некорректный путь внутри архива" }
         val outputDir = File(context.cacheDir, "archive-preview").apply { mkdirs() }
+        cleanupArchivePreviewCache(outputDir)
+        requirePreviewSpace(outputDir, 0L)
         val cleanName = ArchiveSafety.safeSegment(safePath.substringAfterLast('/'))
         val target = File.createTempFile("aura-", "-${cleanName}", outputDir)
         try {
@@ -271,7 +273,7 @@ class ExtendedArchiveRepository(private val context: Context) {
                 require(safePath == singleStreamOutputName(entry.name)) { "Файл внутри архива не найден" }
                 openSingleCompressedInput(entry, singleStreamFormat).use { input ->
                     target.outputStream().buffered(IO_BUFFER_SIZE).use { output ->
-                        copyLimited(input, output, MAX_SINGLE_ENTRY_BYTES, "Распакованный файл слишком велик")
+                        copyLimited(input, output, MAX_SINGLE_ENTRY_BYTES, "Распакованный файл слишком велик", outputDir)
                     }
                 }
                 return target
@@ -361,8 +363,9 @@ class ExtendedArchiveRepository(private val context: Context) {
                 if (item.isDirectory || item.isUnixSymlink) continue
                 if (normalizedArchivePath(item.name) == wanted) {
                     require(item.size < 0L || item.size <= MAX_SINGLE_ENTRY_BYTES) { "Файл внутри ZIP слишком велик" }
+                    requirePreviewSpace(requireNotNull(target.parentFile), item.size)
                     target.outputStream().buffered(1024 * 1024).use { output ->
-                        copyLimited(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри ZIP слишком велик")
+                        copyLimited(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри ZIP слишком велик", target.parentFile)
                     }
                     return
                 }
@@ -378,8 +381,9 @@ class ExtendedArchiveRepository(private val context: Context) {
                 if (item.isDirectory || item.isSymbolicLink || item.isLink || !item.isFile) continue
                 if (normalizedArchivePath(item.name) == wanted) {
                     require(item.size < 0L || item.size <= MAX_SINGLE_ENTRY_BYTES) { "Файл внутри TAR слишком велик" }
+                    requirePreviewSpace(requireNotNull(target.parentFile), item.size)
                     target.outputStream().buffered(1024 * 1024).use { output ->
-                        copyLimited(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри TAR слишком велик")
+                        copyLimited(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри TAR слишком велик", target.parentFile)
                     }
                     return
                 }
@@ -394,8 +398,9 @@ class ExtendedArchiveRepository(private val context: Context) {
                 val item = archive.nextEntry ?: break
                 if (item.isDirectory || normalizedArchivePath(item.name) != wanted) continue
                 require(item.size < 0L || item.size <= MAX_SINGLE_ENTRY_BYTES) { "Файл внутри 7z слишком велик" }
+                requirePreviewSpace(requireNotNull(target.parentFile), item.size)
                 target.outputStream().buffered(IO_BUFFER_SIZE).use { output ->
-                    copyLimitedSevenZ(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри 7z слишком велик")
+                    copyLimitedSevenZ(archive, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри 7z слишком велик", target.parentFile)
                 }
                 return@withTemporaryArchive
             }
@@ -410,9 +415,10 @@ class ExtendedArchiveRepository(private val context: Context) {
                     !header.isDirectory && normalizedArchivePath(header.fileName) == wanted
                 }?.let { header ->
                     require(header.fullUnpackSize < 0L || header.fullUnpackSize <= MAX_SINGLE_ENTRY_BYTES) { "Файл внутри RAR слишком велик" }
+                    requirePreviewSpace(requireNotNull(target.parentFile), header.fullUnpackSize)
                     target.outputStream().buffered(1024 * 1024).use { output ->
                         archive.getInputStream(header).use { input ->
-                            copyLimited(input, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри RAR слишком велик")
+                            copyLimited(input, output, MAX_SINGLE_ENTRY_BYTES, "Файл внутри RAR слишком велик", target.parentFile)
                         }
                     }
                     return
@@ -439,7 +445,7 @@ class ExtendedArchiveRepository(private val context: Context) {
         try {
             openInput(entry).use { input ->
                 temporary.outputStream().buffered(IO_BUFFER_SIZE).use { output ->
-                    copyLimited(input, output, MAX_COMPRESSED_ARCHIVE_BYTES, "Архив слишком велик для временной обработки")
+                    copyLimited(input, output, MAX_COMPRESSED_ARCHIVE_BYTES, "Архив слишком велик для временной обработки", context.cacheDir)
                 }
             }
             return block(temporary)
@@ -448,30 +454,63 @@ class ExtendedArchiveRepository(private val context: Context) {
         }
     }
 
-    private fun copyLimited(input: InputStream, output: OutputStream, limit: Long, message: String): Long {
+    private fun copyLimited(
+        input: InputStream,
+        output: OutputStream,
+        limit: Long,
+        message: String,
+        cacheDirectory: File? = null,
+    ): Long {
         val buffer = ByteArray(IO_BUFFER_SIZE)
         var total = 0L
         while (true) {
             val read = input.read(buffer)
             if (read < 0) break
+            if (read == 0) continue
             total += read
             require(total <= limit) { message }
+            cacheDirectory?.let { requirePreviewSpace(it, read.toLong()) }
             output.write(buffer, 0, read)
         }
         return total
     }
 
-    private fun copyLimitedSevenZ(archive: SevenZFile, output: OutputStream, limit: Long, message: String): Long {
+    private fun copyLimitedSevenZ(
+        archive: SevenZFile,
+        output: OutputStream,
+        limit: Long,
+        message: String,
+        cacheDirectory: File? = null,
+    ): Long {
         val buffer = ByteArray(IO_BUFFER_SIZE)
         var total = 0L
         while (true) {
             val read = archive.read(buffer)
             if (read < 0) break
+            if (read == 0) continue
             total += read
             require(total <= limit) { message }
+            cacheDirectory?.let { requirePreviewSpace(it, read.toLong()) }
             output.write(buffer, 0, read)
         }
         return total
+    }
+
+    private fun cleanupArchivePreviewCache(directory: File) {
+        val expiration = System.currentTimeMillis() - ARCHIVE_PREVIEW_MAX_AGE_MS
+        directory.listFiles().orEmpty()
+            .filter { it.isFile && it.lastModified() > 0L && it.lastModified() < expiration }
+            .forEach { runCatching { it.delete() } }
+    }
+
+    private fun requirePreviewSpace(directory: File, expectedBytes: Long) {
+        val usable = directory.usableSpace
+        require(usable > TEMP_SPACE_RESERVE_BYTES) { "Недостаточно свободного места для просмотра файла из архива" }
+        if (expectedBytes > 0L) {
+            require(expectedBytes <= usable - TEMP_SPACE_RESERVE_BYTES) {
+                "Недостаточно свободного места для просмотра файла из архива"
+            }
+        }
     }
 
     private fun createZip(entries: List<FileEntry>, output: OutputStream) {
@@ -761,6 +800,7 @@ class ExtendedArchiveRepository(private val context: Context) {
         const val MAX_EXTRACTED_BYTES = 128L * 1024L * 1024L * 1024L
         const val MAX_COMPRESSED_ARCHIVE_BYTES = 64L * 1024L * 1024L * 1024L
         const val TEMP_SPACE_RESERVE_BYTES = 256L * 1024L * 1024L
+        const val ARCHIVE_PREVIEW_MAX_AGE_MS = 2L * 60L * 60L * 1000L
         const val MAX_7Z_MEMORY_KIB = 256 * 1024
         const val MAX_XZ_MEMORY_KIB = 256 * 1024
         private const val IO_BUFFER_SIZE = 1024 * 1024

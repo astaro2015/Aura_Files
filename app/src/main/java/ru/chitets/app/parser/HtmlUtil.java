@@ -22,10 +22,12 @@ public final class HtmlUtil {
         int total = 0;
         int read;
         while ((read = input.read(buffer)) != -1) {
+            ReaderIoPolicy.throwIfInterrupted("Чтение книги");
             total += read;
             if (total > MAX_BOOK_BYTES) throw new IOException("Файл слишком большой для этой версии ридера");
             output.write(buffer, 0, read);
         }
+        ReaderIoPolicy.throwIfInterrupted("Чтение книги");
         return output.toByteArray();
     }
 

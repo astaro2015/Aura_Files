@@ -1,6 +1,34 @@
-﻿param(
+param(
+    [ValidateSet('Debug','Release')]
+    [string]$BuildType = '',
     [switch]$SkipConsent
 )
+
+# BUILD_FIX7: official BAT entrypoints route the build mode through the
+# AURA_BUILD_TYPE environment variable. Manual -BuildType remains supported.
+# If both sources are present, they must agree; otherwise fail closed.
+$EnvironmentBuildType = [string]$env:AURA_BUILD_TYPE
+if (-not [string]::IsNullOrWhiteSpace($BuildType) -and
+    -not [string]::IsNullOrWhiteSpace($EnvironmentBuildType) -and
+    $BuildType -ine $EnvironmentBuildType) {
+    throw "Build mode mismatch: -BuildType '$BuildType' but AURA_BUILD_TYPE '$EnvironmentBuildType'."
+}
+
+$RequestedBuildType = if (-not [string]::IsNullOrWhiteSpace($BuildType)) {
+    $BuildType
+} elseif (-not [string]::IsNullOrWhiteSpace($EnvironmentBuildType)) {
+    $EnvironmentBuildType
+} else {
+    'Debug'
+}
+
+$script:AuraRequestedBuildType = if ($RequestedBuildType -ieq 'Release') {
+    'Release'
+} elseif ($RequestedBuildType -ieq 'Debug') {
+    'Debug'
+} else {
+    throw "Unsupported build mode: $RequestedBuildType"
+}
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -29,6 +57,15 @@ $GradleDistRoot = Join-Path $ToolsRoot 'gradle-9.5.0'
 $GradleZip = Join-Path $CacheRoot 'gradle-9.5.0-bin.zip'
 $GradleUrl = 'https://services.gradle.org/distributions/gradle-9.5.0-bin.zip'
 $GradleSha256 = '553c78f50dafcd54d65b9a444649057857469edf836431389695608536d6b746'
+
+# Aura's installed-app identity is intentionally pinned to the certificate that has
+# already been used by the user's working debug builds. Changing this certificate
+# changes Android app identity and may break Vault access / cloud profile continuity.
+$ExpectedAuraSigningSha1 = '90:2F:F6:17:0C:61:EB:8C:DA:08:EE:60:8E:87:12:76:35:51:4B:B5'
+$AuraSigningAlias = 'androiddebugkey'
+$AuraSigningStorePassword = 'android'
+$AuraSigningKeyPassword = 'android'
+$script:AuraSigningKeystore = $null
 
 $CmdToolsVersion = '15859902'
 $CmdToolsSha256 = '90ae805d20434428bffcb699c290860f19bb5f66a67e6b330067e3de801fb04a'
@@ -326,63 +363,73 @@ function Configure-Environment {
                 $env:PATH
 }
 
-function Ensure-DebugKeystore {
+function Normalize-CertificateSha1([string]$Value) {
+    return (($Value -replace '[^0-9A-Fa-f]', '').ToUpperInvariant())
+}
+
+function Ensure-AuraSigningKeystore([ValidateSet('Debug','Release')][string]$RequestedBuildType) {
     if ([string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        Write-Host 'USERPROFILE is unavailable; Gradle will manage its debug keystore normally.' -ForegroundColor Yellow
-        return
+        throw 'USERPROFILE is unavailable; Aura cannot locate its pinned signing key.'
     }
 
     $AndroidUserDir = Join-Path $env:USERPROFILE '.android'
-    $DebugKeystore = Join-Path $AndroidUserDir 'debug.keystore'
+    $SigningKeystore = Join-Path $AndroidUserDir 'debug.keystore'
     $Keytool = Join-Path $JdkRoot 'bin\keytool.exe'
     if (-not (Test-Path -LiteralPath $Keytool)) {
-        Write-Host "keytool was not found at $Keytool; Gradle will manage its debug keystore normally." -ForegroundColor Yellow
-        return
+        throw "keytool was not found at $Keytool; signing identity cannot be verified."
     }
 
-    Ensure-Directory $AndroidUserDir
-    if (-not (Test-Path -LiteralPath $DebugKeystore)) {
-        Write-Step 'Creating persistent Android debug signing key'
-        & $Keytool `
-            -genkeypair `
-            -keystore $DebugKeystore `
-            -storepass android `
-            -alias androiddebugkey `
-            -keypass android `
-            -dname 'CN=Android Debug,O=Android,C=US' `
-            -keyalg RSA `
-            -keysize 2048 `
-            -storetype JKS `
-            -validity 10000 `
-            -noprompt
-        if ($LASTEXITCODE -ne 0) { throw 'Failed to create the persistent Android debug keystore.' }
+    # Do NOT silently create a new signing key here. Aura already has encrypted Vault data
+    # and OAuth identity tied to the certificate below. A freshly generated debug key would
+    # look convenient but would create a different Android application identity.
+    if (-not (Test-Path -LiteralPath $SigningKeystore)) {
+        throw "Aura signing key is missing: $SigningKeystore`nRestore the ORIGINAL debug.keystore from backup. Do not generate a replacement if you need the existing Vault/cloud identity."
     }
 
-    # Android Gradle Plugin uses %USERPROFILE%\.android\debug.keystore for debug builds.
-    # Keeping this file outside the extracted source makes the signing SHA-1 stable across
-    # clean Aura source folders on the same Windows account, which is required by Google OAuth.
-    $KeyInfo = (& $Keytool -list -v -alias androiddebugkey -keystore $DebugKeystore -storepass android -keypass android 2>&1 | Out-String)
+    $KeyInfo = (& $Keytool -list -v -alias $AuraSigningAlias -keystore $SigningKeystore -storepass $AuraSigningStorePassword -keypass $AuraSigningKeyPassword 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read Aura signing key: $SigningKeystore"
+    }
     $ShaMatch = [regex]::Match($KeyInfo, 'SHA1:\s*([0-9A-Fa-f:]+)')
-    Write-Host ''
-    Write-Host 'Google Drive Android OAuth identity for this debug APK:' -ForegroundColor Cyan
-    Write-Host '  Package: com.aurafiles.app'
-    if ($ShaMatch.Success) {
-        Write-Host ("  SHA-1:   {0}" -f $ShaMatch.Groups[1].Value.ToUpperInvariant())
-    } else {
-        Write-Host '  SHA-1:   could not parse automatically; run SHOW_GOOGLE_OAUTH_SHA1.bat' -ForegroundColor Yellow
+    if (-not $ShaMatch.Success) {
+        throw 'Could not parse SHA-1 from Aura signing key. Build stopped to avoid changing application identity.'
     }
-    Write-Host ("  Key:     {0}" -f $DebugKeystore)
-    Write-Host 'Register this package + SHA-1 as an Android OAuth client in the SAME Google Cloud project where Google Drive API is enabled.' -ForegroundColor Yellow
+
+    $ActualSha1 = $ShaMatch.Groups[1].Value.ToUpperInvariant()
+    if ((Normalize-CertificateSha1 $ActualSha1) -ne (Normalize-CertificateSha1 $ExpectedAuraSigningSha1)) {
+        throw "Aura signing certificate mismatch.`nExpected: $ExpectedAuraSigningSha1`nActual:   $ActualSha1`nKey:      $SigningKeystore`nBuild stopped: installing an APK signed by another key could break Vault/cloud continuity."
+    }
+
+    $script:AuraSigningKeystore = $SigningKeystore
+
+    # app/build.gradle.kts already supports these external signing settings. Release builds
+    # deliberately use the SAME established certificate as debug builds so Android sees the
+    # release APK as an update of the same installed Aura application.
+    $env:AURA_KEYSTORE_FILE = $SigningKeystore
+    $env:AURA_KEYSTORE_PASSWORD = $AuraSigningStorePassword
+    $env:AURA_KEY_ALIAS = $AuraSigningAlias
+    $env:AURA_KEY_PASSWORD = $AuraSigningKeyPassword
+
+    Write-Host ''
+    Write-Host 'Aura Android signing identity (PINNED):' -ForegroundColor Cyan
+    Write-Host '  Package: com.aurafiles.app'
+    Write-Host ("  SHA-1:   {0}" -f $ActualSha1)
+    Write-Host ("  Key:     {0}" -f $SigningKeystore)
+    Write-Host ("  Mode:    {0}" -f $RequestedBuildType)
+    Write-Host 'Debug and release APKs are intentionally signed with this same certificate.' -ForegroundColor Yellow
 
     Ensure-Directory $OutputRoot
     $GoogleSetupPath = Join-Path $OutputRoot 'GOOGLE_OAUTH_SETUP.txt'
-    $ShaText = if ($ShaMatch.Success) { $ShaMatch.Groups[1].Value.ToUpperInvariant() } else { 'could not parse automatically' }
     @(
-        'Aura Files Google Drive OAuth setup',
+        'Aura Files Google Drive OAuth / signing identity',
         '',
         'Package: com.aurafiles.app',
-        ("SHA-1:   {0}" -f $ShaText),
-        ("Debug keystore: {0}" -f $DebugKeystore),
+        ("SHA-1:   {0}" -f $ActualSha1),
+        ("Signing keystore: {0}" -f $SigningKeystore),
+        ("Expected pinned SHA-1: {0}" -f $ExpectedAuraSigningSha1),
+        '',
+        'Debug and release APKs produced by the official Windows builder use this SAME certificate.',
+        'Therefore Google OAuth Android identity stays package + SHA-1 above.',
         '',
         'In ONE Google Cloud project:',
         '1. Enable Google Drive API.',
@@ -391,16 +438,79 @@ function Ensure-DebugKeystore {
         '4. If the app is in Testing, add the Google account under Test users.',
         '5. Create OAuth Client ID -> Android with the package and SHA-1 above.',
         '',
-        'If Aura reports UNREGISTERED_ON_API_CONSOLE, this package/SHA-1 is not registered',
-        'for the installed APK, or it was registered in a different Cloud project.'
+        'IMPORTANT: back up the signing keystore. Do not replace it with a newly generated key',
+        'if you need existing Aura Vault data and seamless APK upgrades to remain accessible.'
     ) | Set-Content -LiteralPath $GoogleSetupPath -Encoding UTF8
     Write-Host ("  Setup file: {0}" -f $GoogleSetupPath)
+}
+
+function Assert-ApkSigningIdentity([string]$ApkPath) {
+    $ApkSigner = Join-Path $AndroidSdk 'build-tools\36.0.0\apksigner.bat'
+    if (-not (Test-Path -LiteralPath $ApkSigner)) {
+        throw "apksigner was not found: $ApkSigner"
+    }
+
+    $SignerInfo = (& $ApkSigner verify --print-certs $ApkPath 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "APK signature verification failed: $ApkPath`n$SignerInfo"
+    }
+    $SignerShaMatch = [regex]::Match($SignerInfo, '(?im)Signer #1 certificate SHA-1 digest:\s*([0-9A-Fa-f:]+)')
+    if (-not $SignerShaMatch.Success) {
+        throw "Could not parse signer SHA-1 from apksigner output for: $ApkPath`n$SignerInfo"
+    }
+    $SignerSha1Raw = $SignerShaMatch.Groups[1].Value
+    if ((Normalize-CertificateSha1 $SignerSha1Raw) -ne (Normalize-CertificateSha1 $ExpectedAuraSigningSha1)) {
+        throw "BUILT APK SIGNER MISMATCH.`nExpected: $ExpectedAuraSigningSha1`nActual:   $SignerSha1Raw`nAPK:      $ApkPath`nThe APK will NOT be published/copied as a valid Aura release."
+    }
+
+    $IdentityPath = Join-Path $OutputRoot 'APK_SIGNING_IDENTITY.txt'
+    @(
+        'Aura Files APK signing verification',
+        ("APK: {0}" -f $ApkPath),
+        ("Package: com.aurafiles.app"),
+        ("Expected SHA-1: {0}" -f $ExpectedAuraSigningSha1),
+        ("Actual SHA-1:   {0}" -f $SignerSha1Raw.ToUpperInvariant()),
+        '',
+        $SignerInfo.Trim()
+    ) | Set-Content -LiteralPath $IdentityPath -Encoding UTF8
+
+    Write-Host ("Signer SHA-1 verified: {0}" -f $ExpectedAuraSigningSha1) -ForegroundColor Green
+}
+
+function Report-UnitTestResults {
+    $ResultsRoot = Join-Path $StageRoot 'app\build\test-results\testDebugUnitTest'
+    $XmlFiles = @(Get-ChildItem -LiteralPath $ResultsRoot -Filter 'TEST-*.xml' -File -ErrorAction SilentlyContinue)
+    if ($XmlFiles.Count -eq 0) {
+        throw "Unit-test result XML files were not found after testDebugUnitTest: $ResultsRoot"
+    }
+
+    $Total = 0
+    $Failures = 0
+    $Errors = 0
+    $Skipped = 0
+    foreach ($XmlFile in $XmlFiles) {
+        [xml]$Xml = Get-Content -LiteralPath $XmlFile.FullName -Raw
+        $Suite = $Xml.testsuite
+        $Total += [int]$Suite.tests
+        $Failures += [int]$Suite.failures
+        $Errors += [int]$Suite.errors
+        $Skipped += [int]$Suite.skipped
+    }
+    $Passed = $Total - $Failures - $Errors - $Skipped
+    $Summary = "Unit tests: $Passed/$Total passed; failures=$Failures; errors=$Errors; skipped=$Skipped"
+    $SummaryPath = Join-Path $OutputRoot 'UNIT_TEST_SUMMARY.txt'
+    $Summary | Set-Content -LiteralPath $SummaryPath -Encoding UTF8
+    if (($Failures + $Errors) -ne 0) {
+        throw "Unit tests are not clean. $Summary"
+    }
+    Write-Host $Summary -ForegroundColor Green
 }
 
 function Android-PackagesReady {
     return (
         (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-36\android.jar')) -and
         (Test-Path -LiteralPath (Join-Path $AndroidSdk 'build-tools\36.0.0\aapt2.exe')) -and
+        (Test-Path -LiteralPath (Join-Path $AndroidSdk 'build-tools\36.0.0\apksigner.bat')) -and
         (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platform-tools\adb.exe')) -and
         (Test-Path -LiteralPath (Join-Path $AndroidSdk 'ndk\28.2.13676358\ndk-build.cmd'))
     )
@@ -502,12 +612,35 @@ function Write-LocalProperties {
     Set-Content -LiteralPath $LocalProperties -Encoding ASCII -Value "sdk.dir=$EscapedSdk"
 }
 
-function Build-Apk {
-    Write-Step ("Building Aura Files {0} debug APK" -f $AppVersion)
+function Build-Apk([ValidateSet('Debug','Release')][string]$RequestedBuildType) {
+    if ([string]::IsNullOrWhiteSpace($RequestedBuildType)) {
+        throw 'RequestedBuildType is empty. Refusing to silently fall back to Debug.'
+    }
+    $IsRelease = $RequestedBuildType -ieq 'Release'
+    $VariantLabel = if ($IsRelease) { 'release' } else { 'debug' }
+    $AssembleTask = if ($IsRelease) { 'assembleRelease' } else { 'assembleDebug' }
+    $TaskList = if ($IsRelease) { "clean testDebugUnitTest $AssembleTask" } else { "clean $AssembleTask" }
+
+    # Runtime fail-closed check: a requested Release build must NEVER execute an
+    # assembleDebug task. This protects against future parameter/scope regressions.
+    if ($RequestedBuildType -ieq 'Release' -and $TaskList -notmatch '(^|\s)assembleRelease($|\s)') {
+        throw "Release mode routing failure: computed Gradle tasks were '$TaskList'."
+    }
+    if ($RequestedBuildType -ieq 'Release' -and $TaskList -match '(^|\s)assembleDebug($|\s)') {
+        throw "Release mode routing failure: assembleDebug appeared in '$TaskList'."
+    }
+
+    Write-Host ("Requested build mode: {0}" -f $RequestedBuildType) -ForegroundColor Cyan
+    Write-Host ("Gradle tasks: {0}" -f $TaskList) -ForegroundColor Cyan
+
+    if ($IsRelease) {
+        Write-Step ("Building Aura Files {0} RELEASE APK + unit-test gate" -f $AppVersion)
+    } else {
+        Write-Step ("Building Aura Files {0} debug APK" -f $AppVersion)
+    }
+
     Ensure-Directory $OutputRoot
     $LogPath = Join-Path $OutputRoot 'build.log'
-    # Start each build with a fresh log so diagnostics from an older source tree do not
-    # trigger retry/compile-error detection in the current run.
     Set-Content -LiteralPath $LogPath -Encoding Unicode -Value ''
     $GradleExe = Join-Path $GradleDistRoot 'bin\gradle.bat'
     if (-not (Test-Path -LiteralPath $GradleExe)) { throw "Gradle executable missing: $GradleExe" }
@@ -517,22 +650,28 @@ function Build-Apk {
         $BuildExit = 1
         for ($Attempt = 1; $Attempt -le 12; $Attempt++) {
             Write-Host "Gradle build attempt $Attempt of 12..."
-            # Windows PowerShell 5.1 wraps native stderr lines as red ErrorRecord objects.
-            # Merge Gradle stderr into stdout inside cmd.exe instead; PowerShell then receives
-            # ordinary text while the real Gradle exit code remains the failure criterion.
-            $GradleCommand = ('call "{0}" --no-daemon --stacktrace --console=plain clean assembleDebug 2>&1' -f $GradleExe)
+            $GradleCommand = ('call "{0}" --no-daemon --stacktrace --console=plain {1} 2>&1' -f $GradleExe, $TaskList)
             & $env:ComSpec /d /s /c $GradleCommand | Tee-Object -FilePath $LogPath -Append
             $BuildExit = $LASTEXITCODE
             if ($BuildExit -eq 0) { break }
 
-            $RecentBuildLog = (Get-Content -LiteralPath $LogPath -Tail 220 -ErrorAction SilentlyContinue) -join "`n"
-            $CompileFailure = $RecentBuildLog -match '(?i)(compileDebugKotlin FAILED|compileDebugJavaWithJavac FAILED|mergeDebugJavaResource FAILED|Compilation error|Unresolved reference|Argument type mismatch|Conflicting overloads|More than one file was found|files found with path)'
-            if ($CompileFailure) {
-                Write-Host 'Gradle reached source compilation and found a code error. Retrying cannot fix source code, so stopping immediately.' -ForegroundColor Red
+            # Inspect the WHOLE log for this invocation. A long R8/Gradle stack trace can
+            # push the useful error more than 260 lines away from the end; tail-only
+            # detection previously caused deterministic failures to loop up to 12 times.
+            $CurrentBuildLog = Get-Content -LiteralPath $LogPath -Raw -ErrorAction SilentlyContinue
+            $DeterministicBuildFailure = $CurrentBuildLog -match '(?i)(compile(Debug|Release|Test)Kotlin FAILED|compile(Debug|Release|Test)JavaWithJavac FAILED|merge(Debug|Release)JavaResource FAILED|testDebugUnitTest FAILED|There were failing tests|Compilation error|Unresolved reference|Argument type mismatch|Conflicting overloads|More than one file was found|files found with path|Missing classes detected while running R8|R8: Missing class|com\.android\.tools\.r8\.CompilationFailedException|Execution failed for task .+minifyReleaseWithR8|Could not find [^\r\n]+)'
+            if ($DeterministicBuildFailure) {
+                Write-Host 'Gradle found a deterministic source/test/R8/dependency error. Retrying cannot fix it, so stopping after this attempt.' -ForegroundColor Red
                 break
             }
 
-            Write-Host "Gradle failed with exit $BuildExit. Retrying in case a dependency download was interrupted." -ForegroundColor Yellow
+            $TransientNetworkFailure = $CurrentBuildLog -match '(?i)(UnknownHostException|SocketTimeoutException|ConnectException|Connection reset|Connection timed out|Read timed out|Remote host terminated the handshake|Could not GET|Could not HEAD|Could not resolve host|Temporary failure in name resolution|PKIX path building failed|dependency download was interrupted)'
+            if (-not $TransientNetworkFailure) {
+                Write-Host 'Gradle failed without a recognized transient network error. Repeating the same build is unlikely to help, so stopping after this attempt.' -ForegroundColor Red
+                break
+            }
+
+            Write-Host "Gradle failed with a transient network/download error (exit $BuildExit). Retrying..." -ForegroundColor Yellow
             Start-Sleep -Seconds ([Math]::Min(30, 5 * $Attempt))
         }
     } finally {
@@ -540,23 +679,53 @@ function Build-Apk {
     }
 
     if ($BuildExit -ne 0) {
+        # testDebugUnitTest may already have completed before a later release task
+        # (for example R8) failed. Preserve that useful result instead of losing it.
+        if ($IsRelease) {
+            try {
+                Report-UnitTestResults
+            } catch {
+                Write-Host ("Unit-test gate summary: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
         throw "Gradle build failed with exit code $BuildExit. See $LogPath"
     }
 
-    $BuiltApk = Join-Path $StageRoot 'app\build\outputs\apk\debug\app-debug.apk'
+    if ($IsRelease) {
+        Report-UnitTestResults
+    }
+
+    $BuiltApk = if ($IsRelease) {
+        Join-Path $StageRoot 'app\build\outputs\apk\release\app-release.apk'
+    } else {
+        Join-Path $StageRoot 'app\build\outputs\apk\debug\app-debug.apk'
+    }
     if (-not (Test-Path -LiteralPath $BuiltApk)) {
         throw "Gradle reported success, but APK was not found: $BuiltApk"
     }
 
-    $FinalApk = Join-Path $OutputRoot ("Aura_Files_{0}-debug.apk" -f $AppVersion)
+    # Verify the actual certificate embedded in the produced APK, not only Gradle settings.
+    Assert-ApkSigningIdentity $BuiltApk
+
+    $FinalApk = Join-Path $OutputRoot ("Aura_Files_{0}-{1}.apk" -f $AppVersion, $VariantLabel)
     Copy-Item -LiteralPath $BuiltApk -Destination $FinalApk -Force
+    # Verify once more after copying into BUILD_OUTPUT.
+    Assert-ApkSigningIdentity $FinalApk
+
     $ApkInfo = Get-Item -LiteralPath $FinalApk
     $ApkHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $FinalApk).Hash.ToLowerInvariant()
 
     Write-Host ''
     Write-Host '============================================================' -ForegroundColor Green
-    Write-Host 'BUILD SUCCESSFUL' -ForegroundColor Green
+    if ($IsRelease) {
+        Write-Host 'RELEASE BUILD SUCCESSFUL' -ForegroundColor Green
+        Write-Host 'Unit-test gate: PASSED' -ForegroundColor Green
+    } else {
+        Write-Host 'DEBUG BUILD SUCCESSFUL' -ForegroundColor Green
+    }
     Write-Host "APK:    $FinalApk" -ForegroundColor Green
+    Write-Host "Mode:   $VariantLabel" -ForegroundColor Green
+    Write-Host "Signer: $ExpectedAuraSigningSha1" -ForegroundColor Green
     Write-Host "Size:   $($ApkInfo.Length) bytes" -ForegroundColor Green
     Write-Host "SHA256: $ApkHash" -ForegroundColor Green
     Write-Host '============================================================' -ForegroundColor Green
@@ -606,7 +775,8 @@ try {
     Write-Step 'JDK check'
     & (Join-Path $JdkRoot 'bin\java.exe') -version
     if ($LASTEXITCODE -ne 0) { throw 'java -version failed.' }
-    Ensure-DebugKeystore
+    Write-Host ("Requested build mode (script): {0}" -f $script:AuraRequestedBuildType) -ForegroundColor Cyan
+    Ensure-AuraSigningKeystore -RequestedBuildType $script:AuraRequestedBuildType
 
     Install-AndroidCommandLineTools
     Configure-Environment
@@ -615,7 +785,7 @@ try {
     Install-Gradle95
     Stage-Project
     Write-LocalProperties
-    Build-Apk
+    Build-Apk -RequestedBuildType $script:AuraRequestedBuildType
     try { Stop-Transcript | Out-Null } catch {}
     exit 0
 } catch {
@@ -631,8 +801,16 @@ try {
         $FailureLines = @('Aura Files setup/build failed.', '', 'ERROR:', $_.Exception.Message, '', 'STACK:', $_.ScriptStackTrace)
         $BuildLogForFailure = Join-Path $OutputRoot 'build.log'
         if (Test-Path -LiteralPath $BuildLogForFailure) {
+            $BuildLogLines = @(Get-Content -LiteralPath $BuildLogForFailure -ErrorAction SilentlyContinue)
+            $ImportantBuildLines = @($BuildLogLines | Where-Object {
+                $_ -match '(?i)(^e: |^error:|Unresolved reference|Argument type mismatch|Type mismatch|Cannot infer|Conflicting overloads|Compilation error|compile(Debug|Release|Test)Kotlin FAILED|compile(Debug|Release|Test)JavaWithJavac FAILED|testDebugUnitTest FAILED|There were failing tests|R8: Missing class|minifyReleaseWithR8|Could not find |Could not resolve all files)'
+            } | Select-Object -First 120)
+            if ($ImportantBuildLines.Count -gt 0) {
+                $FailureLines += @('', 'COMPILER/BUILD ERROR HIGHLIGHTS:')
+                $FailureLines += $ImportantBuildLines
+            }
             $FailureLines += @('', 'LAST 120 LINES OF BUILD.LOG:')
-            $FailureLines += Get-Content -LiteralPath $BuildLogForFailure -Tail 120
+            $FailureLines += $BuildLogLines | Select-Object -Last 120
         }
         $FailureLines | Set-Content -LiteralPath $FailurePath -Encoding UTF8
         Write-Host "Error was also saved to: $FailurePath" -ForegroundColor Yellow

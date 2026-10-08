@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import androidx.documentfile.provider.DocumentFile
+import com.aurafiles.app.data.DocumentTreeSafety
 import com.aurafiles.app.data.FastDocumentListing
 import com.aurafiles.app.data.AuraVault
 import com.aurafiles.app.model.CategorySummary
@@ -13,6 +14,8 @@ import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.model.FileSortMode
 import com.aurafiles.app.model.ImageSourceFilter
 import com.aurafiles.app.model.StorageAnalysis
+import java.io.IOException
+import java.util.ArrayDeque
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -95,63 +98,106 @@ class StorageIndexer(
             }
         }
 
-        suspend fun walk(directory: DocumentFile, relativePath: String) {
-            currentCoroutineContext().ensureActive()
-            publish(
-                IndexScanProgress(IndexScanState.SCANNING, count, bytes, relativePath.ifBlank { "/" }, ""),
-                force = false,
-            )
-            for (child in FastDocumentListing.list(appContext, directory)) {
-                currentCoroutineContext().ensureActive()
-                if (child.name == TRASH_FOLDER || child.name == AuraVault.VAULT_FOLDER) continue
-                val childPath = if (relativePath.isBlank()) child.name else "$relativePath/${child.name}"
-                if (child.isDirectory) {
-                    // Android intentionally blocks third-party apps from enumerating other apps'
-                    // private external-storage trees even when MANAGE_EXTERNAL_STORAGE is granted.
-                    // Treat only those well-known protected trees as out of scope for analysis.
-                    // Do not swallow generic I/O failures here: a disconnected SD/USB volume must
-                    // still fail the scan instead of producing a falsely "complete" index.
-                    if (isProtectedAndroidSharedPath(child.uri.path.orEmpty())) {
-                        skippedProtectedDirectoryCount += 1
-                        continue
-                    }
-                    walk(child.document, childPath)
-                    continue
-                }
+        data class PendingDirectory(val directory: DocumentFile, val relativePath: String, val depth: Int)
 
-                val classification = FileClassifier.classify(child.name, child.mimeType, child.uri, directory.uri)
-                val previous = oldHashes[child.uri.toString()]?.takeIf {
-                    it.size == child.size && it.modifiedAt == child.modifiedAt
-                }
-                batch += IndexedFileEntity(
-                    rootId,
-                    child.uri.toString(),
-                    directory.uri.toString(),
-                    child.name,
-                    classification.extension,
-                    child.mimeType,
-                    child.size,
-                    child.modifiedAt,
-                    classification.category.name,
-                    classification.sourceFolder,
-                    classification.readerSupported,
-                    classification.temporaryCandidate,
-                    previous?.sha256,
-                    previous?.quickHash,
-                    generation,
-                )
-                count += 1
-                bytes += child.size.coerceAtLeast(0L)
+        suspend fun walkTree() {
+            DocumentTreeSafety.requireNotFilesystemSymlink(root, "Индексация")
+            val visitedDirectories = mutableSetOf<String>()
+            DocumentTreeSafety.requireUniqueDirectoryVisit(root, 0, visitedDirectories, "Индексация")
+            val pending = ArrayDeque<PendingDirectory>()
+            pending.addLast(PendingDirectory(root, "", 0))
+
+            while (pending.isNotEmpty()) {
+                currentCoroutineContext().ensureActive()
+                val current = pending.removeLast()
                 publish(
-                    IndexScanProgress(IndexScanState.SCANNING, count, bytes, relativePath, child.name),
+                    IndexScanProgress(
+                        IndexScanState.SCANNING,
+                        count,
+                        bytes,
+                        current.relativePath.ifBlank { "/" },
+                        "",
+                    ),
                     force = false,
                 )
-                if (batch.size >= BATCH_SIZE) flush()
+                val children = FastDocumentListing.listStrict(appContext, current.directory)
+                for (child in children.asReversed()) {
+                    currentCoroutineContext().ensureActive()
+                    if (child.name == TRASH_FOLDER || AuraVault.isVaultFolder(child.name)) continue
+                    if (DocumentTreeSafety.isFilesystemSymlink(child.document)) continue
+                    val childPath = if (current.relativePath.isBlank()) {
+                        child.name
+                    } else {
+                        "${current.relativePath}/${child.name}"
+                    }
+                    if (child.isDirectory) {
+                        // Android intentionally blocks third-party apps from enumerating other apps'
+                        // private external-storage trees even when MANAGE_EXTERNAL_STORAGE is granted.
+                        // Treat only those well-known protected trees as out of scope for analysis.
+                        // Do not swallow generic I/O failures here: a disconnected SD/USB volume must
+                        // still fail the scan instead of producing a falsely "complete" index.
+                        if (isProtectedAndroidSharedPath(child.uri.path.orEmpty())) {
+                            skippedProtectedDirectoryCount += 1
+                            continue
+                        }
+                        val depth = current.depth + 1
+                        DocumentTreeSafety.requireUniqueDirectoryVisit(
+                            child.document,
+                            depth,
+                            visitedDirectories,
+                            "Индексация",
+                        )
+                        pending.addLast(PendingDirectory(child.document, childPath, depth))
+                        continue
+                    }
+
+                    val classification = FileClassifier.classify(
+                        child.name,
+                        child.mimeType,
+                        child.uri,
+                        current.directory.uri,
+                    )
+                    val previous = oldHashes[child.uri.toString()]?.takeIf {
+                        it.size == child.size && it.modifiedAt == child.modifiedAt
+                    }
+                    batch += IndexedFileEntity(
+                        rootId,
+                        child.uri.toString(),
+                        current.directory.uri.toString(),
+                        child.name,
+                        classification.extension,
+                        child.mimeType,
+                        child.size,
+                        child.modifiedAt,
+                        classification.category.name,
+                        classification.sourceFolder,
+                        classification.readerSupported,
+                        classification.temporaryCandidate,
+                        previous?.sha256,
+                        previous?.quickHash,
+                        generation,
+                    )
+                    count = try {
+                        Math.addExact(count, 1L)
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Индексация: переполнение счётчика файлов")
+                    }
+                    bytes = try {
+                        Math.addExact(bytes, child.size.coerceAtLeast(0L))
+                    } catch (_: ArithmeticException) {
+                        throw IOException("Индексация: суммарный размер слишком велик")
+                    }
+                    publish(
+                        IndexScanProgress(IndexScanState.SCANNING, count, bytes, current.relativePath, child.name),
+                        force = false,
+                    )
+                    if (batch.size >= BATCH_SIZE) flush()
+                }
             }
         }
 
         return try {
-            walk(root, "")
+            walkTree()
             flush()
             fileDao.deleteNotSeen(rootId, generation)
             publish(IndexScanProgress(IndexScanState.HASHING, count, bytes), force = true)

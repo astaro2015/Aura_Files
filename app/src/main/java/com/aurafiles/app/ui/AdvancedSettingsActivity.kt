@@ -44,7 +44,7 @@ class AdvancedSettingsActivity : ComponentActivity() {
         toggle("Показывать скрытые файлы", files.showHiddenFiles(), files::setShowHiddenFiles)
         toggle("Показывать папки thumbnails", files.showThumbnailFiles(), files::setShowThumbnailFiles)
         toggle("Миниатюры в сетке", files.showGridThumbnails(), files::setShowGridThumbnails)
-        toggle("Избранное на главном экране", files.showFavoritesOnHome(), files::setShowFavoritesOnHome)
+        toggle("Сейф на главном экране", files.showFavoritesOnHome(), files::setShowFavoritesOnHome)
 
         section("Просмотр")
         note("Изображения: соседние файлы, EXIF, свайп, масштаб 100 %, поворот просмотра.")

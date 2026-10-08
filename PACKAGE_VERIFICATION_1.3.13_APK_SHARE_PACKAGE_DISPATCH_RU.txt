@@ -1,0 +1,32 @@
+Aura Files 1.3.13 — package verification
+Date: 2026-09-16
+
+Release identity:
+- versionName = 1.3.13
+- versionCode = 143
+
+Real-device regression addressed:
+- 1.3.12 recipient list opened;
+- Telegram: "unsupported attachment";
+- MAX: empty compose message.
+
+Root-cause correction:
+- APK ACTION_SEND is no longer pinned to ResolveInfo.activityInfo via setComponent;
+- recipient targets are deduplicated by packageName;
+- selected recipient is launched with setPackage(packageName);
+- provider URI is preflighted via ContentResolver query/open/read before the picker opens;
+- EXTRA_STREAM + ClipData + EXTRA_TITLE + read URI permission are present;
+- MIME priority: application/vnd.android.package-archive -> application/octet-stream -> */*.
+
+Verification performed in container:
+- Python audit harness: 22/22 PASS (excluding release-hygiene, run separately).
+- stage17g_release_hygiene.py: PASS, tracked=471.
+- ApkShareIntentPolicy.kt + stage18e_policy_harness.kt standalone kotlinc: PASS.
+- stage18h_apk_share_package_dispatch.py: PASS.
+- Gradle :app:compileDebugKotlin was attempted and stopped before compilation because services.gradle.org is unreachable (UnknownHostException).
+
+Final device verification required:
+- build on Windows;
+- install Aura Files 1.3.13;
+- SPLIT -> unified APK -> Share -> Telegram/MAX;
+- verify the APK appears as an attachment with a non-zero file size.

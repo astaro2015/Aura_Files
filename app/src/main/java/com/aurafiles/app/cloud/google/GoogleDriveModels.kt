@@ -28,6 +28,7 @@ data class GoogleDriveFile(
     val parents: List<String> = emptyList(),
     val canDownload: Boolean = true,
     val shortcutTargetId: String = "",
+    val trashed: Boolean = false,
 ) {
     val isDirectory: Boolean get() = mimeType == GOOGLE_DRIVE_FOLDER_MIME
     val isShortcut: Boolean get() = mimeType == GOOGLE_DRIVE_SHORTCUT_MIME

@@ -1,10 +1,98 @@
-> Текущая рабочая ветка: **Aura Files 1.3.4**. Историческая стабильная база — 1.0.4; актуальный checkpoint: `AURA_1.3.4_CLOUD_CHECKPOINT.md`.
+> Текущая версия: **Aura Files 1.3.19**. База safety/release audit — 1.3.5; checkpoint 1.3.15: `AURA_1.3.15_MEDIASTORE_APK_SHARE_CHECKPOINT.md`.
 
-# Aura Files 1.3.4
+# Aura Files 1.3.19
+
+## Исправление видеоплеера и DjVu (1.3.19)
+
+Из ARSCLib удалены Android framework и XmlPull заглушки, которые попадали в APK и нарушали создание Media3-видеоплеера на устройстве. Файлы DjVu больше не направляются в растровый просмотрщик, где они оставались на бесконечной загрузке. Реальное воспроизведение на POCO F6 требует повторной проверки этой сборки на устройстве.
+
+## История: Aura Files 1.3.17
+
+## Надёжность предпросмотра (1.3.17)
+
+При ошибке чтения соседних файлов фото- и видеопросмотр оставляют открытым текущий файл, вместо необработанного исключения. Миниатюры распознают поддерживаемые расширения и при отсутствии MIME. Текстовый предпросмотр загружает ограниченный фрагмент до 32 768 символов. Полный Android Lint для этой версии проверяется отдельно; изменения не заменяют проверку на реальном устройстве. Подробнее: `RELEASE_NOTES_1.3.17_RU.md`.
+
+## История: Aura Files 1.3.16
+
+## Сейф и папка .AuraSafe (1.3.16)
+
+Раздел «Избранное» переименован в «Сейф», а папка зашифрованных файлов — из `.AuraVault` в `.AuraSafe`. При первом обращении к Сейфу после обновления старая папка переносится целиком без перешифрования файлов. Если обе папки уже существуют, приложение ничего не удаляет и сообщает о конфликте; обе папки исключены из обычного просмотра, индексации и сетевой выдачи. Исправление разрешения при восстановлении файла из Сейфа из сборки 1.3.15 сохранено. Подробнее: `RELEASE_NOTES_1.3.16_RU.md`.
+
+## История: Aura Files 1.3.15
+
+## System MediaStore APK share handoff (1.3.15)
+
+На Android 10+ готовый APK перед отправкой публикуется в системный `MediaStore.Downloads` на `VOLUME_EXTERNAL_PRIMARY` (`Загрузки/Aura Files`) и только после проверки передаётся через обычный Android Sharesheet. Messenger-facing MIME фиксирован как `application/octet-stream`; `ClipData.newRawUri()` не даёт provider MIME повторно превратить вложение в APK MIME. Получатель не закрепляется через `setPackage`/`setComponent`. Если OEM ломает MediaStore, используется preflight-проверенный native Aura ContentProvider fallback.
+
+## Native share provider fix (1.3.14)
+
+Реальный тест 1.3.13 показал, что проблема была глубже: outgoing URI уже строился самой Aura, но обслуживал его всё ещё AndroidX `FileProvider`, и `ContentResolver.openFileDescriptor()` снова падал на `Missing android.support.FILE_PROVIDER_PATHS meta-data`. В 1.3.14 AndroidX FileProvider полностью удалён из share-path: Aura использует собственный read-only `ContentProvider`, который сам безопасно сопоставляет `content://` URI с разрешёнными файлами. Manifest meta-data и `file_paths.xml` больше не участвуют вообще.
+
+# История текущей ветки
 
 Файловый менеджер для Android с лаконичным интерфейсом в духе Apple. Основное приложение написано на Kotlin и Jetpack Compose; встроенные движки чтения книг используют Java.
 
 Разработчик: Привалов Олег.
+
+
+## FileProvider URI generation fix (1.3.12)
+
+После реального теста 1.3.11 выяснилось, что subclass `AuraFileProvider(R.xml.file_paths)` сам по себе недостаточен: статический AndroidX `FileProvider.getUriForFile()` всё равно заново читает `FILE_PROVIDER_PATHS` через PackageManager. В 1.3.12 outgoing URI формируется самой Aura через `AuraFileProvider.uriForFile()` с канонической проверкой разрешённых roots. Все production-вызовы статического URI generator удалены; provider продолжает обслуживать URI через `FileProvider(R.xml.file_paths)`.
+
+
+## FileProvider OEM fix (1.3.11)
+
+На тестовом Xiaomi после нажатия «Поделиться» Aura доходила до `FileProvider.getUriForFile()`, но прошивка возвращала `Missing android.support.FILE_PROVIDER_PATHS meta-data`, несмотря на наличие meta-data в исходном manifest. Прямое объявление `androidx.core.content.FileProvider` заменено собственным `AuraFileProvider : FileProvider(R.xml.file_paths)`. Пути теперь закреплены в конструкторе provider; manifest meta-data сохранена как совместимый fallback.
+
+## Исправление «Поделиться APK» (1.3.10)
+
+На Xiaomi/MIUI системный chooser мог не появляться даже после успешного поиска внешнего receiver. Теперь Aura сначала закрывает «APK готов», затем через `window.decorView.post` показывает собственный список внешних ACTION_SEND targets и запускает выбранный exact `ComponentName` с явным FileProvider read grant. MIME priority: `application/octet-stream` → `*/*` → APK MIME.
+
+## Исправление «Поделиться APK» (1.3.9)
+
+- После успешной сборки единого APK Aura больше не запускает системный chooser вслепую только с `application/vnd.android.package-archive`.
+- Перед запуском проверяется наличие внешнего приложения-получателя. MIME выбирается по цепочке: APK MIME → `application/octet-stream` → `*/*`.
+- Это исправляет сценарий Xiaomi/MIUI, где кнопка «Поделиться» могла закрыть диалог и оставить пользователя в Aura без системного списка приложений.
+- `FileProvider`, `ClipData` и временное read-разрешение сохраняются; если внешнего получателя действительно нет, Aura показывает явное сообщение вместо молчаливого возврата.
+- Merge/sign/verify pipeline 1.3.8 не изменён.
+
+
+## Единый APK из SPLIT (1.3.6)
+
+- В `Очистка → Приложения` для SPLIT-приложения основное действие теперь **«Поделиться APK…»**: Aura объединяет установленный `base.apk + splitSourceDirs` в один APK.
+- Слияние ресурсов и manifest основано на APKEditor 1.4.9 / ARSCLib 1.4.0; split-required markers и старая подпись удаляются до финальной подписи.
+- Получившийся APK подписывается отдельной локальной software RSA identity `Aura APK Export` в `noBackupFilesDir`, затем повторно проверяются подпись, package name и versionCode. Ключ подписи самой Aura для экспорта чужих APK не используется.
+- Начиная с 1.3.7 legacy v1/JAR signing отключён: Aura задаёт signing floor API 26 и использует v2/v3, что соответствует минимальной версии самой Aura и убирает проблемный on-device PKCS#7 path.
+- Поскольку исходная подпись разработчика после merge недоступна, единый APK предназначен для чистой установки либо обновления APK, ранее экспортированного той же установкой Aura. Поверх Play/оригинальной версии с другой подписью Android его не установит.
+- Кнопка **APKS** сохранена рядом как fallback для защищённых/нестандартных приложений или случаев, когда merge невозможен.
+- `.apks` installer/export остаётся полностью поддержан и не удалён.
+
+
+## Android runtime signer (1.3.8)
+
+- Host-oriented `com.android.tools.build:apksig` удалён из runtime dependencies: upstream AOSP прямо позиционирует его как инструмент для использования вне Android-устройств.
+- На устройстве используется `MuntashirAkon/apksig-android 4.4.0`, сохраняющий публичный API `com.android.apksig.*`, но адаптированный для Android runtime.
+- JitPack ограничен группой `com.github.MuntashirAkon`, чтобы не менять источник остальных зависимостей.
+- Signing floor остаётся API 26: v1/JAR отключён, v2+v3 включены.
+- v4 явно отключён: он создаёт отдельный `.idsig` sidecar и не нужен для экспорта одного самостоятельного APK.
+- Проверка подписи, package name/versionCode, atomic publish и APKS fallback сохранены.
+
+## Hotfix подписи Universal APK (1.3.7)
+
+- Исправлен runtime-сбой `SignatureException: Failed to sign` после merge.
+- Реализация 1.3.6 ошибочно принудительно включала v1/JAR signing, хотя design функции требовал v2+v3 для API 26+.
+- Теперь signer и verifier явно используют нижнюю границу API 26; v1 отключён, v2/v3 включены.
+- Audit harness закрепляет это как регрессионный инвариант.
+
+## Глубокий safety/release audit (1.3.5)
+
+- Сетевые и облачные операции hardened против lost ACK, stale ID/session, неоднозначного MOVE/DELETE/REPLACE и ошибочного destructive fallback.
+- Пакетное переименование получило durable crash journal и восстановление после process kill; локальный REPLACE и Vault Restore получили собственные crash-safe журналы.
+- Восстановлены потерянные safety-защиты рекурсивных локальных операций и корзины: depth/cycle/symlink guards, orphan trash recovery и conservative ambiguous-delete policy.
+- Viewer/reader/cache paths hardened против EXIF inconsistency, OOM, зависших jobs, частичных preview/plaintext-файлов и переполнения внутреннего cache.
+- APK/APKS import/export/install hardened: size/space limits, cooperative cancellation, atomic temp commit и доверенный PackageInstaller callback по session+nonce.
+- Dependency audit обновил XZ for Java до 1.12 и Bouncy Castle до 1.85.2; third-party notice приведён к фактическим runtime dependencies.
+- Финальный clean Android build выполняется `BUILD_ON_CLEAN_WINDOWS.bat`; контейнерный audit не подменяет его статическими проверками.
 
 
 
@@ -89,7 +177,7 @@ Backend workspace теперь задаёт корректный Material3 `cont
 - быстрые категории: изображения, видео, аудио, электронные книги, документы, архивы, APK, «Загрузки», «Камера» и «Все»;
 - отдельные быстрые категории APK, «Загрузки» и «Камера»;
 - раздел «Изображения» показывает общий поток по дате и быстрые фильтры: Камера, Снимки экрана, WhatsApp, Telegram, Загрузки и другие папки; выдача постраничная без жёсткого потолка 5000;
-- экспорт установленных приложений: обычные APK отправляются напрямую, SPLIT собираются в один Aura `.apks`, который Aura умеет проверять и устанавливать полным комплектом на другом телефоне; полученный `.apks` можно открыть тапом либо выбрать через `Очистка → Приложения → Установить .APKS`;
+- экспорт установленных приложений: обычные APK отправляются напрямую; для SPLIT основное действие собирает один переподписанный APK, а Aura `.apks` остаётся отдельным fallback и по-прежнему устанавливается полным комплектом через `Очистка → Приложения → Установить .APKS`;
 - отдельная категория «Книги» для EPUB, FB2/FB2.ZIP, MOBI/AZW/AZW3/PRC, CBZ/CBR; встроенная читалка также умеет открывать ряд документных форматов;
 - встроенный просмотр PDF, DjVu/DJV и комиксов CBZ/CBR, включая запоминание позиции, закладки, заметки, оглавление и настройку оформления;
 - PDF, DjVu, DOCX, RTF, Markdown, TXT и HTML классифицируются как документы, даже если встроенный просмотрщик/читалка Aura умеет их открыть;

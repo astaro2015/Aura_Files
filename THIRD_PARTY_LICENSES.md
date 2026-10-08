@@ -45,9 +45,9 @@ Used for SMB2/SMB3 client access. Project: https://github.com/hierynomus/smbj
 
 Used only to enumerate the file shares exposed by an SMB2 server; file browsing and transfers remain on SMBJ. Project: https://github.com/codelibs/jcifs
 
-## slf4j-api / slf4j-nop 2.0.18
+## slf4j-api / slf4j-nop 2.0.18 — MIT
 
-Logging API and no-output runtime binding used by the reader/network dependencies.
+Logging API and no-output runtime binding used by the reader/network dependencies. Project: https://www.slf4j.org/
 
 ## AndroidX Room 2.8.4 — Apache License 2.0
 
@@ -66,3 +66,27 @@ Used for the embedded SFTP-only SSH server on the phone (`sshd-core` + `sshd-sft
 Used for Google Identity Services `AuthorizationClient` in the Google Drive connection flow.
 Artifact: `com.google.android.gms:play-services-auth:21.6.0` from Google Maven.
 Use and redistribution are subject to the applicable Google Play services / Google APIs SDK terms published by Google; this project does not vendor or modify the library source.
+
+## AndroidX / Jetpack / Compose — Apache License 2.0
+
+The application uses AndroidX Activity, Compose, DocumentFile, ExifInterface, Lifecycle, Media3 and Room components. AndroidX libraries are distributed under the Apache License 2.0 unless an individual artifact states otherwise.
+
+## Apache Commons Net 3.13.0 — Apache License 2.0
+
+Used for FTP/FTPS client access. Project: https://commons.apache.org/proper/commons-net/
+
+## Apache Commons Compress 1.28.0 — Apache License 2.0
+
+Used for ZIP/TAR/7z and compressed stream formats. Project: https://commons.apache.org/proper/commons-compress/
+
+## Bouncy Castle 1.85 line — MIT-style Bouncy Castle License
+
+`bcprov-jdk18on` 1.85.2 and `bcpkix-jdk18on` 1.85 provide cryptographic primitives required by the SSH/SMB stack. The Bouncy Castle license is an MIT-style permissive license. Project: https://www.bouncycastle.org/
+
+## XZ for Java 1.12 — 0BSD
+
+Used by the XZ support in the archive stack. XZ for Java 1.10 and newer are distributed under the BSD Zero Clause License. Project: https://tukaani.org/xz/java.html
+
+## Runtime dependency inventory note
+
+The sections above document the direct runtime libraries declared by `app/build.gradle.kts`. Test-only dependencies (for example JUnit and AndroidX test artifacts) are not shipped as application runtime components and are therefore not part of this runtime notice inventory.

@@ -1,0 +1,31 @@
+Aura Files 1.3.10 — package verification / explicit APK share targets
+
+Version: 1.3.10 / versionCode 140
+Date: 2026-09-16
+Base: 1.3.9 APK share chooser fix
+
+Change:
+- no dependency on OEM/system chooser for outgoing APK share;
+- dismiss «APK готов» then schedule target picker with window.decorView.post;
+- enumerate external ACTION_SEND activities;
+- show Aura-owned target list;
+- launch exact ComponentName with explicit FileProvider read grant;
+- MIME priority octet-stream -> */* -> APK MIME;
+- detailed runtime error if target launch fails.
+
+Verification completed in container:
+- stage18d APK share contract: PASS
+- stage18e explicit target regression: PASS (RED on 1.3.9, PASS after fix)
+- stage18e pure Kotlin MIME policy harness: PASS
+- full Python audit harness: 19/19 PASS (stage17g checked from a temporary clean Git index)
+- release identity: PASS (1.3.10 / 140)
+- universal APK merge/sign/verify source invariants: PASS
+- Android apksig runtime-port guard: PASS
+- release hygiene: PASS, 459 tracked files at audit time
+
+Gradle compile attempt:
+- command reached wrapper distribution fetch before source compilation;
+- environment blocked https://services.gradle.org with UnknownHostException;
+- therefore final Android compiler/device gate remains BUILD_ON_CLEAN_WINDOWS.bat on Windows.
+
+SOURCE_SHA256SUMS.txt is regenerated after all source/document changes and verified before packaging.

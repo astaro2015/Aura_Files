@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
 import android.app.Activity
 import android.app.PendingIntent
 import android.content.ClipData
@@ -15,7 +16,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.lifecycle.SavedStateViewModelFactory
-import androidx.core.content.FileProvider
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -258,7 +258,7 @@ private fun BackendWorkspaceScreen(
         viewModel.consumeOpenFileRequest()
         runCatching {
             val file = File(request.absolutePath)
-            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            val uri = AuraFileProvider.uriForFile(context, file)
             if (request.displayName.substringAfterLast('.', "").equals("apks", ignoreCase = true)) {
                 SplitPackageInstallerActivity.start(context, uri, request.displayName)
             } else {
@@ -1050,7 +1050,11 @@ private fun BackendStandardRow(
         }
         if (selectionMode) {
             IconButton(onClick = onToggle, enabled = !busy) {
-                Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+                Icon(
+                    Icons.Rounded.CheckCircle,
+                    contentDescription = if (selected) "Снять выделение ${item.name}" else "Выбрать ${item.name}",
+                    tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         } else Box {
             IconButton(onClick = { menuOpen = true }, enabled = !busy) { Icon(Icons.Rounded.MoreHoriz, contentDescription = "Действия") }
@@ -1142,7 +1146,14 @@ private fun BackendStandardTile(
                 BackendItemIcon(item, Modifier.size(52.dp))
                 Box(Modifier.align(Alignment.TopEnd)) {
                     IconButton(onClick = { if (selectionMode) onToggle() else menuOpen = true }, enabled = !busy) {
-                        Icon(if (selectionMode) Icons.Rounded.CheckCircle else Icons.Rounded.MoreHoriz, contentDescription = null)
+                        Icon(
+                            if (selectionMode) Icons.Rounded.CheckCircle else Icons.Rounded.MoreHoriz,
+                            contentDescription = if (selectionMode) {
+                                if (selected) "Снять выделение ${item.name}" else "Выбрать ${item.name}"
+                            } else {
+                                "Действия с ${item.name}"
+                            },
+                        )
                     }
                     BackendItemMenu(
                         expanded = menuOpen,

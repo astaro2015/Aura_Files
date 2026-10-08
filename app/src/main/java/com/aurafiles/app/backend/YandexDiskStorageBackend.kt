@@ -13,7 +13,10 @@ import com.aurafiles.app.cloud.yandex.YandexFailureKind
 import com.aurafiles.app.cloud.yandex.YandexOperationLink
 import com.aurafiles.app.cloud.yandex.YandexOperationState
 import java.io.IOException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 
 class YandexDiskStorageBackend(
     private val profile: CloudProfile,
@@ -104,7 +107,19 @@ class YandexDiskStorageBackend(
             if (existing.isDirectory) return existing
             throw IOException("${existing.name} уже существует и не является папкой")
         }
-        authorizedApi { mkdir(normalized) }
+        try {
+            authorizedApi { mkdir(normalized) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            val probe = probeStat(normalized)
+            if (probe.known && probe.item?.isDirectory == true) return requireNotNull(probe.item)
+            throw ambiguousMutation(
+                "Яндекс не подтвердил создание папки ${BackendPath.name(normalized)}. " +
+                    "Aura не повторяет команду автоматически, чтобы не создать дубль.",
+                error,
+            )
+        }
         return stat(normalized) ?: StorageItem(
             backendId = descriptor.id,
             path = normalized,
@@ -118,8 +133,15 @@ class YandexDiskStorageBackend(
         require(normalized != "/") { "Нельзя переименовать корень Яндекс.Диска" }
         val destination = child(parent(normalized), newName)
         require(stat(destination) == null) { "$newName уже существует" }
-        val operation = authorizedApi { move(normalized, destination, overwrite = false) }
-        waitForOperation(operation)
+        try {
+            val operation = authorizedApi { move(normalized, destination, overwrite = false) }
+            waitForOperation(operation)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            reconcileMoveAfterFailure(normalized, destination, "переименование", error)?.let { return it }
+            throw error
+        }
         return stat(destination) ?: throw IOException("Яндекс не подтвердил переименование")
     }
 
@@ -129,8 +151,15 @@ class YandexDiskStorageBackend(
         val destinationDir = normalize(destinationDirectory)
         val target = child(destinationDir, BackendPath.name(normalized))
         require(stat(target) == null) { "${BackendPath.name(normalized)} уже существует в папке назначения" }
-        val operation = authorizedApi { move(normalized, target, overwrite = false) }
-        waitForOperation(operation)
+        try {
+            val operation = authorizedApi { move(normalized, target, overwrite = false) }
+            waitForOperation(operation)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            reconcileMoveAfterFailure(normalized, target, "перемещение", error)?.let { return it }
+            throw error
+        }
         return stat(target) ?: throw IOException("Яндекс не подтвердил перемещение")
     }
 
@@ -141,8 +170,20 @@ class YandexDiskStorageBackend(
         if (item.isDirectory && !recursive && list(normalized).isNotEmpty()) {
             throw IOException("Папка не пуста")
         }
-        val operation = authorizedApi { delete(normalized, permanently = false) }
-        waitForOperation(operation)
+        try {
+            val operation = authorizedApi { delete(normalized, permanently = false) }
+            waitForOperation(operation)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            val probe = probeStat(normalized)
+            if (probe.known && probe.item == null) return
+            throw ambiguousMutation(
+                "Яндекс не подтвердил удаление ${item.name}. " +
+                    "Текущее состояние нельзя считать окончательным; Aura не повторяет удаление автоматически.",
+                error,
+            )
+        }
     }
 
     override suspend fun ping(): Boolean = runCatching {
@@ -179,18 +220,54 @@ class YandexDiskStorageBackend(
 
     private suspend fun waitForOperation(operation: YandexOperationLink) {
         val href = operation.href ?: return
-        repeat(OPERATION_POLL_ATTEMPTS) {
+        val deadlineNanos = System.nanoTime() + OPERATION_TIMEOUT_MS * 1_000_000L
+        while (System.nanoTime() < deadlineNanos) {
+            currentCoroutineContext().ensureActive()
             when (authorizedApi { operationState(href) }) {
                 YandexOperationState.SUCCESS -> return
                 YandexOperationState.FAILED -> throw IOException("Операция на Яндекс.Диске завершилась ошибкой")
-                YandexOperationState.IN_PROGRESS -> delay(OPERATION_POLL_INTERVAL_MS)
+                YandexOperationState.IN_PROGRESS -> Unit
             }
+            currentCoroutineContext().ensureActive()
+            val remainingMs = ((deadlineNanos - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
+            if (remainingMs <= 0L) break
+            delay(minOf(OPERATION_POLL_INTERVAL_MS, remainingMs))
         }
-        throw IOException("Операция на Яндекс.Диске не завершилась вовремя")
+        throw IOException("Операция на Яндекс.Диске не завершилась за ${OPERATION_TIMEOUT_MS / 1_000L} секунд")
     }
+
+    private suspend fun reconcileMoveAfterFailure(
+        sourcePath: String,
+        targetPath: String,
+        operationLabel: String,
+        cause: Throwable,
+    ): StorageItem? {
+        val source = probeStat(sourcePath)
+        val target = probeStat(targetPath)
+        if (source.known && source.item == null && target.known && target.item != null) {
+            return target.item
+        }
+        throw ambiguousMutation(
+            "Яндекс не подтвердил $operationLabel. Текущее состояние source/target не доказывает, " +
+                "что сервер не завершит асинхронную операцию позже; Aura не повторяет её автоматически.",
+            cause,
+        )
+    }
+
+    private suspend fun probeStat(path: String): StatProbe = try {
+        StatProbe(known = true, item = stat(path))
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        StatProbe(known = false, item = null)
+    }
+
+    private fun ambiguousMutation(message: String, cause: Throwable): IOException = IOException(message, cause)
+
+    private data class StatProbe(val known: Boolean, val item: StorageItem?)
 
     companion object {
         private const val OPERATION_POLL_INTERVAL_MS = 500L
-        private const val OPERATION_POLL_ATTEMPTS = 360
+        private const val OPERATION_TIMEOUT_MS = 180_000L
     }
 }

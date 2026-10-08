@@ -15,22 +15,18 @@ internal fun openEnhancedPreview(context: Context, entry: FileEntry, siblings: L
             ApkInspectorActivity.start(context, entry)
             true
         }
-        entry.mimeType?.startsWith("image/") == true || extension in IMAGE_EXTENSIONS -> {
+        isPreviewImage(entry.name, entry.mimeType) -> {
             ImageViewerActivity.start(context, entry, siblings)
             true
         }
-        entry.mimeType?.startsWith("video/") == true || extension in VIDEO_EXTENSIONS -> {
+        isPreviewVideo(entry.name, entry.mimeType) -> {
             MediaPlayerActivity.start(context, entry, audioOnly = false, siblings = siblings)
             true
         }
-        entry.mimeType?.startsWith("audio/") == true || extension in AUDIO_EXTENSIONS -> {
+        isPreviewAudio(entry.name, entry.mimeType) -> {
             MediaPlayerActivity.start(context, entry, audioOnly = true, siblings = siblings)
             true
         }
         else -> false
     }
 }
-
-internal val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "heic", "heif", "avif")
-internal val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "avi", "mov", "m4v", "3gp", "ts", "m2ts")
-internal val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "ogg", "oga", "opus", "wav", "flac", "amr", "3gp")

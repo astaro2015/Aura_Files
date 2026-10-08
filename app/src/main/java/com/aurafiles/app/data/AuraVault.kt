@@ -1,14 +1,18 @@
 package com.aurafiles.app.data
 
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
 import androidx.documentfile.provider.DocumentFile
+import androidx.exifinterface.media.ExifInterface
 import com.aurafiles.app.model.FileEntry
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -35,12 +39,12 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Device-bound encrypted storage used by the UI labelled "Избранное".
+ * Device-bound encrypted storage used by the UI labelled "Сейф".
  *
  * There is intentionally no persisted key file. The AES-256 key is deterministically derived
  * from ANDROID_ID with HKDF-SHA256 and a fixed application context string. On Android 8+ the
  * value is scoped to device + Android user + app signing key, so a normal reinstall signed with
- * the same key on the same device derives the same vault key while copying .AuraVault to another
+ * the same key on the same device derives the same vault key while copying .AuraSafe to another
  * device does not.
  *
  * AVF2 stores payload data as independently authenticated AES-GCM chunks. Some Android crypto
@@ -55,6 +59,7 @@ import kotlin.math.roundToInt
 class AuraVault(private val context: Context) {
     private val resolver = context.contentResolver
     private val random = SecureRandom()
+    private val restoreJournalStore = VaultRestoreJournalStore(context.noBackupFilesDir)
 
     data class Item(
         val id: String,
@@ -81,6 +86,7 @@ class AuraVault(private val context: Context) {
     }
 
     fun list(): Listing {
+        recoverPendingRestores()
         // Plaintext is only ever staged under Aura's private cache. Sweep expired staging files
         // whenever the vault is opened/refreshed as well as before creating a new one.
         cleanupOld(File(context.cacheDir, DEFAULT_PLAIN_CACHE_FOLDER))
@@ -102,10 +108,10 @@ class AuraVault(private val context: Context) {
     }
 
     fun moveInto(entry: FileEntry): Item {
-        require(!entry.isDirectory) { "Папки пока нельзя помещать в защищённое Избранное" }
-        require(entry.vaultItemId == null && !isVaultUri(entry.uri)) { "Файл уже находится в защищённом Избранном" }
+        require(!entry.isDirectory) { "Папки пока нельзя помещать в Сейф" }
+        require(entry.vaultItemId == null && !isVaultUri(entry.uri)) { "Файл уже находится в Сейфе" }
         ensureAvailable()
-        val data = requireNotNull(dataDirectory(create = true)) { "Не удалось создать хранилище Избранного" }
+        val data = requireNotNull(dataDirectory(create = true)) { "Не удалось создать Сейф" }
         val id = UUID.randomUUID().toString()
         val target = File(data, "$id.$VAULT_EXTENSION")
         val temporary = File(data, ".$id.$VAULT_EXTENSION.tmp")
@@ -131,7 +137,7 @@ class AuraVault(private val context: Context) {
             val sourceStillExists = runCatching { entry.document.exists() }.getOrNull()
             if (sourceStillExists == true) {
                 target.delete()
-                throw IOException("Не удалось удалить исходный файл; перемещение в Избранное отменено")
+                throw IOException("Не удалось удалить исходный файл; перемещение в Сейф отменено")
             }
 
             preserveTargetOnFailure = true
@@ -148,40 +154,96 @@ class AuraVault(private val context: Context) {
 
     fun restore(item: Item, destination: DocumentFile): DocumentFile {
         require(destination.isDirectory && destination.canWrite()) { "Выбранная папка недоступна для записи" }
-        val name = uniqueName(destination, item.name)
-        val created = destination.createFile(item.mimeType ?: "application/octet-stream", name)
-            ?: throw IOException("Не удалось создать $name")
-
-        // Roll back the plaintext destination only while decrypt/write is still in progress.
-        // After the vault copy has been asked to delete, never blindly delete the restored file:
-        // preserving an extra copy is safer than losing the only remaining copy.
-        try {
-            val output = resolver.openOutputStream(created.uri, "w")
-                ?: throw IOException("Не удалось открыть $name для записи")
-            output.use { decryptData(item, it) }
-        } catch (error: Throwable) {
+        DocumentTreeSafety.requireNotFilesystemSymlink(destination, "Восстановление из Сейфа")
+        val finalName = uniqueName(destination, item.name)
+        val permissionOwned = acquireRestorePermissionIfNeeded(destination.uri)
+        val serviceName = allocateRestoreTemporaryName(destination)
+        val created = destination.createFile(item.mimeType ?: "application/octet-stream", serviceName)
+            ?: run {
+                releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+                throw IOException("Не удалось создать временный файл для $finalName")
+            }
+        val temporaryName = created.name ?: serviceName
+        if (!temporaryName.startsWith(VAULT_RESTORE_TEMP_PREFIX)) {
             runCatching { created.delete() }
+            releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+            throw IOException("Провайдер изменил служебное имя восстановления; безопасное восстановление невозможно")
+        }
+
+        var journal: VaultRestoreJournal? = null
+        try {
+            journal = restoreJournalStore.create(
+                destinationUri = destination.uri.toString(),
+                temporaryName = temporaryName,
+                finalName = finalName,
+                vaultFileName = item.encryptedFile.name,
+                releasePersistedPermission = permissionOwned,
+            )
+            val output = resolver.openOutputStream(created.uri, "w")
+                ?: throw IOException("Не удалось открыть временный файл для $finalName")
+            output.use { decryptData(item, it) }
+
+            journal = restoreJournalStore.update(journal, VaultRestorePhase.FINALIZE_PENDING)
+            val final = when (renameVaultRestoreAndProbe(destination, created, temporaryName, finalName)) {
+                VaultRenameOutcome.COMMITTED -> findUniqueChildStrict(destination, finalName)
+                    ?: throw IOException("Восстановленный файл $finalName больше не виден в папке")
+                VaultRenameOutcome.NOT_COMMITTED -> {
+                    cleanupVaultRestoreTemporary(destination, created, temporaryName)
+                    restoreJournalStore.remove(journal)
+                    releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+                    throw IOException("Не удалось завершить восстановление $finalName")
+                }
+                VaultRenameOutcome.AMBIGUOUS -> throw IOException(
+                    "Результат финализации $finalName неоднозначен; Aura сохраняет журнал и ничего не удаляет"
+                )
+            }
+            journal = restoreJournalStore.update(journal, VaultRestorePhase.FINALIZED)
+
+            val deleted = runCatching { item.encryptedFile.delete() }.getOrDefault(false)
+            if (!deleted && item.encryptedFile.exists()) {
+                restoreJournalStore.remove(journal)
+                releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+                throw IOException(
+                    "Файл возвращён в выбранную папку, но зашифрованная копия осталась в Сейфе. " +
+                        "Удалите её вручную после проверки возвращённого файла"
+                )
+            }
+            restoreJournalStore.remove(journal)
+            releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+            return final
+        } catch (error: Throwable) {
+            val record = journal
+            if (record == null) {
+                runCatching { created.delete() }
+                releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+            } else if (record.phase == VaultRestorePhase.WRITING && item.encryptedFile.exists()) {
+                // Decryption did not reach finalization and the encrypted source is still proven.
+                // It is safe to remove our partial plaintext staging file immediately.
+                val cleaned = runCatching {
+                    cleanupVaultRestoreTemporary(destination, created, temporaryName)
+                    true
+                }.getOrDefault(false)
+                if (cleaned) {
+                    runCatching { restoreJournalStore.remove(record) }
+                    releaseRestorePermissionIfOwned(destination.uri, permissionOwned)
+                }
+            }
             throw error
         }
-
-        val deleted = runCatching { item.encryptedFile.delete() }.getOrDefault(false)
-        if (!deleted && item.encryptedFile.exists()) {
-            throw IOException(
-                "Файл возвращён в выбранную папку, но зашифрованная копия осталась в Избранном. " +
-                    "Удалите её вручную после проверки возвращённого файла"
-            )
-        }
-        return created
     }
 
     fun preparePlainFile(item: Item, purpose: String = DEFAULT_PLAIN_CACHE_FOLDER): File {
         val directory = File(context.cacheDir, purpose).apply { mkdirs() }
         cleanupOld(directory)
+        requireCacheSpace(directory, item.size)
         val safe = safeName(item.name)
         val target = File(directory, "${UUID.randomUUID().toString().take(8)}-$safe")
         try {
             FileOutputStream(target).use { output -> decryptData(item, output) }
-            if (item.modifiedAt > 0L) runCatching { target.setLastModified(item.modifiedAt) }
+            // Keep the cache file timestamp as its staging time. The original modified time lives
+            // in encrypted metadata/FileEntry; reusing it here would make an old photo look like
+            // an expired plaintext cache file immediately and could delete it while a viewer reads it.
+            runCatching { target.setLastModified(System.currentTimeMillis()) }
             return target
         } catch (error: Throwable) {
             target.delete()
@@ -190,7 +252,7 @@ class AuraVault(private val context: Context) {
     }
 
     fun delete(item: Item) {
-        require(item.encryptedFile.delete()) { "Не удалось удалить ${item.name} из Избранного" }
+        require(item.encryptedFile.delete()) { "Не удалось удалить ${item.name} из Сейфа" }
     }
 
     fun toFileEntry(item: Item): FileEntry {
@@ -240,6 +302,7 @@ class AuraVault(private val context: Context) {
 
                 val plainBuffer = ByteArray(DATA_CHUNK_BYTES)
                 var chunkIndex = 0L
+                var totalPlainBytes = 0L
                 while (true) {
                     val plainLength = readChunk(source, plainBuffer)
                     if (plainLength <= 0) break
@@ -251,7 +314,14 @@ class AuraVault(private val context: Context) {
                         plain = plainBuffer,
                         plainLength = plainLength,
                     )
+                    totalPlainBytes = Math.addExact(totalPlainBytes, plainLength.toLong())
                     chunkIndex += 1L
+                }
+                if (entry.size > 0L && totalPlainBytes != entry.size) {
+                    throw IOException(
+                        "Источник ${entry.name} изменился во время чтения: " +
+                            "прочитано $totalPlainBytes из ${entry.size} байт"
+                    )
                 }
 
                 // An authenticated zero-length record is an end marker. Its AAD contains the
@@ -516,13 +586,14 @@ class AuraVault(private val context: Context) {
             null
         } ?: return null
 
+        val oriented = if (image) applyThumbnailOrientation(entry, bitmap) else bitmap
         val normalized = try {
-            scaleBitmap(bitmap, THUMBNAIL_EDGE)
+            scaleBitmap(oriented, THUMBNAIL_EDGE)
         } catch (_: OutOfMemoryError) {
-            bitmap.recycle()
+            if (!oriented.isRecycled) oriented.recycle()
             return null
         } catch (_: Throwable) {
-            bitmap.recycle()
+            if (!oriented.isRecycled) oriented.recycle()
             return null
         }
         return try {
@@ -535,8 +606,33 @@ class AuraVault(private val context: Context) {
         } catch (_: Throwable) {
             null
         } finally {
-            if (normalized !== bitmap && !normalized.isRecycled) normalized.recycle()
-            if (!bitmap.isRecycled) bitmap.recycle()
+            if (normalized !== oriented && !normalized.isRecycled) normalized.recycle()
+            if (!oriented.isRecycled) oriented.recycle()
+            if (oriented !== bitmap && !bitmap.isRecycled) bitmap.recycle()
+        }
+    }
+
+    private fun applyThumbnailOrientation(entry: FileEntry, bitmap: Bitmap): Bitmap {
+        val exif = runCatching {
+            if (entry.uri.scheme == "file") {
+                ExifInterface(requireNotNull(entry.uri.path))
+            } else {
+                val descriptor = resolver.openFileDescriptor(entry.uri, "r")
+                    ?: throw IOException("Не удалось открыть EXIF")
+                descriptor.use { ExifInterface(it.fileDescriptor) }
+            }
+        }.getOrNull() ?: return bitmap
+        if (exif.rotationDegrees == 0 && !exif.isFlipped) return bitmap
+        val matrix = Matrix().apply {
+            if (exif.isFlipped) postScale(-1f, 1f)
+            if (exif.rotationDegrees != 0) postRotate(exif.rotationDegrees.toFloat())
+        }
+        return try {
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        } catch (_: OutOfMemoryError) {
+            bitmap
+        } catch (_: RuntimeException) {
+            bitmap
         }
     }
 
@@ -640,36 +736,196 @@ class AuraVault(private val context: Context) {
     }
 
     private fun isVaultUri(uri: Uri): Boolean {
-        val path = uri.path?.replace('\\', '/') ?: return false
-        return path.split('/').any { it.equals(VAULT_FOLDER, ignoreCase = false) }
+        val path = uri.path ?: return false
+        return VaultStoragePaths.isVaultPath(path)
     }
 
     private fun dataDirectory(create: Boolean): File? {
-        val root = File(Environment.getExternalStorageDirectory(), VAULT_FOLDER)
-        val data = File(root, DATA_FOLDER)
+        val storageRoot = Environment.getExternalStorageDirectory()
+        val data = VaultStoragePaths.dataDirectory(storageRoot, create) ?: return null
         if (create) {
-            if (!data.exists() && !data.mkdirs()) return null
-            File(root, NO_MEDIA_FILE).runCatchingCreate()
+            File(data.parentFile, NO_MEDIA_FILE).runCatchingCreate()
         }
-        return data.takeIf { it.exists() && it.isDirectory }
+        return data
     }
 
     private fun ensureAvailable() {
         require(available()) {
-            "Для защищённого Избранного включите для Aura Files доступ «Весь накопитель»"
+            "Для Сейфа включите для Aura Files доступ «Весь накопитель»"
         }
     }
 
+    private fun recoverPendingRestores() {
+        restoreJournalStore.list().forEach { record ->
+            val destinationUri = Uri.parse(record.destinationUri)
+            val destination = when (destinationUri.scheme) {
+                "file" -> destinationUri.path?.let { DocumentFile.fromFile(File(it)) }
+                else -> DocumentFile.fromTreeUri(context, destinationUri)
+            } ?: throw IOException("Папка незавершённого восстановления Vault недоступна")
+            DocumentTreeSafety.requireNotFilesystemSymlink(destination, "Восстановление Vault после сбоя")
+            val temporary = findUniqueChildStrict(destination, record.temporaryName)
+            val final = findUniqueChildStrict(destination, record.finalName)
+            val vaultSource = dataDirectory(create = false)?.let { File(it, record.vaultFileName) }
+            val encryptedSourceExists = vaultSource?.isFile == true
+
+            when (record.phase) {
+                VaultRestorePhase.WRITING -> when {
+                    final != null -> throw IOException(
+                        "Журнал восстановления ${record.finalName} противоречив: финальный файл появился до фазы финализации; " +
+                            "Aura ничего не удаляет"
+                    )
+                    temporary != null && !encryptedSourceExists -> throw IOException(
+                        "Найден частичный plaintext ${record.temporaryName}, но зашифрованный оригинал не подтверждён; " +
+                            "Aura ничего не удаляет"
+                    )
+                    temporary != null -> cleanupVaultRestoreTemporary(destination, temporary, record.temporaryName)
+                    !encryptedSourceExists -> throw IOException(
+                        "Не удалось подтвердить ни зашифрованный оригинал, ни временную, ни финальную копию ${record.finalName}; " +
+                            "журнал сохранён для ручной проверки"
+                    )
+                }
+                VaultRestorePhase.FINALIZE_PENDING -> when {
+                    final != null && temporary != null -> throw IOException(
+                        "Одновременно видны финальная и временная копии ${record.finalName}; Aura сохраняет обе и журнал"
+                    )
+                    final != null -> Unit // rename committed before ACK/phase fsync
+                    temporary != null && encryptedSourceExists ->
+                        cleanupVaultRestoreTemporary(destination, temporary, record.temporaryName)
+                    temporary != null -> throw IOException(
+                        "Состояние восстановления ${record.finalName} неоднозначно; временный plaintext сохранён"
+                    )
+                    !encryptedSourceExists -> throw IOException(
+                        "Не удалось подтвердить ни зашифрованный оригинал, ни временную, ни финальную копию ${record.finalName}; " +
+                            "журнал сохранён для ручной проверки"
+                    )
+                }
+                VaultRestorePhase.FINALIZED -> when {
+                    final != null && temporary != null -> throw IOException(
+                        "После подтверждённой финализации одновременно видны две plaintext-копии ${record.finalName}; " +
+                            "Aura ничего не удаляет"
+                    )
+                    final != null -> Unit
+                    temporary != null -> throw IOException(
+                        "Финализация ${record.finalName} была подтверждена, но вместо финального файла виден только staging; " +
+                            "Aura ничего не удаляет"
+                    )
+                    encryptedSourceExists -> Unit // restored file disappeared externally, but encrypted source remains safe
+                    else -> throw IOException(
+                        "После подтверждённой финализации не найдена ни одна копия ${record.finalName}; " +
+                            "журнал сохранён для ручной проверки"
+                    )
+                }
+            }
+            restoreJournalStore.remove(record)
+            releaseRestorePermissionIfOwned(destinationUri, record.releasePersistedPermission)
+        }
+    }
+
+    private fun acquireRestorePermissionIfNeeded(destinationUri: Uri): Boolean {
+        if (destinationUri.scheme != "content") return false
+        val permissionUri = restorePermissionUri(destinationUri)
+        val alreadyPersisted = resolver.persistedUriPermissions.any { permission ->
+            permission.uri == permissionUri && permission.isWritePermission
+        }
+        if (alreadyPersisted) return false
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        try {
+            resolver.takePersistableUriPermission(permissionUri, flags)
+        } catch (error: Exception) {
+            throw IOException(
+                "Провайдер не разрешил сохранить доступ к папке до завершения восстановления; " +
+                    "Aura не создаёт plaintext без возможности очистить его после сбоя",
+                error,
+            )
+        }
+        return true
+    }
+
+    private fun releaseRestorePermissionIfOwned(destinationUri: Uri, owned: Boolean) {
+        if (!owned || destinationUri.scheme != "content") return
+        val permissionUri = restorePermissionUri(destinationUri)
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { resolver.releasePersistableUriPermission(permissionUri, flags) }
+    }
+
+    private fun restorePermissionUri(destinationUri: Uri): Uri {
+        // OpenDocumentTree grants /tree/<id>, whereas DocumentFile exposes
+        // /tree/<id>/document/<id>. Android persists only the exact granted URI.
+        // Keep the destination document in the journal, but acquire/release its
+        // tree grant so the same permission remains usable after process death.
+        if (!DocumentsContract.isTreeUri(destinationUri)) return destinationUri
+        val authority = destinationUri.authority
+            ?: throw IOException("Не удалось определить провайдер выбранной папки")
+        return DocumentsContract.buildTreeDocumentUri(
+            authority,
+            DocumentsContract.getTreeDocumentId(destinationUri),
+        )
+    }
+
+    private enum class VaultRenameOutcome { COMMITTED, NOT_COMMITTED, AMBIGUOUS }
+
+    private fun renameVaultRestoreAndProbe(
+        parent: DocumentFile,
+        temporary: DocumentFile,
+        temporaryName: String,
+        finalName: String,
+    ): VaultRenameOutcome {
+        try {
+            temporary.renameTo(finalName)
+        } catch (_: Exception) {
+            // Reconcile provider lost-ACK below.
+        }
+        val oldProbe = runCatching { findUniqueChildStrict(parent, temporaryName) }
+        val finalProbe = runCatching { findUniqueChildStrict(parent, finalName) }
+        if (oldProbe.isFailure || finalProbe.isFailure) return VaultRenameOutcome.AMBIGUOUS
+        val oldExists = oldProbe.getOrNull() != null
+        val finalExists = finalProbe.getOrNull() != null
+        return when {
+            !oldExists && finalExists -> VaultRenameOutcome.COMMITTED
+            oldExists && !finalExists -> VaultRenameOutcome.NOT_COMMITTED
+            else -> VaultRenameOutcome.AMBIGUOUS
+        }
+    }
+
+    private fun cleanupVaultRestoreTemporary(parent: DocumentFile, temporary: DocumentFile, temporaryName: String) {
+        val existing = findUniqueChildStrict(parent, temporaryName) ?: return
+        if (!DocumentTreeSafety.sameIdentity(existing.uri, temporary.uri)) {
+            throw IOException("Служебное имя $temporaryName уже занято другим объектом; Aura ничего не удаляет")
+        }
+        try {
+            existing.delete()
+        } catch (_: Exception) {
+            // Probe below.
+        }
+        if (findUniqueChildStrict(parent, temporaryName) != null) {
+            throw IOException("Не удалось безопасно удалить временный plaintext $temporaryName")
+        }
+    }
+
+    private fun findUniqueChildStrict(parent: DocumentFile, name: String): DocumentFile? {
+        val matches = FastDocumentListing.listStrict(context, parent).filter { it.name == name }
+        if (matches.size > 1) throw IOException("Имя $name неоднозначно: найдено объектов ${matches.size}")
+        return matches.singleOrNull()?.document
+    }
+
+    private fun allocateRestoreTemporaryName(parent: DocumentFile): String {
+        repeat(VAULT_RESTORE_TEMP_ATTEMPTS) {
+            val candidate = "$VAULT_RESTORE_TEMP_PREFIX${UUID.randomUUID()}"
+            if (findUniqueChildStrict(parent, candidate) == null) return candidate
+        }
+        throw IOException("Не удалось подобрать безопасное служебное имя восстановления")
+    }
+
     private fun uniqueName(parent: DocumentFile, requested: String): String {
-        if (parent.findFile(requested) == null) return requested
+        if (findUniqueChildStrict(parent, requested) == null) return requested
         val dot = requested.lastIndexOf('.')
         val base = if (dot > 0) requested.substring(0, dot) else requested
         val ext = if (dot > 0) requested.substring(dot) else ""
         for (index in 1..9999) {
             val candidate = "$base ($index)$ext"
-            if (parent.findFile(candidate) == null) return candidate
+            if (findUniqueChildStrict(parent, candidate) == null) return candidate
         }
-        return "$base-${System.currentTimeMillis()}$ext"
+        throw IOException("Не удалось подобрать уникальное имя для $requested")
     }
 
     private fun readSizedBytes(input: DataInputStream, expected: Int, label: String): ByteArray {
@@ -689,7 +945,24 @@ class AuraVault(private val context: Context) {
 
     private fun cleanupOld(directory: File) {
         val expiration = System.currentTimeMillis() - TEMP_PLAIN_MAX_AGE_MS
-        directory.listFiles().orEmpty().filter { it.lastModified() < expiration }.forEach(File::delete)
+        directory.listFiles().orEmpty()
+            .filter { it.isFile && it.lastModified() > 0L && it.lastModified() < expiration }
+            .forEach(File::delete)
+    }
+
+    private fun requireCacheSpace(directory: File, expectedBytes: Long) {
+        val usable = directory.usableSpace
+        require(usable > PLAIN_CACHE_SPACE_RESERVE_BYTES) { "Недостаточно свободного места для временного просмотра" }
+        if (expectedBytes > 0L) {
+            require(expectedBytes <= usable - PLAIN_CACHE_SPACE_RESERVE_BYTES) {
+                "Недостаточно свободного места для временного просмотра ${formatBytes(expectedBytes)}"
+            }
+        }
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val mib = bytes.toDouble() / (1024.0 * 1024.0)
+        return if (mib >= 1024.0) "%.1f ГБ".format(mib / 1024.0) else "%.0f МБ".format(mib)
     }
 
     private fun safeName(name: String): String = name
@@ -712,11 +985,14 @@ class AuraVault(private val context: Context) {
     }
 
     companion object {
-        const val VAULT_FOLDER = ".AuraVault"
-        private const val DATA_FOLDER = "data"
+        const val VAULT_FOLDER = VaultStoragePaths.FOLDER
+        const val LEGACY_VAULT_FOLDER = VaultStoragePaths.LEGACY_FOLDER
+        fun isVaultFolder(name: String): Boolean = VaultStoragePaths.isVaultFolder(name)
         private const val NO_MEDIA_FILE = ".nomedia"
         private const val VAULT_EXTENSION = "avf"
         private const val DEFAULT_PLAIN_CACHE_FOLDER = "vault-open"
+        private const val VAULT_RESTORE_TEMP_PREFIX = ".aura-vault-restore-"
+        private const val VAULT_RESTORE_TEMP_ATTEMPTS = 64
         private const val HKDF_ALGORITHM = "HmacSHA256"
         private const val HKDF_HASH_BYTES = 32
         private const val HKDF_INFO = "AuraVault-v1"
@@ -737,6 +1013,7 @@ class AuraVault(private val context: Context) {
         private const val MAX_THUMBNAIL_SAMPLE = 1 shl 15
         private const val MIN_CONTAINER_BYTES = 4 + 1 + GCM_IV_BYTES + 4 + 17 + 4 + 4 + GCM_IV_BYTES + GCM_TAG_BYTES
         private const val TEMP_PLAIN_MAX_AGE_MS = 2L * 60L * 60L * 1000L
+        private const val PLAIN_CACHE_SPACE_RESERVE_BYTES = 256L * 1024L * 1024L
         private const val VAULT_TEMP_MAX_AGE_MS = 24L * 60L * 60L * 1000L
         private val EMPTY_BYTES = ByteArray(0)
         private val THUMBNAIL_AAD = "AuraVault-thumbnail-v2".toByteArray(StandardCharsets.UTF_8)

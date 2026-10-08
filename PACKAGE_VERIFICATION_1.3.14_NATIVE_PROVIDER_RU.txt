@@ -1,0 +1,36 @@
+Aura Files 1.3.14 — package verification
+Date: 2026-09-16
+
+Release identity:
+- versionName = 1.3.14
+- versionCode = 144
+
+Real-device regression addressed:
+- 1.3.13 preflight failed before recipient selection with:
+  "Aura не может прочитать подготовленный APK: Missing android.support.FILE_PROVIDER_PATHS meta-data".
+
+Root-cause correction:
+- outgoing provider no longer extends or imports androidx.core.content.FileProvider;
+- provider is Aura-owned android.content.ContentProvider;
+- manifest no longer contains FILE_PROVIDER_PATHS meta-data or @xml/file_paths;
+- file_paths.xml is removed from the runtime surface;
+- query() returns DISPLAY_NAME/SIZE;
+- getType() explicitly reports APK/APKS MIME and has MimeTypeMap/octet-stream fallback;
+- openFile() is read-only and returns ParcelFileDescriptor for a canonically validated file;
+- URI generation and reverse resolution share the same root policy;
+- traversal, root-confusion and symlink escape are rejected.
+
+Verification performed in container:
+- Python audit harness: all production/release/share checks PASS;
+- stage18j route-policy harness: 2005+ cases PASS, including traversal/symlink fuzz;
+- stage18k native-provider integration harness: URI -> query/getType/openFile round-trip PASS;
+- AuraFileProvider + path policy compile successfully against Android ContentProvider framework-signature stubs;
+- release hygiene run in a clean tracked snapshot: PASS (477 tracked source files including checksum manifest).
+
+Source checksum target: 476 files + SOURCE_SHA256SUMS.txt.
+
+Final device verification required:
+- build on Windows;
+- install Aura Files 1.3.14;
+- SPLIT -> unified APK -> Share;
+- preflight must pass, recipient list must open, Telegram/MAX must receive a non-empty APK attachment.

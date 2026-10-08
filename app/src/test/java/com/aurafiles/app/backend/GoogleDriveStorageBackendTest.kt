@@ -113,6 +113,14 @@ class GoogleDriveStorageBackendTest {
 
         override fun file(fileId: String): GoogleDriveFile? {
             requireAuth()
+            if (fileId == "root") {
+                return GoogleDriveFile(
+                    id = "root",
+                    name = "My Drive",
+                    mimeType = GOOGLE_DRIVE_FOLDER_MIME,
+                    parents = emptyList(),
+                )
+            }
             return files[fileId]
         }
 

@@ -373,10 +373,12 @@ public final class PdfReflowParser {
             byte[] buffer = new byte[32768];
             int total = 0, read;
             while ((read = in.read(buffer)) != -1) {
+                ReaderIoPolicy.throwIfInterrupted("Чтение PDF");
                 total += read;
                 if (total > limit) throw new IOException("PDF слишком большой для текстового разбора (лимит " + (limit / 1024 / 1024) + " МБ)");
                 out.write(buffer, 0, read);
             }
+            ReaderIoPolicy.throwIfInterrupted("Чтение PDF");
             return out.toByteArray();
         }
     }

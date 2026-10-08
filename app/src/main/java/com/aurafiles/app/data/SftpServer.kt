@@ -126,7 +126,7 @@ class SftpServer(
 
         private fun isReservedPath(path: Path): Boolean =
             path.normalize().any { segment ->
-                segment.toString() == AuraVault.VAULT_FOLDER || segment.toString() == AURA_TRASH_FOLDER
+                AuraVault.isVaultFolder(segment.toString()) || segment.toString() == AURA_TRASH_FOLDER
             }
 
         private fun ensureVisible(path: Path) {
@@ -153,7 +153,7 @@ class SftpServer(
             ensureVisible(dir)
             return Files.newDirectoryStream(dir) { child ->
                 val name = child.fileName?.toString()
-                name != AuraVault.VAULT_FOLDER && name != AURA_TRASH_FOLDER
+                name != null && !AuraVault.isVaultFolder(name) && name != AURA_TRASH_FOLDER
             }
         }
 

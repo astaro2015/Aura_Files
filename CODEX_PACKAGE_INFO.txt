@@ -1,16 +1,19 @@
-Aura Files 1.3.4 ALL STORAGE BROWSER — FULL SOURCE — 2026-09-10
+Aura Files 1.3.15 UNIVERSAL APK SOURCE — 2026-09-16
 
 Продолжать от полного дерева этого пакета.
-Читать: 00_CODEX_TASK.md + AURA_1.3.4_CLOUD_CHECKPOINT.md + AURA_1.3.4_ALL_STORAGE_BROWSER_RU.md.
-Cloud OAuth инструкция: CLOUD_SETUP_1.2.4_RU.md.
+Сначала читать: 00_CODEX_TASK.md + AURA_1.3.15_MEDIASTORE_APK_SHARE_CHECKPOINT.md + RELEASE_NOTES_1.3.15_RU.md.
+База safety audit: AURA_1.3.5_AUDIT_CHECKPOINT.md.
 
-Ключевое 1.3.4:
-- на главной «Другие» заменено на прямой вход «Все»;
-- вход не зависит от индекса/анализа и использует штатный full-access root;
-- без MANAGE_EXTERNAL_STORAGE запускается системный flow разрешения;
-- Категория называется «Книги».
+Ключевое 1.3.15:
+- Android 10+ APK handoff через системный MediaStore Downloads на VOLUME_EXTERNAL_PRIMARY;
+- файл сохраняется в Download/Aura Files и передаётся системным content://media URI;
+- MIME для мессенджера — application/octet-stream;
+- ACTION_SEND + EXTRA_STREAM + raw ClipData + read grant;
+- обычный Android Sharesheet, без setPackage/setComponent;
+- MediaStore публикация preflight-проверяется по metadata/MIME/readability;
+- при OEM MediaStore failure используется native Aura ContentProvider fallback;
+- cancellation не поглощается fallback;
+- APKS fallback и Universal APK merge/sign/verify сохранены.
 
-Сохранять без регрессий 1.3.3 SMB standard browser, 1.3.2 Vault AVF2/preview, 1.3.0 SPLIT/APKS export/install, cloud backends/OAuth, Images catalog paging и transfer/trash safety.
-Версия: 1.3.4 (versionCode 134).
-
-Compile fix 1.3.2 сохранён: external FileRepository.TRASH_FOLDER references не возвращать; использовать module-internal AURA_TRASH_FOLDER.
+Версия: 1.3.15 (versionCode 145).
+Финальный Android clean build выполнить BUILD_RELEASE_WINDOWS.bat; container audit его не заменяет.

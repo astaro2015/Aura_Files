@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
 import android.app.AlertDialog
 import android.app.PictureInPictureParams
 import android.content.ComponentName
@@ -25,7 +26,6 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import androidx.core.graphics.Insets
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -224,7 +224,9 @@ class MediaPlayerActivity : ComponentActivity() {
             val items = if (sessionMedia.isNotEmpty()) {
                 sessionMedia.map { item -> mediaItem(item.uri, item.name) }
             } else {
-                withContext(Dispatchers.IO) { neighboringMedia(parentUri, openedUri, currentName, audioOnly) }
+                loadOptionalNeighbors(listOf(currentItem)) {
+                    withContext(Dispatchers.IO) { neighboringMedia(parentUri, openedUri, currentName, audioOnly) }
+                }
             }
             if (items.size <= 1 || player !== attached) return@launch
             if (attached.currentMediaItem?.mediaId != openedUri.toString()) return@launch
@@ -417,7 +419,7 @@ class MediaPlayerActivity : ComponentActivity() {
     private fun externallyReadableUri(uri: Uri): Uri {
         if (uri.scheme != ContentResolver.SCHEME_FILE) return uri
         val path = requireNotNull(uri.path) { "Не удалось определить путь файла" }
-        return FileProvider.getUriForFile(this, "$packageName.fileprovider", File(path))
+        return AuraFileProvider.uriForFile(this, File(path))
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()

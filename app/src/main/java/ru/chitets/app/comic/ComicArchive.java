@@ -19,6 +19,8 @@ import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+import ru.chitets.app.parser.ReaderIoPolicy;
+
 public final class ComicArchive {
     private static final int MAX_PAGES = 5000;
     private static final long MAX_ARCHIVE_BYTES = 768L * 1024L * 1024L;
@@ -56,6 +58,7 @@ public final class ComicArchive {
             if (images.size() > MAX_PAGES) throw new IOException("Слишком много страниц в CBZ");
             long total = 0;
             for (int i = 0; i < images.size(); i++) {
+                ReaderIoPolicy.throwIfInterrupted("Распаковка CBZ");
                 ZipEntry entry = images.get(i);
                 File target = new File(pagesDir, pageName(i, extension(entry.getName())));
                 try (InputStream in = zip.getInputStream(entry)) {
@@ -78,6 +81,7 @@ public final class ComicArchive {
             if (entries.size() > MAX_PAGES) throw new IOException("Слишком много страниц в CBR");
             long total = 0;
             for (int i = 0; i < entries.size(); i++) {
+                ReaderIoPolicy.throwIfInterrupted("Распаковка CBR");
                 RarEntryData entry = entries.get(i);
                 File target = new File(pagesDir, pageName(i, extension(entry.name)));
                 try (InputStream in = archive.getInputStream(entry.header)) {
@@ -95,6 +99,7 @@ public final class ComicArchive {
             byte[] buffer = new byte[32768];
             int read;
             while ((read = in.read(buffer)) != -1) {
+                ReaderIoPolicy.throwIfInterrupted("Распаковка страницы комикса");
                 written += read;
                 if (written > remaining) throw new IOException("Превышен размер распакованного комикса");
                 out.write(buffer, 0, read);
@@ -111,6 +116,7 @@ public final class ComicArchive {
             long total = 0;
             int read;
             while ((read = in.read(buffer)) != -1) {
+                ReaderIoPolicy.throwIfInterrupted("Кэширование комикса");
                 total += read;
                 if (total > MAX_ARCHIVE_BYTES) throw new IOException("Архив комикса слишком большой");
                 out.write(buffer, 0, read);

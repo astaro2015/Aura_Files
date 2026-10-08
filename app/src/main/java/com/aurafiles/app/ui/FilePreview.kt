@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -13,6 +14,7 @@ import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.exifinterface.media.ExifInterface
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.rememberScrollState
@@ -170,11 +172,19 @@ private fun PreviewBody(entry: FileEntry, onOpenExternal: () -> Unit, modifier: 
 @Composable
 private fun BitmapPreview(entry: FileEntry, modifier: Modifier) {
     val context = LocalContext.current
-    val bitmap by produceState<Bitmap?>(initialValue = null, entry.uri, entry.modifiedAt) {
-        value = withContext(Dispatchers.IO) { runCatching { loadImage(context, entry) }.getOrNull() }
+    val result by produceState<Result<Bitmap>?>(initialValue = null, entry.uri, entry.modifiedAt) {
+        value = withContext(Dispatchers.IO) { runCatching { loadImage(context, entry) } }
     }
     Box(modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerLowest), contentAlignment = Alignment.Center) {
-        if (bitmap == null) CircularProgressIndicator() else ZoomableImage(bitmap!!)
+        when {
+            result == null -> CircularProgressIndicator()
+            result!!.isSuccess -> ZoomableImage(result!!.getOrThrow())
+            else -> Text(
+                "Не удалось показать изображение: ${result!!.exceptionOrNull()?.message ?: "повреждённый или неподдерживаемый файл"}",
+                modifier = Modifier.padding(24.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -214,18 +224,26 @@ private fun ZoomableImage(bitmap: Bitmap) {
 private fun PdfPreview(entry: FileEntry, modifier: Modifier) {
     val context = LocalContext.current
     var pageIndex by remember(entry.uri) { mutableIntStateOf(0) }
-    val page by produceState<PdfPage?>(initialValue = null, entry.uri, pageIndex) {
-        value = withContext(Dispatchers.IO) { runCatching { renderPdfPage(context, entry, pageIndex) }.getOrNull() }
+    val result by produceState<Result<PdfPage>?>(initialValue = null, entry.uri, pageIndex) {
+        value = withContext(Dispatchers.IO) { runCatching { renderPdfPage(context, entry, pageIndex) } }
     }
+    val page = result?.getOrNull()
     Column(modifier.fillMaxSize()) {
         Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-            if (page == null) CircularProgressIndicator()
-            else Image(
-                bitmap = page!!.bitmap.asImageBitmap(),
-                contentDescription = "Страница ${pageIndex + 1}",
-                modifier = Modifier.fillMaxSize().padding(8.dp),
-                contentScale = ContentScale.Fit,
-            )
+            when {
+                result == null -> CircularProgressIndicator()
+                page != null -> Image(
+                    bitmap = page.bitmap.asImageBitmap(),
+                    contentDescription = "Страница ${pageIndex + 1}",
+                    modifier = Modifier.fillMaxSize().padding(8.dp),
+                    contentScale = ContentScale.Fit,
+                )
+                else -> Text(
+                    "Не удалось показать PDF: ${result!!.exceptionOrNull()?.message ?: "повреждённый или неподдерживаемый файл"}",
+                    modifier = Modifier.padding(24.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
         val count = page?.count ?: 1
         Row(
@@ -251,9 +269,7 @@ private fun TextPreview(entry: FileEntry, modifier: Modifier) {
         value = withContext(Dispatchers.IO) {
             runCatching {
                 context.contentResolver.openInputStream(entry.uri)?.bufferedReader()?.use { reader ->
-                    val buffer = CharArray(MAX_TEXT_PREVIEW_CHARS)
-                    val count = reader.read(buffer)
-                    if (count <= 0) "" else String(buffer, 0, count) + if (count == buffer.size) "\n\n…предпросмотр ограничен…" else ""
+                    readTextPreview(reader)
                 } ?: throw IOException("Не удалось прочитать файл")
             }.getOrElse { "Не удалось показать текст: ${it.message}" }
         }
@@ -448,7 +464,34 @@ private fun decodeSampledImage(
     } catch (_: OutOfMemoryError) {
         null
     } ?: return null
-    return ensureBitmapWithin(decoded, requestedEdge)
+    val oriented = applyExifOrientation(context, entry.uri, decoded)
+    return ensureBitmapWithin(oriented, requestedEdge)
+}
+
+private fun applyExifOrientation(context: Context, uri: Uri, bitmap: Bitmap): Bitmap {
+    val exif = runCatching {
+        if (uri.scheme == "file") {
+            ExifInterface(requireNotNull(uri.path))
+        } else {
+            val descriptor = context.contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IOException("Не удалось открыть EXIF")
+            descriptor.use { ExifInterface(it.fileDescriptor) }
+        }
+    }.getOrNull() ?: return bitmap
+    if (exif.rotationDegrees == 0 && !exif.isFlipped) return bitmap
+    val matrix = Matrix().apply {
+        if (exif.isFlipped) postScale(-1f, 1f)
+        if (exif.rotationDegrees != 0) postRotate(exif.rotationDegrees.toFloat())
+    }
+    return try {
+        Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true).also { transformed ->
+            if (transformed !== bitmap) bitmap.recycle()
+        }
+    } catch (_: OutOfMemoryError) {
+        bitmap
+    } catch (_: RuntimeException) {
+        bitmap
+    }
 }
 
 private fun ensureBitmapWithin(bitmap: Bitmap, edge: Int): Bitmap {
@@ -499,17 +542,15 @@ private fun openDescriptor(context: Context, uri: Uri): ParcelFileDescriptor {
     }
 }
 
-private fun isImage(entry: FileEntry) = entry.mimeType?.startsWith("image/") == true ||
-    entry.name.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp", "gif", "heic")
+private fun isImage(entry: FileEntry) = isPreviewImage(entry.name, entry.mimeType)
 
-private fun isVideo(entry: FileEntry) = entry.mimeType?.startsWith("video/") == true
-private fun isAudio(entry: FileEntry) = entry.mimeType?.startsWith("audio/") == true
+private fun isVideo(entry: FileEntry) = isPreviewVideo(entry.name, entry.mimeType)
+private fun isAudio(entry: FileEntry) = isPreviewAudio(entry.name, entry.mimeType)
 private fun isPdf(entry: FileEntry) = entry.mimeType == "application/pdf" || entry.name.endsWith(".pdf", true)
 private fun isText(entry: FileEntry) = entry.mimeType?.startsWith("text/") == true ||
     entry.name.substringAfterLast('.', "").lowercase() in setOf("txt", "md", "json", "xml", "csv", "log", "kt", "java", "c", "cpp", "h")
 
 private data class PdfPage(val bitmap: Bitmap, val count: Int)
-private const val MAX_TEXT_PREVIEW_CHARS = 300_000
 private const val MAX_IMAGE_EDGE = 2_048
 private const val PDF_TARGET_WIDTH = 1_400
 private const val PDF_MAX_SCALE = 2.5f

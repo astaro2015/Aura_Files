@@ -39,6 +39,7 @@ import com.aurafiles.app.index.StorageIndexer
 import com.aurafiles.app.model.FileEntry
 import com.aurafiles.app.tools.SimilarPhotoFinder
 import com.aurafiles.app.ui.theme.AuraFilesTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -68,8 +69,8 @@ private fun SimilarPhotosScreen(onClose: () -> Unit) {
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
-        runCatching {
-            withContext(Dispatchers.IO) {
+        try {
+            result = withContext(Dispatchers.IO) {
                 val repository = FileRepository(context)
                 val root = repository.restoreRoot() ?: error("Сначала подключите локальное хранилище")
                 val indexer = StorageIndexer(context)
@@ -88,8 +89,11 @@ private fun SimilarPhotosScreen(onClose: () -> Unit) {
                     }
                 }
             }
-        }.onSuccess { result = it }
-            .onFailure { error = it.message ?: "Не удалось найти похожие фотографии" }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            error = failure.message ?: "Не удалось найти похожие фотографии"
+        }
     }
 
     Column(Modifier.fillMaxSize().padding(12.dp)) {

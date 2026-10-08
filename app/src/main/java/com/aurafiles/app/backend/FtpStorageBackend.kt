@@ -37,9 +37,12 @@ class FtpStorageBackend(
             return@synchronized StorageItem(descriptor.id, "/", descriptor.title, true)
         }
         val ftp = requireClient()
-        val parent = remotePath(parent(normalized))
-        ftp.listFiles(remotePath(normalized)).firstOrNull()?.takeIf { it.name != "." && it.name != ".." }?.toItem(parent)
-            ?: ftp.listFiles(parent).firstOrNull { it.name == BackendPath.name(normalized) }?.toItem(parent)
+        val parentPath = parent(normalized)
+        val remoteParent = remotePath(parentPath)
+        // Listing the object path itself can make some FTP servers follow a directory
+        // symlink and return its children. Resolve the entry from its parent listing so
+        // the link remains a link and recursive operations never enter its target.
+        ftp.listFiles(remoteParent).firstOrNull { it.name == BackendPath.name(normalized) }?.toItem(parentPath)
     }
 
     override suspend fun openRead(path: String): StorageReadHandle {
@@ -210,14 +213,17 @@ class FtpStorageBackend(
 
     private fun FTPFile.toItem(parentPath: String): StorageItem {
         val normalizedParent = normalize(parentPath)
+        val link = isSymbolicLink
+        val directory = isDirectory && !link
         return StorageItem(
             backendId = descriptor.id,
             path = child(normalizedParent, name),
             name = name,
-            isDirectory = isDirectory,
-            size = if (isFile) size.coerceAtLeast(0L) else 0L,
+            isDirectory = directory,
+            size = if (isFile && !link) size.coerceAtLeast(0L) else 0L,
             modifiedAt = timestampInstant?.toEpochMilli() ?: 0L,
-            mimeType = if (isDirectory) null else BackendPath.guessMime(name),
+            mimeType = if (directory) null else BackendPath.guessMime(name),
+            isLink = link,
         )
     }
 

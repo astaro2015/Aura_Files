@@ -15,6 +15,7 @@ import com.aurafiles.app.cloud.google.presentedName
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.Base64
+import kotlinx.coroutines.CancellationException
 
 class GoogleDriveStorageBackend(
     private val profile: CloudProfile,
@@ -31,11 +32,17 @@ class GoogleDriveStorageBackend(
         require(profile.provider == CloudProvider.GOOGLE_DRIVE) { "Cloud-профиль относится не к Google Drive" }
     }
 
+    @Volatile
+    private var rootFolderIdCache: String? = null
+
     override suspend fun list(path: String): List<StorageItem> {
         val normalized = normalize(path)
         val parentId = resolveDirectoryId(normalized)
         return authorizedApi { listChildren(parentId) }
+            .asSequence()
+            .filterNot { it.trashed }
             .map { toStorageItem(it, normalized) }
+            .toList()
     }
 
     override suspend fun stat(path: String): StorageItem? {
@@ -53,7 +60,7 @@ class GoogleDriveStorageBackend(
         return when {
             segment.startsWith(ID_PREFIX) -> {
                 val id = decodeSegment(segment.removePrefix(ID_PREFIX)) ?: return null
-                authorizedApi { file(id) }?.let { toStorageItem(it, parentPath) }
+                resolveIdFileInParent(id, parentPath)?.let { toStorageItem(it, parentPath) }
             }
             segment.startsWith(NAME_PREFIX) -> {
                 val displayName = decodeSegment(segment.removePrefix(NAME_PREFIX)) ?: return null
@@ -150,7 +157,21 @@ class GoogleDriveStorageBackend(
         val parentPath = parent(normalized)
         val parentId = resolveDirectoryId(parentPath)
         val name = displayNameFromPath(normalized)
-        val created = authorizedApi { createFolder(parentId, name) }
+        val created = try {
+            authorizedApi { createFolder(parentId, name) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!mayHaveCommitted(error)) throw error
+            val probe = probePresentedName(parentId, name)
+            if (probe.known && probe.file?.isDirectory == true) {
+                return toStorageItem(requireNotNull(probe.file), parentPath)
+            }
+            throw ambiguousMutation(
+                "Google Drive не подтвердил создание папки $name. Aura не повторяет команду автоматически, чтобы не создать дубль.",
+                error,
+            )
+        }
         return toStorageItem(created, parentPath)
     }
 
@@ -161,12 +182,35 @@ class GoogleDriveStorageBackend(
         val parentPath = parent(normalized)
         val requestedDisplayName = decodeNameArgument(newName)
         val providerName = providerNameForRename(file, requestedDisplayName)
+        if (providerName == file.name && requestedDisplayName == file.presentedName()) {
+            return toStorageItem(file, parentPath)
+        }
         val collisionPath = child(parentPath, requestedDisplayName)
         val collision = stat(collisionPath)
         if (collision != null && resolveFile(collision.path)?.id != file.id) {
             throw IOException("$requestedDisplayName уже существует")
         }
-        val renamed = authorizedApi { rename(file.id, providerName) }
+        val renamed = try {
+            authorizedApi { rename(file.id, providerName) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!mayHaveCommitted(error)) throw error
+            val probe = probeFileLocation(file.id, parentPath)
+            when {
+                probe.known && probe.file != null && probe.inExpectedParent && !probe.file.trashed && probe.file.name == providerName -> {
+                    return toStorageItem(probe.file, parentPath)
+                }
+                probe.known && probe.file != null && probe.inExpectedParent && !probe.file.trashed && probe.file.name == file.name -> {
+                    throw error
+                }
+                else -> throw ambiguousMutation(
+                    "Google Drive не подтвердил переименование $requestedDisplayName, а текущее состояние объекта неоднозначно. " +
+                        "Aura не повторяет mutation автоматически.",
+                    error,
+                )
+            }
+        }
         return toStorageItem(renamed, parentPath)
     }
 
@@ -174,14 +218,40 @@ class GoogleDriveStorageBackend(
         val normalized = normalize(path)
         require(normalized != "/") { "Нельзя перемещать корень Google Drive" }
         val file = resolveFile(normalized) ?: throw IOException("Объект Google Drive не найден")
+        val sourceParentPath = parent(normalized)
         val destinationPath = normalize(destinationDirectory)
         val destinationParentId = resolveDirectoryId(destinationPath)
+        if (destinationParentId in file.parents) {
+            throw IOException("${file.presentedName()} уже находится в этой папке")
+        }
         val displayedName = file.presentedName()
         val collision = stat(child(destinationPath, displayedName))
         if (collision != null && resolveFile(collision.path)?.id != file.id) {
             throw IOException("$displayedName уже существует в папке назначения")
         }
-        val moved = authorizedApi { move(file.id, destinationParentId, file.parents) }
+        val moved = try {
+            authorizedApi { move(file.id, destinationParentId, file.parents) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!mayHaveCommitted(error)) throw error
+            val destinationProbe = probeFileLocation(file.id, destinationPath)
+            if (destinationProbe.known && destinationProbe.file != null && destinationProbe.inExpectedParent && !destinationProbe.file.trashed) {
+                return toStorageItem(destinationProbe.file, destinationPath)
+            }
+            val sourceProbe = probeFileLocation(file.id, sourceParentPath)
+            if (
+                sourceProbe.known && sourceProbe.file != null && sourceProbe.inExpectedParent && !sourceProbe.file.trashed &&
+                destinationProbe.known && !destinationProbe.inExpectedParent
+            ) {
+                throw error
+            }
+            throw ambiguousMutation(
+                "Google Drive не подтвердил перемещение $displayedName, а parent membership после ошибки неоднозначен. " +
+                    "Aura не запускает повторное перемещение автоматически.",
+                error,
+            )
+        }
         return toStorageItem(moved, destinationPath)
     }
 
@@ -193,7 +263,23 @@ class GoogleDriveStorageBackend(
             throw IOException("Папка не пуста")
         }
         // The file manager does not expose a Google trash view; normal delete remains recoverable in Google Drive itself.
-        authorizedApi { trash(file.id) }
+        try {
+            authorizedApi { trash(file.id) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (!mayHaveCommitted(error)) throw error
+            val probe = probeRawFile(file.id)
+            when {
+                probe.known && (probe.file == null || probe.file.trashed) -> return
+                probe.known && probe.file != null && !probe.file.trashed -> throw error
+                else -> throw ambiguousMutation(
+                    "Google Drive не подтвердил удаление ${file.presentedName()}, и состояние объекта проверить не удалось. " +
+                        "Aura не повторяет удаление автоматически.",
+                    error,
+                )
+            }
+        }
     }
 
     override suspend fun ping(): Boolean = runCatching {
@@ -213,7 +299,7 @@ class GoogleDriveStorageBackend(
 
     private suspend fun resolveDirectoryId(path: String): String {
         val normalized = normalize(path)
-        if (normalized == "/") return ROOT_ID
+        if (normalized == "/") return rootFolderId()
         val file = resolveFile(normalized) ?: throw IOException("Папка Google Drive не найдена")
         if (!file.isDirectory) throw IOException("${file.presentedName()} не является папкой")
         return file.id
@@ -221,14 +307,63 @@ class GoogleDriveStorageBackend(
 
     private suspend fun resolveFile(path: String): GoogleDriveFile? {
         val normalized = normalize(path)
-        if (normalized == "/") return GoogleDriveFile(ROOT_ID, descriptor.title, GOOGLE_FOLDER_MIME)
+        if (normalized == "/") return GoogleDriveFile(rootFolderId(), descriptor.title, GOOGLE_FOLDER_MIME)
         val segment = BackendPath.name(normalized)
         if (segment.startsWith(ID_PREFIX)) {
             val id = decodeSegment(segment.removePrefix(ID_PREFIX)) ?: return null
-            return authorizedApi { file(id) }
+            return resolveIdFileInParent(id, parent(normalized))
         }
         val parentId = resolveDirectoryId(parent(normalized))
         return findByPresentedName(parentId, displayNameFromPath(normalized))
+    }
+
+    private suspend fun rootFolderId(): String {
+        rootFolderIdCache?.let { return it }
+        val root = authorizedApi { file(ROOT_ID) }
+            ?: throw IOException("Корень Google Drive не найден")
+        if (root.trashed || !root.isDirectory) throw IOException("Google Drive вернул некорректный корень")
+        return root.id.also { rootFolderIdCache = it }
+    }
+
+    private suspend fun resolveIdFileInParent(fileId: String, parentPath: String): GoogleDriveFile? {
+        val file = authorizedApi { file(fileId) } ?: return null
+        if (file.trashed) return null
+        val expectedParentId = resolveDirectoryId(parentPath)
+        return file.takeIf { expectedParentId in it.parents }
+    }
+
+    private suspend fun probeRawFile(fileId: String): GoogleFileProbe = try {
+        GoogleFileProbe(known = true, file = authorizedApi { file(fileId) })
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        GoogleFileProbe(known = false, file = null)
+    }
+
+    private suspend fun probeFileLocation(fileId: String, parentPath: String): GoogleFileProbe = try {
+        val file = authorizedApi { file(fileId) }
+        if (file == null) {
+            GoogleFileProbe(known = true, file = null, inExpectedParent = false)
+        } else {
+            val expectedParentId = resolveDirectoryId(parentPath)
+            GoogleFileProbe(
+                known = true,
+                file = file,
+                inExpectedParent = !file.trashed && expectedParentId in file.parents,
+            )
+        }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        GoogleFileProbe(known = false, file = null)
+    }
+
+    private suspend fun probePresentedName(parentId: String, displayName: String): GoogleFileProbe = try {
+        GoogleFileProbe(known = true, file = findByPresentedName(parentId, displayName))
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        GoogleFileProbe(known = false, file = null)
     }
 
     private suspend fun findByPresentedName(parentId: String, displayName: String): GoogleDriveFile? {
@@ -237,11 +372,11 @@ class GoogleDriveStorageBackend(
         // Name-based filesystem operations must never silently select one of those objects.
         val matches = linkedMapOf<String, GoogleDriveFile>()
         authorizedApi { findChildren(parentId, displayName) }
-            .filter { it.presentedName() == displayName }
+            .filter { !it.trashed && it.presentedName() == displayName }
             .forEach { matches[it.id] = it }
         for ((baseName, mimeType) in exportBaseCandidates(displayName)) {
             authorizedApi { findChildren(parentId, baseName) }
-                .filter { it.mimeType == mimeType && it.presentedName() == displayName }
+                .filter { !it.trashed && it.mimeType == mimeType && it.presentedName() == displayName }
                 .forEach { matches[it.id] = it }
         }
         if (matches.size > 1) {
@@ -338,6 +473,23 @@ class GoogleDriveStorageBackend(
             apiFactory(fresh).block()
         }
     }
+
+    private fun mayHaveCommitted(error: Throwable): Boolean {
+        val drive = error as? GoogleDriveApiException ?: return true
+        return drive.kind in setOf(
+            GoogleDriveFailureKind.NETWORK,
+            GoogleDriveFailureKind.SERVER,
+            GoogleDriveFailureKind.BAD_RESPONSE,
+        )
+    }
+
+    private fun ambiguousMutation(message: String, cause: Throwable): IOException = IOException(message, cause)
+
+    private data class GoogleFileProbe(
+        val known: Boolean,
+        val file: GoogleDriveFile?,
+        val inExpectedParent: Boolean = false,
+    )
 
     private fun encodeSegment(value: String): String = Base64.getUrlEncoder().withoutPadding()
         .encodeToString(value.toByteArray(StandardCharsets.UTF_8))

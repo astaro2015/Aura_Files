@@ -33,11 +33,11 @@ import java.util.concurrent.Executors;
 import ru.chitets.app.djvu.DjvuDocument;
 import ru.chitets.app.djvu.DjvuException;
 import ru.chitets.app.djvu.DjvuRenderer;
+import ru.chitets.app.parser.ReaderIoPolicy;
 import ru.chitets.app.store.ReadingPrefs;
 
 /** Native pure-Java DjVu reader. No WebView/Rust/WASM runtime is required. */
 public final class DjvuActivity extends Activity {
-    private static final int MAX_BOOK_BYTES = 512 * 1024 * 1024;
 
     private Uri uri;
     private String uriText;
@@ -178,7 +178,9 @@ public final class DjvuActivity extends Activity {
                     renderPage(currentPage);
                 });
             } catch (Throwable error) {
-                runOnUiThread(() -> showFatal(readable(error)));
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed()) showFatal(readable(error));
+                });
             }
         });
     }
@@ -186,15 +188,22 @@ public final class DjvuActivity extends Activity {
     private byte[] readBook(Uri source) throws IOException, DjvuException {
         try (InputStream in = getContentResolver().openInputStream(source)) {
             if (in == null) throw new IOException("Не удалось открыть поток файла");
-            ByteArrayOutputStream out = new ByteArrayOutputStream(4 * 1024 * 1024);
+            long limit = ReaderIoPolicy.safeDjvuSourceBytes();
+            ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(4L * 1024L * 1024L, limit));
             byte[] buffer = new byte[128 * 1024];
-            int total = 0, n;
+            long total = 0;
+            int n;
             while ((n = in.read(buffer)) >= 0) {
+                ReaderIoPolicy.throwIfInterrupted("Чтение DjVu");
                 if (n == 0) continue;
                 total += n;
-                if (total > MAX_BOOK_BYTES) throw new DjvuException("DjVu: файл больше 512 МБ; текущий Java-декодер не загружает такие книги целиком в память");
+                if (total > limit) {
+                    throw new DjvuException("DjVu слишком большой для безопасной загрузки в память на этом устройстве (лимит около "
+                            + Math.max(1L, limit / (1024L * 1024L)) + " МБ)");
+                }
                 out.write(buffer, 0, n);
             }
+            ReaderIoPolicy.throwIfInterrupted("Чтение DjVu");
             return out.toByteArray();
         }
     }
@@ -243,7 +252,11 @@ public final class DjvuActivity extends Activity {
                     ReadingPrefs.setDjvuPage(this, uriText, page, pageCount);
                 });
             } catch (Throwable error) {
-                runOnUiThread(() -> { if (serial == renderSerial) showFatal("Страница " + (page + 1) + ": " + readable(error)); });
+                runOnUiThread(() -> {
+                    if (!isFinishing() && !isDestroyed() && serial == renderSerial) {
+                        showFatal("Страница " + (page + 1) + ": " + readable(error));
+                    }
+                });
             }
         });
     }

@@ -38,7 +38,7 @@ class BackendTransferCore(
             val backend = registry.require(source.backendId)
             val item = backend.stat(source.path)
                 ?: throw IOException("Источник ${source.name} больше не существует")
-            val measure = measure(backend, item, controller, stats, onProgress)
+            val measure = measure(backend, item, controller, stats, onProgress, depth = 0)
             stats.measures[source.key] = measure
         }
 
@@ -51,7 +51,23 @@ class BackendTransferCore(
                     ?: throw IOException("Источник ${source.name} больше не существует")
                 when (request.type) {
                     TransferType.DELETE -> {
-                        backend.delete(item.path, recursive = item.isDirectory)
+                        try {
+                            backend.delete(item.path, recursive = item.isDirectory)
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (error: Throwable) {
+                            val probe = probeStat(backend, item.path)
+                            when {
+                                probe.known && probe.item == null ->
+                                    stats.warnings += "Сервер вернул ошибку удаления ${item.name}, но повторная проверка подтвердила, что объект уже удалён"
+                                probe.known && probe.item != null -> throw error
+                                else -> throw IOException(
+                                    "Сервер не позволил подтвердить удаление ${item.name}; состояние неизвестно. " +
+                                        "Aura не повторяет удаление автоматически — проверьте исходную папку.",
+                                    error,
+                                )
+                            }
+                        }
                         stats.complete(stats.measures[source.key] ?: Measure(1, source.size.coerceAtLeast(0L)))
                         stats.currentName = item.name
                         onProgress(stats.progress(TransferState.RUNNING))
@@ -72,9 +88,25 @@ class BackendTransferCore(
                         }
                         val targetCollision = destinationBackend.stat(destinationBackend.child(destinationDirectory, item.name))
                         if (request.type == TransferType.MOVE && sameBackend && targetCollision == null) {
-                            val fastMoved = runCatching {
+                            val fastTargetPath = destinationBackend.child(destinationDirectory, item.name)
+                            val fastMoved = try {
                                 backend.move(item.path, destinationDirectory)
-                            }.getOrNull()
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                when (val outcome = probeRenameOutcome(backend, item.path, fastTargetPath)) {
+                                    is RenameOutcome.Committed -> {
+                                        stats.warnings += "Сервер не подтвердил перемещение ${item.name}, но повторная проверка показала, что оно завершено"
+                                        outcome.target
+                                    }
+                                    RenameOutcome.NotCommitted -> null
+                                    RenameOutcome.Ambiguous -> throw IOException(
+                                        "Сервер не подтвердил перемещение ${item.name}, а состояние исходной и целевой папок неоднозначно. " +
+                                            "Aura не запускает copy+delete автоматически; проверьте обе папки.",
+                                        error,
+                                    )
+                                }
+                            }
                             if (fastMoved != null) {
                                 stats.complete(stats.measures[source.key] ?: Measure(1, item.size.coerceAtLeast(0L)))
                                 stats.currentName = item.name
@@ -94,10 +126,28 @@ class BackendTransferCore(
                             policyState = policyState,
                             resolveConflict = resolveConflict,
                             onProgress = onProgress,
+                            depth = 0,
                         )
                         if (request.type == TransferType.MOVE && result.copied) {
                             controller.checkpoint()
-                            backend.delete(item.path, recursive = item.isDirectory)
+                            try {
+                                backend.delete(item.path, recursive = item.isDirectory)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                val probe = probeStat(backend, item.path)
+                                when {
+                                    probe.known && probe.item == null -> {
+                                        stats.warnings += "Сервер не подтвердил удаление исходника ${item.name}, но повторная проверка показала, что он уже удалён"
+                                    }
+                                    probe.known && probe.item != null -> {
+                                        stats.warnings += "${item.name} скопирован в назначение, но исходник удалить не удалось; оставлены обе копии"
+                                    }
+                                    else -> {
+                                        stats.warnings += "${item.name} скопирован в назначение, но сервер не позволил подтвердить удаление исходника; проверьте исходную папку"
+                                    }
+                                }
+                            }
                         }
                     }
                     else -> throw IOException("Тип ${request.type} не поддержан для универсального Backend")
@@ -126,8 +176,10 @@ class BackendTransferCore(
         controller: TransferController,
         stats: Stats,
         onProgress: (TransferProgress) -> Unit,
+        depth: Int,
     ): Measure {
         controller.checkpoint()
+        requireDepth(depth, item)
         stats.currentName = item.name
         var count = 1
         var bytes = if (item.isDirectory) 0L else item.size.coerceAtLeast(0L)
@@ -136,7 +188,7 @@ class BackendTransferCore(
         onProgress(stats.progress(TransferState.PREPARING))
         if (item.isDirectory && !item.isLink) {
             backend.list(item.path).forEach { child ->
-                val nested = measure(backend, child, controller, stats, onProgress)
+                val nested = measure(backend, child, controller, stats, onProgress, depth + 1)
                 count += nested.items
                 bytes += nested.bytes
             }
@@ -155,8 +207,10 @@ class BackendTransferCore(
         policyState: PolicyState,
         resolveConflict: suspend (TransferConflict) -> TransferConflictDecision,
         onProgress: (TransferProgress) -> Unit,
+        depth: Int,
     ): CopyOutcome {
         controller.checkpoint()
+        requireDepth(depth, source)
         stats.currentName = source.name
         if (source.isLink) {
             throw IOException("Ссылки, ярлыки и junction нельзя копировать между хранилищами как обычные файлы")
@@ -170,7 +224,7 @@ class BackendTransferCore(
             resolveConflict,
         )
         if (decision.skip) {
-            val skipped = countNode(sourceBackend, source, controller)
+            val skipped = countNode(sourceBackend, source, controller, depth)
             stats.skippedItems += skipped.items
             stats.processedBytes += skipped.bytes
             onProgress(stats.progress(TransferState.RUNNING))
@@ -190,6 +244,7 @@ class BackendTransferCore(
                 policyState,
                 resolveConflict,
                 onProgress,
+                depth,
             )
         }
         return copyFileAtomic(
@@ -216,11 +271,11 @@ class BackendTransferCore(
         policyState: PolicyState,
         resolveConflict: suspend (TransferConflict) -> TransferConflictDecision,
         onProgress: (TransferProgress) -> Unit,
+        depth: Int,
     ): CopyOutcome {
         val finalName = decision.name
         val finalPath = destinationBackend.child(destinationDirectory, finalName)
-        val workingName = ".aura-dir-${UUID.randomUUID()}"
-        val workingPath = destinationBackend.child(destinationDirectory, workingName)
+        val workingPath = allocateTemporaryPath(destinationBackend, destinationDirectory, ".aura-dir-")
         destinationBackend.mkdir(workingPath)
         var committed = false
         try {
@@ -238,17 +293,21 @@ class BackendTransferCore(
                     policyState,
                     resolveConflict,
                     onProgress,
+                    depth + 1,
                 )
             }
+            controller.checkpoint()
             if (decision.replace) {
                 swapIntoPlace(destinationBackend, workingPath, finalPath, source.name)?.let(stats.warnings::add)
             } else {
-                destinationBackend.rename(workingPath, finalName)
+                finalizeWithoutReplace(destinationBackend, workingPath, finalPath, source.name)?.let(stats.warnings::add)
             }
             committed = true
             return CopyOutcome(true)
         } catch (error: Throwable) {
-            if (!committed) runCatching { destinationBackend.delete(workingPath, recursive = true) }
+            if (!committed && error !is PreserveTemporaryException) {
+                runCatching { destinationBackend.delete(workingPath, recursive = true) }
+            }
             throw error
         }
     }
@@ -264,7 +323,7 @@ class BackendTransferCore(
         onProgress: (TransferProgress) -> Unit,
     ): CopyOutcome {
         val finalPath = destinationBackend.child(destinationDirectory, decision.name)
-        val temporaryPath = destinationBackend.child(destinationDirectory, ".aura-part-${UUID.randomUUID()}")
+        val temporaryPath = allocateTemporaryPath(destinationBackend, destinationDirectory, ".aura-part-")
         stats.currentItemBytes = 0L
         stats.currentItemTotalBytes = source.size.coerceAtLeast(0L)
         var written = 0L
@@ -299,10 +358,12 @@ class BackendTransferCore(
             if (source.size > 0L && written != source.size) {
                 throw IOException("Записано $written из ${source.size} байт для ${source.name}")
             }
+            controller.checkpoint()
             if (decision.replace) {
                 swapIntoPlace(destinationBackend, temporaryPath, finalPath, source.name)?.let(stats.warnings::add)
+            } else {
+                finalizeWithoutReplace(destinationBackend, temporaryPath, finalPath, source.name)?.let(stats.warnings::add)
             }
-            else destinationBackend.rename(temporaryPath, decision.name)
             stats.completedItems += 1
             stats.currentItemBytes = 0L
             stats.currentItemTotalBytes = 0L
@@ -310,11 +371,56 @@ class BackendTransferCore(
             return CopyOutcome(true)
         } catch (error: Throwable) {
             runCatching { writeHandle?.abort() }
-            runCatching { destinationBackend.delete(temporaryPath, recursive = false) }
+            if (error !is PreserveTemporaryException) {
+                runCatching { destinationBackend.delete(temporaryPath, recursive = false) }
+            }
             throw error
         } finally {
             stats.currentItemBytes = 0L
             stats.currentItemTotalBytes = 0L
+        }
+    }
+
+    private suspend fun allocateTemporaryPath(
+        backend: StorageBackend,
+        directory: String,
+        prefix: String,
+    ): String {
+        repeat(TEMP_NAME_ATTEMPTS) {
+            val path = backend.child(directory, "$prefix${UUID.randomUUID()}")
+            if (backend.stat(path) == null) return path
+        }
+        throw IOException("Не удалось подобрать безопасное служебное имя в $directory")
+    }
+
+    private suspend fun finalizeWithoutReplace(
+        backend: StorageBackend,
+        temporaryPath: String,
+        finalPath: String,
+        displayName: String,
+    ): String? {
+        if (backend.stat(finalPath) != null) {
+            throw PreserveTemporaryException(
+                "Пока копировался $displayName, объект с таким именем появился в папке назначения. " +
+                    "Aura не перезаписывает его; готовая временная копия сохранена: $temporaryPath",
+            )
+        }
+        return try {
+            backend.rename(temporaryPath, BackendPath.name(finalPath))
+            null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            when (probeRenameOutcome(backend, temporaryPath, finalPath)) {
+                is RenameOutcome.Committed ->
+                    "Сервер не подтвердил финальное переименование $displayName, но повторная проверка показала, что оно завершено"
+                RenameOutcome.NotCommitted -> throw error
+                RenameOutcome.Ambiguous -> throw PreserveTemporaryException(
+                    "Не удалось однозначно подтвердить финальное переименование $displayName. " +
+                        "Готовая временная копия сохранена: $temporaryPath",
+                    error,
+                )
+            }
         }
     }
 
@@ -331,16 +437,79 @@ class BackendTransferCore(
     ): String? {
         val existing = backend.stat(finalPath)
         if (existing == null) {
-            backend.rename(temporaryPath, BackendPath.name(finalPath))
-            return null
+            try {
+                backend.rename(temporaryPath, BackendPath.name(finalPath))
+                return null
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                return when (probeRenameOutcome(backend, temporaryPath, finalPath)) {
+                    is RenameOutcome.Committed ->
+                        "Сервер не подтвердил финальное переименование $displayName, но повторная проверка показала, что оно завершено"
+                    RenameOutcome.NotCommitted -> throw error
+                    RenameOutcome.Ambiguous -> throw PreserveTemporaryException(
+                        "Не удалось однозначно подтвердить финальное переименование $displayName. " +
+                            "Временная копия сохранена: $temporaryPath",
+                        error,
+                    )
+                }
+            }
         }
-        val backupName = ".aura-backup-${UUID.randomUUID()}"
-        val backup = backend.rename(finalPath, backupName)
+
+        val backupPath = allocateTemporaryPath(backend, backend.parent(finalPath), ".aura-backup-")
+        val backupName = BackendPath.name(backupPath)
+        val backup = try {
+            backend.rename(finalPath, backupName)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            when (val outcome = probeRenameOutcome(backend, finalPath, backupPath)) {
+                is RenameOutcome.Committed -> outcome.target
+                RenameOutcome.NotCommitted -> throw error
+                RenameOutcome.Ambiguous -> throw PreserveTemporaryException(
+                    "Сервер не подтвердил создание страховочной копии $displayName. " +
+                        "Новая временная копия сохранена: $temporaryPath; возможная страховочная: $backupPath",
+                    error,
+                )
+            }
+        }
+
         try {
             backend.rename(temporaryPath, BackendPath.name(finalPath))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (error: Throwable) {
-            runCatching { backend.rename(backup.path, BackendPath.name(finalPath)) }
-            throw IOException("Не удалось атомарно заменить $displayName", error)
+            when (probeRenameOutcome(backend, temporaryPath, finalPath)) {
+                is RenameOutcome.Committed -> {
+                    // The server applied the rename but the acknowledgement was lost.
+                }
+                RenameOutcome.NotCommitted -> {
+                    val restored = try {
+                        backend.rename(backup.path, BackendPath.name(finalPath))
+                        true
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (restoreError: Throwable) {
+                        when (probeRenameOutcome(backend, backup.path, finalPath)) {
+                            is RenameOutcome.Committed -> true
+                            RenameOutcome.NotCommitted, RenameOutcome.Ambiguous -> false
+                        }
+                    }
+                    if (restored) {
+                        throw IOException("Не удалось заменить $displayName; исходный объект восстановлен", error)
+                    }
+                    throw PreserveTemporaryException(
+                        "Не удалось заменить $displayName и не удалось однозначно восстановить исходное имя. " +
+                            "Aura ничего больше не удаляет: страховочная копия $backupPath, новая копия $temporaryPath",
+                        error,
+                    )
+                }
+                RenameOutcome.Ambiguous -> throw PreserveTemporaryException(
+                    "Сервер не подтвердил замену $displayName, и состояние после переименования неоднозначно. " +
+                        "Aura не удаляет служебные объекты автоматически: возможная страховочная копия $backupPath, возможная новая копия $temporaryPath",
+                    error,
+                )
+            }
         }
         return cleanupCommittedBackup(backend, backup, displayName)
     }
@@ -355,28 +524,45 @@ class BackendTransferCore(
         backup: StorageItem,
         displayName: String,
     ): String? {
-        var lastError: Throwable? = null
-        repeat(BACKUP_DELETE_ATTEMPTS) { attempt ->
-            try {
-                backend.delete(backup.path, recursive = backup.isDirectory)
-                return null
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                lastError = error
-                if (attempt + 1 < BACKUP_DELETE_ATTEMPTS) {
-                    try {
-                        backend.ping()
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Throwable) {
-                        // The next delete attempt remains the authoritative check.
-                    }
-                }
+        return try {
+            backend.delete(backup.path, recursive = backup.isDirectory)
+            null
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            val probe = probeStat(backend, backup.path)
+            when {
+                probe.known && probe.item == null -> null
+                probe.known && probe.item != null ->
+                    "Файл $displayName заменён, но служебная копия ${backup.path} осталась. " +
+                        "Aura не повторяет delete автоматически после ошибки, чтобы не удалить подменённый объект."
+                else ->
+                    "Файл $displayName заменён, но состояние служебной копии ${backup.path} неизвестно. " +
+                        "Aura не повторяет delete автоматически; проверьте служебный объект вручную."
             }
         }
-        val detail = lastError?.message?.takeIf(String::isNotBlank)?.let { ": $it" }.orEmpty()
-        return "Файл $displayName заменён, но служебную копию ${backup.path} удалить не удалось$detail"
+    }
+
+    private suspend fun probeStat(backend: StorageBackend, path: String): StatProbe = try {
+        StatProbe(known = true, item = backend.stat(path))
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Throwable) {
+        StatProbe(known = false, item = null)
+    }
+
+    private suspend fun probeRenameOutcome(
+        backend: StorageBackend,
+        sourcePath: String,
+        targetPath: String,
+    ): RenameOutcome {
+        val source = probeStat(backend, sourcePath)
+        val target = probeStat(backend, targetPath)
+        return when {
+            source.known && source.item == null && target.known && target.item != null -> RenameOutcome.Committed(target.item)
+            source.known && source.item != null && target.known && target.item == null -> RenameOutcome.NotCommitted
+            else -> RenameOutcome.Ambiguous
+        }
     }
 
     private suspend fun targetDecision(
@@ -446,18 +632,40 @@ class BackendTransferCore(
         return normalizedCandidate == normalizedAncestor || normalizedCandidate.startsWith("$normalizedAncestor/")
     }
 
-    private suspend fun countNode(backend: StorageBackend, item: StorageItem, controller: TransferController): Measure {
+    private suspend fun countNode(
+        backend: StorageBackend,
+        item: StorageItem,
+        controller: TransferController,
+        depth: Int,
+    ): Measure {
         controller.checkpoint()
+        requireDepth(depth, item)
         if (!item.isDirectory || item.isLink) return Measure(1, item.size.coerceAtLeast(0L))
         var items = 1
         var bytes = 0L
         backend.list(item.path).forEach { child ->
-            val nested = countNode(backend, child, controller)
+            val nested = countNode(backend, child, controller, depth + 1)
             items += nested.items
             bytes += nested.bytes
         }
         return Measure(items, bytes)
     }
+
+    private fun requireDepth(depth: Int, item: StorageItem) {
+        if (depth > MAX_TREE_DEPTH) {
+            throw IOException("Слишком глубокое дерево каталогов рядом с ${item.name}; операция остановлена")
+        }
+    }
+
+    private data class StatProbe(val known: Boolean, val item: StorageItem?)
+
+    private sealed interface RenameOutcome {
+        data class Committed(val target: StorageItem) : RenameOutcome
+        data object NotCommitted : RenameOutcome
+        data object Ambiguous : RenameOutcome
+    }
+
+    private class PreserveTemporaryException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
     private data class PolicyState(var applyToAll: TransferConflictPolicy? = null)
     private data class TargetDecision(val name: String, val replace: Boolean, val skip: Boolean = false)
@@ -517,7 +725,8 @@ class BackendTransferCore(
     companion object {
         private const val BUFFER_SIZE = 1024 * 1024
         private const val SPEED_WINDOW_MS = 4_000L
-        private const val BACKUP_DELETE_ATTEMPTS = 3
+        private const val TEMP_NAME_ATTEMPTS = 32
+        private const val MAX_TREE_DEPTH = 256
     }
 }
 

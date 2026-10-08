@@ -15,6 +15,8 @@ import java.io.IOException
 import java.security.MessageDigest
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 data class ApkCertificateInfo(
     val subject: String,
@@ -41,12 +43,28 @@ data class ApkInfo(
 class ApkInspector(private val context: Context) {
     data class Result(val info: ApkInfo, val temporaryFile: File)
 
-    fun inspect(uri: Uri, displayName: String = "app.apk"): Result {
+    suspend fun inspect(uri: Uri, displayName: String = "app.apk"): Result {
         val shareDir = File(context.cacheDir, "shares").apply { mkdirs() }
         cleanupStaleApks(shareDir)
+        requireCacheSpace(shareDir, 0L)
         val temporary = File.createTempFile("aura-apk-", ".apk", shareDir)
         try {
-            openInput(uri).use { input -> temporary.outputStream().buffered().use { input.copyTo(it, BUFFER_SIZE) } }
+            openInput(uri).use { input ->
+                temporary.outputStream().buffered(BUFFER_SIZE).use { output ->
+                    val buffer = ByteArray(BUFFER_SIZE)
+                    var copied = 0L
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        copied = Math.addExact(copied, read.toLong())
+                        require(copied <= MAX_APK_BYTES) { "APK слишком большой" }
+                        output.write(buffer, 0, read)
+                        requireCacheSpace(shareDir, 0L)
+                    }
+                    require(copied > 0L) { "APK пуст" }
+                }
+            }
             val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 PackageManager.GET_SIGNING_CERTIFICATES
             } else {
@@ -113,11 +131,12 @@ class ApkInspector(private val context: Context) {
         File(requireNotNull(uri.path)).inputStream()
     } else context.contentResolver.openInputStream(uri) ?: throw IOException("Не удалось открыть APK")
 
-    private fun hashFile(file: File): String {
+    private suspend fun hashFile(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")
         file.inputStream().buffered(BUFFER_SIZE).use { input ->
             val buffer = ByteArray(BUFFER_SIZE)
             while (true) {
+                currentCoroutineContext().ensureActive()
                 val read = input.read(buffer)
                 if (read < 0) break
                 digest.update(buffer, 0, read)
@@ -126,9 +145,21 @@ class ApkInspector(private val context: Context) {
         return digest.digest().toHexString()
     }
 
+    private fun requireCacheSpace(directory: File, expectedBytes: Long) {
+        val usable = directory.usableSpace
+        if (usable <= CACHE_SPACE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места: Aura сохраняет резерв 128 МиБ")
+        }
+        if (expectedBytes > 0L && expectedBytes > usable - CACHE_SPACE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места для APK")
+        }
+    }
+
 
     companion object {
         private const val BUFFER_SIZE = 1024 * 1024
+        private const val MAX_APK_BYTES = 8L * 1024L * 1024L * 1024L
+        private const val CACHE_SPACE_RESERVE_BYTES = 128L * 1024L * 1024L
         private const val TEMP_MAX_AGE_MS = 24L * 60L * 60L * 1000L
     }
 }

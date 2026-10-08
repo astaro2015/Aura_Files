@@ -172,7 +172,7 @@ class LocalStorageBackend(
     }
 
     private fun isReservedName(name: String): Boolean =
-        name == AuraVault.VAULT_FOLDER || name == AURA_TRASH_FOLDER
+        AuraVault.isVaultFolder(name) || name == AURA_TRASH_FOLDER
 
     private fun DocumentFile.toStorageItem(parentPath: String): StorageItem {
         val name = name ?: "Без имени"

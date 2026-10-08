@@ -41,6 +41,21 @@ object FastDocumentListing {
         return fallback(directory)
     }
 
+    /**
+     * Safety-oriented listing for recursive/destructive operations. Unlike [list], this never
+     * turns an unavailable/unsupported document-provider query into an empty directory: callers
+     * must stop rather than risk committing an incomplete tree and deleting the source.
+     */
+    fun listStrict(context: Context, directory: DocumentFile): List<FastDocumentInfo> {
+        val uri = directory.uri
+        if (uri.scheme == ContentResolver.SCHEME_FILE) return listFileDirectory(uri)
+        if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
+            return queryDocumentProvider(context, uri)
+                ?: throw IOException("Не удалось надёжно прочитать ${directory.name ?: "папку"}: провайдер не вернул список файлов")
+        }
+        throw IOException("Неподдерживаемый тип хранилища: ${uri.scheme ?: "без схемы"}")
+    }
+
     fun resolve(context: Context, uri: Uri): DocumentFile? {
         if (uri.scheme == ContentResolver.SCHEME_FILE) {
             val path = uri.path ?: return null

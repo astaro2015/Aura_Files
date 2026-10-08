@@ -1,5 +1,7 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -53,14 +55,31 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
+import com.aurafiles.app.tools.ApkShareDeliveryPolicy
+import com.aurafiles.app.tools.ApkSharePublisher
 import com.aurafiles.app.tools.AuraApksBundle
+import com.aurafiles.app.tools.UniversalApkExporter
+import com.aurafiles.app.tools.UniversalApkExportPolicy
 import com.aurafiles.app.ui.theme.AuraFilesTheme
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private suspend fun <T> installedAppsResult(block: suspend () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancelled: CancellationException) {
+    throw cancelled
+} catch (error: Throwable) {
+    Result.failure(error)
+}
 
 class InstalledAppsActivity : ComponentActivity() {
     private var exportingPackage by mutableStateOf<String?>(null)
@@ -119,7 +138,7 @@ class InstalledAppsActivity : ComponentActivity() {
         exportingPackage = app.packageName
         Toast.makeText(this, "Готовим SPLIT-комплект…", Toast.LENGTH_SHORT).show()
         lifecycleScope.launch {
-            val result = runCatching {
+            val result = installedAppsResult {
                 withContext(Dispatchers.IO) {
                     AuraApksBundle.exportInstalledPackage(
                         this@InstalledAppsActivity,
@@ -136,11 +155,7 @@ class InstalledAppsActivity : ComponentActivity() {
             }
             exportingPackage = null
             result.onSuccess { bundle ->
-                val uri = FileProvider.getUriForFile(
-                    this@InstalledAppsActivity,
-                    "$packageName.fileprovider",
-                    bundle,
-                )
+                val uri = AuraFileProvider.uriForFile(this@InstalledAppsActivity, bundle)
                 val send = Intent(Intent.ACTION_SEND).apply {
                     // Preserve Aura's custom MIME when the messenger supports it;
                     // this lets the receiving phone route the document straight back to Aura.
@@ -169,64 +184,207 @@ class InstalledAppsActivity : ComponentActivity() {
     }
 
     private fun shareInstalledApk(app: InstalledAppEntry) {
-        if (app.isSplit || exportingPackage != null) return
+        if (exportingPackage != null) return
+        if (app.isSplit) {
+            shareInstalledUniversalApk(app)
+            return
+        }
         exportingPackage = app.packageName
         lifecycleScope.launch {
-            val result = runCatching {
+            val result = installedAppsResult {
                 withContext(Dispatchers.IO) {
                     val source = File(app.sourceDir)
                     require(source.isFile) { "APK приложения недоступен" }
+                    val sourceSize = source.length()
+                    require(sourceSize in 1..MAX_SHARED_APK_BYTES) { "APK слишком большой или пуст" }
                     val shareDir = File(cacheDir, "shares").apply { mkdirs() }
                     val expiry = System.currentTimeMillis() - 24L * 60L * 60L * 1000L
                     shareDir.listFiles().orEmpty()
                         .filter { it.name.startsWith("installed-") && it.lastModified() < expiry }
                         .forEach(File::delete)
-                    val safeLabel = app.label
-                        .replace(Regex("[^\\p{L}\\p{N}._ -]+"), "_")
-                        .trim()
-                        .take(48)
-                        .ifBlank { app.packageName.substringAfterLast('.') }
-                    val safeVersion = app.versionName
-                        .replace(Regex("[^A-Za-z0-9._-]+"), "_")
-                        .take(24)
-                    val target = File(
+                    requireShareCacheSpace(shareDir, sourceSize)
+                    val target = uniqueShareFile(
                         shareDir,
-                        "installed-${safeLabel}${safeVersion.takeIf(String::isNotBlank)?.let { "-$it" }.orEmpty()}.apk",
+                        UniversalApkExportPolicy.outputFileName(
+                            app.label,
+                            app.packageName,
+                            app.versionName,
+                            app.versionCode,
+                        ),
                     )
-                    source.copyTo(target, overwrite = true)
-                    target
+                    val temporary = File(shareDir, ".${target.name}.${UUID.randomUUID()}.tmp")
+                    try {
+                        FileOutputStream(temporary).use { output ->
+                            source.inputStream().buffered(APK_COPY_BUFFER).use { input ->
+                                val buffer = ByteArray(APK_COPY_BUFFER)
+                                var copied = 0L
+                                while (true) {
+                                    currentCoroutineContext().ensureActive()
+                                    val read = input.read(buffer)
+                                    if (read < 0) break
+                                    copied = Math.addExact(copied, read.toLong())
+                                    require(copied <= sourceSize) { "APK изменился во время подготовки" }
+                                    output.write(buffer, 0, read)
+                                    requireShareCacheSpace(shareDir, 0L)
+                                }
+                                require(copied == sourceSize) { "APK обрезан во время подготовки" }
+                            }
+                            output.flush()
+                            output.fd.sync()
+                        }
+                        require(source.length() == sourceSize) { "APK изменился во время подготовки" }
+                        currentCoroutineContext().ensureActive()
+                        require(temporary.renameTo(target)) { "Не удалось завершить подготовку APK" }
+                        target
+                    } catch (error: Throwable) {
+                        temporary.delete()
+                        throw error
+                    }
                 }
             }
             exportingPackage = null
-            result.onSuccess { apk ->
-                val uri = FileProvider.getUriForFile(
+            result.onSuccess { apk -> shareApkFile(apk, "Поделиться ${app.label}") }
+                .onFailure { error ->
+                    Toast.makeText(
+                        this@InstalledAppsActivity,
+                        error.message ?: "Не удалось извлечь APK",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+        }
+    }
+
+    private fun shareInstalledUniversalApk(app: InstalledAppEntry) {
+        if (!app.isSplit || exportingPackage != null) return
+        exportingPackage = app.packageName
+        Toast.makeText(this, "Готовим единый APK…", Toast.LENGTH_SHORT).show()
+        lifecycleScope.launch {
+            val result = installedAppsResult {
+                withContext(Dispatchers.IO) {
+                    UniversalApkExporter.export(
+                        this@InstalledAppsActivity,
+                        AuraApksBundle.InstalledPackageSource(
+                            packageName = app.packageName,
+                            label = app.label,
+                            versionName = app.versionName,
+                            versionCode = app.versionCode,
+                            baseApkPath = app.sourceDir,
+                            splitApkPaths = app.splitSourceDirs,
+                        ),
+                    )
+                }
+            }
+            exportingPackage = null
+            result.onSuccess { exported ->
+                if (isFinishing || isDestroyed) return@onSuccess
+                AlertDialog.Builder(this@InstalledAppsActivity)
+                    .setTitle("APK готов")
+                    .setMessage(
+                        buildString {
+                            append(app.label)
+                            append("\n\n")
+                            append(exported.warning)
+                            append("\n\nПодпись Aura APK Export:\n")
+                            append(exported.signerSha256)
+                        },
+                    )
+                    .setNegativeButton("Отмена", null)
+                    .setPositiveButton("Поделиться") { dialog, _ ->
+                        dialog.dismiss()
+                        // Some OEM resolver implementations (notably MIUI/HyperOS) can swallow
+                        // a chooser launch while the source AlertDialog is still being dismissed.
+                        // Schedule Aura's own target picker for the next UI-loop turn instead.
+                        window.decorView.post {
+                            if (!isFinishing && !isDestroyed) {
+                                shareApkFile(exported.file, "Поделиться ${app.label}")
+                            }
+                        }
+                    }
+                    .show()
+            }.onFailure { error ->
+                Toast.makeText(
                     this@InstalledAppsActivity,
-                    "$packageName.fileprovider",
-                    apk,
-                )
+                    (error.message ?: "Не удалось собрать единый APK") + "\nМожно использовать APKS.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    private fun shareApkFile(apk: File, chooserTitle: String) {
+        if (!apk.isFile || apk.length() <= 0L) {
+            Toast.makeText(this, "APK недоступен", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        lifecycleScope.launch {
+            val result = installedAppsResult {
+                withContext(Dispatchers.IO) {
+                    ApkSharePublisher.publish(this@InstalledAppsActivity, apk)
+                }
+            }
+            result.onSuccess { published ->
+                if (isFinishing || isDestroyed) return@onSuccess
                 val send = Intent(Intent.ACTION_SEND).apply {
-                    type = "application/vnd.android.package-archive"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    clipData = ClipData.newUri(contentResolver, apk.name, uri)
+                    type = ApkShareDeliveryPolicy.SHARE_MIME
+                    putExtra(Intent.EXTRA_STREAM, published.uri)
+                    putExtra(Intent.EXTRA_TITLE, published.displayName)
+                    clipData = ClipData.newRawUri(published.displayName, published.uri)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
                 runCatching {
-                    startActivity(Intent.createChooser(send, "Поделиться ${app.label}"))
-                }.onFailure {
+                    startActivity(Intent.createChooser(send, chooserTitle))
+                    if (published.savedToDownloads) {
+                        Toast.makeText(
+                            this@InstalledAppsActivity,
+                            "APK сохранён в Загрузки/Aura Files",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }.onFailure { error ->
                     Toast.makeText(
                         this@InstalledAppsActivity,
-                        "Не найдено приложение для отправки APK",
-                        Toast.LENGTH_SHORT,
+                        "Не удалось открыть системное меню отправки: ${error.message ?: error.javaClass.simpleName}",
+                        Toast.LENGTH_LONG,
                     ).show()
                 }
             }.onFailure { error ->
                 Toast.makeText(
                     this@InstalledAppsActivity,
-                    error.message ?: "Не удалось извлечь APK",
+                    "Не удалось подготовить APK для отправки: ${error.message ?: error.javaClass.simpleName}",
                     Toast.LENGTH_LONG,
                 ).show()
             }
         }
+    }
+
+    private fun requireShareCacheSpace(directory: File, expectedBytes: Long) {
+        val usable = directory.usableSpace
+        if (usable <= SHARE_CACHE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места: Aura сохраняет резерв 128 МиБ")
+        }
+        if (expectedBytes > 0L && expectedBytes > usable - SHARE_CACHE_RESERVE_BYTES) {
+            throw IOException("Недостаточно свободного места для подготовки APK")
+        }
+    }
+
+    private fun uniqueShareFile(directory: File, requestedName: String): File {
+        val direct = File(directory, requestedName)
+        if (!direct.exists()) return direct
+        val dot = requestedName.lastIndexOf('.')
+        val base = if (dot > 0) requestedName.substring(0, dot) else requestedName
+        val extension = if (dot > 0) requestedName.substring(dot) else ""
+        for (index in 2..9999) {
+            val candidate = File(directory, "$base ($index)$extension")
+            if (!candidate.exists()) return candidate
+        }
+        throw IOException("Не удалось подобрать имя временного APK")
+    }
+
+    private companion object {
+        const val APK_COPY_BUFFER = 256 * 1024
+        const val MAX_SHARED_APK_BYTES = 8L * 1024L * 1024L * 1024L
+        const val SHARE_CACHE_RESERVE_BYTES = 128L * 1024L * 1024L
     }
 }
 
@@ -257,10 +415,13 @@ private fun InstalledAppsScreen(
     var loadError by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
-        runCatching {
-            withContext(Dispatchers.IO) { loadInstalledApps(context.packageManager) }
-        }.onSuccess { apps = it }
-            .onFailure { loadError = it.message ?: "Не удалось получить список приложений" }
+        try {
+            apps = withContext(Dispatchers.IO) { loadInstalledApps(context.packageManager) }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            loadError = error.message ?: "Не удалось получить список приложений"
+        }
     }
 
     Surface(
@@ -406,23 +567,27 @@ private fun InstalledAppRow(
                 Column(modifier = Modifier.padding(top = 7.dp)) {
                     AppTypeBadge(app)
                     Spacer(Modifier.size(6.dp))
-                    OutlinedButton(
-                        onClick = if (app.isSplit) onShareSplit else onShare,
-                        enabled = !exporting,
-                    ) {
-                        if (exporting) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(Icons.Rounded.Share, contentDescription = null, modifier = Modifier.size(18.dp))
-                        }
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            when {
-                                exporting -> "Готовим…"
-                                app.isSplit -> "Поделиться комплектом…"
-                                else -> "Поделиться…"
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(
+                            onClick = onShare,
+                            enabled = !exporting,
+                        ) {
+                            if (exporting) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Rounded.Share, contentDescription = null, modifier = Modifier.size(18.dp))
                             }
-                        )
+                            Spacer(Modifier.width(6.dp))
+                            Text(UniversalApkExportPolicy.shareLabel(app.isSplit, exporting))
+                        }
+                        if (app.isSplit) {
+                            OutlinedButton(
+                                onClick = onShareSplit,
+                                enabled = !exporting,
+                            ) {
+                                Text("APKS")
+                            }
+                        }
                     }
                 }
             }

@@ -61,7 +61,7 @@ class CrossBackendTransferTest {
         registry.close()
     }
 
-    @Test fun committedReplacementRetriesTransientBackupCleanupFailure() = runBlocking {
+    @Test fun committedReplacementDoesNotRetryAmbiguousBackupCleanupDelete() = runBlocking {
         val sourceBackend = FakeStorageBackend("source").apply { putFile("/data.bin", "NEW") }
         val destination = FakeStorageBackend("destination").apply {
             putFile("/data.bin", "OLD")
@@ -82,9 +82,9 @@ class CrossBackendTransferTest {
         )
 
         assertEquals("NEW", String(destination.readBytes("/data.bin")))
-        assertEquals(2, destination.backupDeleteAttempts)
-        assertTrue(result.warnings.isEmpty())
-        assertFalse(destination.hiddenNames().any { it.startsWith(".aura-backup-") })
+        assertEquals(1, destination.backupDeleteAttempts)
+        assertTrue(result.warnings.single().contains("служебная копия"))
+        assertTrue(destination.hiddenNames().any { it.startsWith(".aura-backup-") })
         registry.close()
     }
 
@@ -109,8 +109,8 @@ class CrossBackendTransferTest {
         )
 
         assertEquals("NEW", String(destination.readBytes("/data.bin")))
-        assertEquals(3, destination.backupDeleteAttempts)
-        assertTrue(result.warnings.single().contains("служебную копию"))
+        assertEquals(1, destination.backupDeleteAttempts)
+        assertTrue(result.warnings.single().contains("служебная копия"))
         assertTrue(destination.hiddenNames().any { it.startsWith(".aura-backup-") })
         registry.close()
     }

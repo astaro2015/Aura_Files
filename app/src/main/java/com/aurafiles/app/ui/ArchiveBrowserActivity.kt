@@ -1,5 +1,6 @@
 package com.aurafiles.app.ui
 
+import com.aurafiles.app.AuraFileProvider
 import android.content.ActivityNotFoundException
 import android.content.ContentResolver
 import android.content.Context
@@ -51,7 +52,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.lifecycleScope
 import com.aurafiles.app.data.FastDocumentListing
@@ -62,6 +62,7 @@ import com.aurafiles.app.model.isReaderSupported
 import com.aurafiles.app.ui.theme.AuraFilesTheme
 import java.io.File
 import java.net.URLConnection
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -118,22 +119,34 @@ class ArchiveBrowserActivity : ComponentActivity() {
             return
         }
         lifecycleScope.launch {
-            val result = withContext(Dispatchers.IO) { runCatching { repository.extract(archiveEntry, parent) } }
+            val result = try {
+                Result.success(withContext(Dispatchers.IO) { repository.extract(archiveEntry, parent) })
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Result.failure(error)
+            }
             result.onSuccess { Toast.makeText(this@ArchiveBrowserActivity, "Архив распакован", Toast.LENGTH_SHORT).show() }
                 .onFailure { error -> Toast.makeText(this@ArchiveBrowserActivity, error.message ?: "Ошибка распаковки", Toast.LENGTH_LONG).show() }
         }
     }
 
     private suspend fun openVirtualFile(item: ArchiveVirtualEntry) {
-        val result = withContext(Dispatchers.IO) {
-            runCatching { repository.extractEntryToCache(archiveEntry, item.path) }
+        val result = try {
+            Result.success(withContext(Dispatchers.IO) {
+                repository.extractEntryToCache(archiveEntry, item.path)
+            })
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Result.failure(error)
         }
         result.onSuccess { file -> openCachedFile(file, item.name) }
             .onFailure { error -> Toast.makeText(this, error.message ?: "Не удалось открыть файл", Toast.LENGTH_LONG).show() }
     }
 
     private fun openCachedFile(file: File, displayName: String) {
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+        val uri = AuraFileProvider.uriForFile(this, file)
         val document = DocumentFile.fromSingleUri(this, uri) ?: return
         val mime = URLConnection.guessContentTypeFromName(displayName) ?: "application/octet-stream"
         val entry = FileEntry(document, displayName, uri, false, mime, file.length(), file.lastModified(), null)
@@ -200,7 +213,13 @@ private fun ArchiveBrowserScreen(
     var currentPath by remember { mutableStateOf("") }
     var openingPath by remember { mutableStateOf<String?>(null) }
     val loadResult by produceState<Result<List<ArchiveVirtualEntry>>?>(null, archive.uri) {
-        value = runCatching { withContext(Dispatchers.IO) { repository.listEntries(archive) } }
+        value = try {
+            Result.success(withContext(Dispatchers.IO) { repository.listEntries(archive) })
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Result.failure(error)
+        }
     }
     val allEntries = loadResult?.getOrNull().orEmpty()
     val childrenIndex = remember(allEntries) {

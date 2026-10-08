@@ -16,6 +16,8 @@ import net.schmizz.sshj.sftp.FileAttributes
 import net.schmizz.sshj.sftp.FileMode
 import net.schmizz.sshj.sftp.OpenMode
 import net.schmizz.sshj.sftp.RemoteFile
+import net.schmizz.sshj.sftp.Response
+import net.schmizz.sshj.sftp.SFTPException
 import net.schmizz.sshj.sftp.SFTPClient
 import net.schmizz.sshj.transport.verification.HostKeyVerifier
 
@@ -50,14 +52,17 @@ class SftpStorageBackend(
             .filterNot { it.name == "." || it.name == ".." }
             .map { info ->
                 val attrs = info.attributes
+                val isLink = attrs.type == FileMode.Type.SYMLINK
+                val isDirectory = attrs.type == FileMode.Type.DIRECTORY
                 StorageItem(
                     backendId = descriptor.id,
                     path = child(path, info.name),
                     name = info.name,
-                    isDirectory = attrs.type == FileMode.Type.DIRECTORY,
+                    isDirectory = isDirectory,
                     size = if (attrs.type == FileMode.Type.REGULAR) attrs.size.coerceAtLeast(0L) else 0L,
                     modifiedAt = attrs.mtime.coerceAtLeast(0L) * 1000L,
-                    mimeType = if (attrs.type == FileMode.Type.DIRECTORY) null else BackendPath.guessMime(info.name),
+                    mimeType = if (isDirectory) null else BackendPath.guessMime(info.name),
+                    isLink = isLink,
                 )
             }
             .sortedWith(compareByDescending<StorageItem> { it.isDirectory }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name })
@@ -83,7 +88,7 @@ class SftpStorageBackend(
     override suspend fun openWrite(path: String, replace: Boolean): StorageWriteHandle = synchronized(lock) {
         val client = requireSftp()
         val target = remotePath(path)
-        if (!replace && client.statExistence(target) != null) throw IOException("${BackendPath.name(path)} уже существует")
+        if (!replace && lstatExistence(client, target) != null) throw IOException("${BackendPath.name(path)} уже существует")
         val modes = EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.TRUNC)
         val remote = client.open(target, modes)
         val stream = remote.RemoteFileOutputStream(0L, 16)
@@ -113,7 +118,7 @@ class SftpStorageBackend(
     override suspend fun mkdir(path: String): StorageItem = synchronized(lock) {
         val client = requireSftp()
         val target = remotePath(path)
-        if (client.statExistence(target) == null) client.mkdir(target)
+        if (lstatExistence(client, target) == null) client.mkdir(target)
         statBlocking(client, path) ?: StorageItem(descriptor.id, normalize(path), BackendPath.name(path), true)
     }
 
@@ -208,17 +213,29 @@ class SftpStorageBackend(
     private fun statBlocking(client: SFTPClient, path: String): StorageItem? {
         val normalized = normalize(path)
         if (normalized == "/") return StorageItem(descriptor.id, "/", descriptor.title, true)
-        val attrs = client.statExistence(remotePath(normalized)) ?: return null
+        val attrs = lstatExistence(client, remotePath(normalized)) ?: return null
+        val isLink = attrs.type == FileMode.Type.SYMLINK
         val directory = attrs.type == FileMode.Type.DIRECTORY
         return StorageItem(
             backendId = descriptor.id,
             path = normalized,
             name = BackendPath.name(normalized),
             isDirectory = directory,
-            size = if (directory) 0L else attrs.size.coerceAtLeast(0L),
+            size = if (attrs.type == FileMode.Type.REGULAR) attrs.size.coerceAtLeast(0L) else 0L,
             modifiedAt = attrs.mtime.coerceAtLeast(0L) * 1000L,
             mimeType = if (directory) null else BackendPath.guessMime(BackendPath.name(normalized)),
+            isLink = isLink,
         )
+    }
+
+
+    /** Like statExistence(), but does not follow symbolic links. */
+    private fun lstatExistence(client: SFTPClient, remote: String): FileAttributes? {
+        return try {
+            client.lstat(remote)
+        } catch (error: SFTPException) {
+            if (error.statusCode == Response.StatusCode.NO_SUCH_FILE) null else throw error
+        }
     }
 
     private fun deleteBlocking(client: SFTPClient, path: String, recursive: Boolean) {

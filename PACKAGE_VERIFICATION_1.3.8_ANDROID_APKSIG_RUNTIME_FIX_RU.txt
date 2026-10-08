@@ -1,0 +1,39 @@
+Aura Files 1.3.8 — package verification / Android apksig runtime fix
+Дата: 2026-09-16
+
+Исправление:
+- host-only com.android.tools.build:apksig удалён из runtime dependency;
+- on-device signing backend: com.github.MuntashirAkon:apksig-android:4.4.0;
+- JitPack ограничен group com.github.MuntashirAkon;
+- API 26 floor; v1=false, v2=true, v3=true, v4=false;
+- software RSA export identity, signature/package/version verification и APKS fallback сохранены.
+
+Проверено в текущем дереве до генерации SOURCE_SHA256SUMS.txt:
+- stage12b trash recovery model: PASS (50 scenarios)
+- stage16b local transfer model: PASS (87 scenarios)
+- stage16c local replace crash model: PASS (17 scenarios)
+- stage16d vault restore model: PASS (15 scenarios)
+- stage17a APK/APKS blockers + callback spoof model: PASS
+- stage17b legacy checkpoint consistency: PASS
+- stage17c dependency release guard: PASS
+- stage17d Android release surface: PASS
+- stage17f release identity: PASS (1.3.8 / 138)
+- stage17g release hygiene: PASS (449 tracked files in verification snapshot)
+- stage17i pinned Aura release signing: PASS
+- stage17j R8 retry: PASS
+- stage17k release mode propagation: PASS
+- stage17l PowerShell entrypoint integrity: PASS
+- stage18 Universal APK export invariants: PASS
+- stage18b export signer invariants: PASS (10 checks)
+- stage18c Android apksig runtime port: PASS (11 checks)
+
+External API compatibility evidence:
+- apksig-android 4.4.0 exposes ApkSigner Builder with setMinSdkVersion, v1/v2/v3/v4 switches;
+- v4 is enabled by default in that library, therefore Aura explicitly disables it;
+
+Container Android build boundary:
+- full Gradle build could not start because this execution environment cannot resolve services.gradle.org;
+- wrapper failure is UnknownHostException before dependency resolution/compilation, not a Kotlin/Java build error;
+- final proof of the original phone runtime symptom requires BUILD_ON_CLEAN_WINDOWS.bat (or BUILD_RELEASE_WINDOWS.bat), install Aura 1.3.8, then repeat the same SPLIT -> unified APK export on device.
+
+SOURCE_SHA256SUMS.txt must be generated AFTER this file and all other source changes, and then the ZIP must be extracted and revalidated against that manifest.

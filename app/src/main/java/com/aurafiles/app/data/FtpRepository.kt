@@ -23,6 +23,7 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -99,30 +100,71 @@ class FtpRepository(private val context: Context) {
 
     suspend fun createDirectory(name: String): Pair<String, List<FtpEntry>> = mutex.withLock {
         val clean = safeName(name)
-        withReconnect { ftp ->
-            val target = childPath(currentPath, clean)
-            if (!ftp.makeDirectory(target)) throw IOException(replyMessage(ftp, "Не удалось создать папку"))
+        val target = childPath(currentPath, clean)
+        val ftp = mutationClient()
+        if (remoteState(ftp, target) != null) throw IOException("Объект $clean уже существует")
+        try {
+            if (!ftp.makeDirectory(target)) {
+                throw FtpCommandRejectedException(replyMessage(ftp, "Не удалось создать папку"))
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (rejected: FtpCommandRejectedException) {
+            throw rejected
+        } catch (error: IOException) {
+            when (reconcileCreateDirectory(target, error)) {
+                MutationOutcome.COMMITTED -> Unit
+                MutationOutcome.NOT_APPLIED -> throw error
+                MutationOutcome.AMBIGUOUS -> throw ambiguousMutation("создания папки", error, target)
+            }
         }
-        currentPath to listInternal(currentPath)
+        refreshAfterCommittedMutation("Папка создана")
     }
 
     suspend fun delete(entry: FtpEntry): Pair<String, List<FtpEntry>> = mutex.withLock {
-        withReconnect { ftp ->
+        val ftp = mutationClient()
+        try {
             val success = if (entry.isDirectory) ftp.removeDirectory(entry.path) else ftp.deleteFile(entry.path)
             if (!success) {
                 val hint = if (entry.isDirectory) "Папка должна быть пустой. " else ""
-                throw IOException(hint + replyMessage(ftp, "Не удалось удалить ${entry.name}"))
+                throw FtpCommandRejectedException(hint + replyMessage(ftp, "Не удалось удалить ${entry.name}"))
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (rejected: FtpCommandRejectedException) {
+            throw rejected
+        } catch (error: IOException) {
+            when (reconcileDelete(entry.path, error)) {
+                MutationOutcome.COMMITTED -> Unit
+                MutationOutcome.NOT_APPLIED -> throw error
+                MutationOutcome.AMBIGUOUS -> throw ambiguousMutation("удаления ${entry.name}", error, entry.path)
             }
         }
-        currentPath to listInternal(currentPath)
+        refreshAfterCommittedMutation("Удаление выполнено")
     }
 
     suspend fun rename(entry: FtpEntry, requestedName: String): Pair<String, List<FtpEntry>> = mutex.withLock {
-        val target = childPath(parentPath(entry.path), safeName(requestedName))
-        withReconnect { ftp ->
-            if (!ftp.rename(entry.path, target)) throw IOException(replyMessage(ftp, "Не удалось переименовать"))
+        val clean = safeName(requestedName)
+        val target = childPath(parentPath(entry.path), clean)
+        if (target == entry.path) return@withLock refreshAfterCommittedMutation("Имя не изменилось")
+        val ftp = mutationClient()
+        if (remoteState(ftp, target) != null) throw IOException("Объект $clean уже существует")
+        try {
+            if (!ftp.rename(entry.path, target)) {
+                throw FtpCommandRejectedException(replyMessage(ftp, "Не удалось переименовать"))
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (rejected: FtpCommandRejectedException) {
+            throw rejected
+        } catch (error: IOException) {
+            when (reconcileRename(entry.path, target, error)) {
+                MutationOutcome.COMMITTED -> Unit
+                MutationOutcome.NOT_APPLIED -> throw error
+                MutationOutcome.AMBIGUOUS -> throw ambiguousMutation("переименования ${entry.name}", error, target)
+            }
         }
-        currentPath to listInternal(currentPath)
+        refreshAfterCommittedMutation("Переименование выполнено")
     }
 
     suspend fun upload(uris: List<Uri>): Int = mutex.withLock {
@@ -133,28 +175,64 @@ class FtpRepository(private val context: Context) {
                 ?: throw IOException("Не удалось открыть выбранный файл")
             require(document.isFile) { "Загрузка папок через системный выбор пока не поддерживается" }
             val name = safeName(document.name ?: "Файл")
-            val remoteName = withReconnect { ftp -> uniqueRemoteName(ftp, currentPath, name) }
+            val ftp = readClient()
+            val remoteName = uniqueRemoteName(ftp, currentPath, name)
             val finalPath = childPath(currentPath, remoteName)
-            val temporaryPath = childPath(currentPath, ".aura-part-${UUID.randomUUID()}")
+            val temporaryPath = uniqueTemporaryPath(ftp, currentPath)
+
+            val input = context.contentResolver.openInputStream(uri)
+                ?: throw IOException("Не удалось прочитать $name")
             try {
-                withReconnect { ftp ->
-                    runCatching { ftp.deleteFile(temporaryPath) }
-                    val input = context.contentResolver.openInputStream(uri)
-                        ?: throw IOException("Не удалось прочитать $name")
-                    input.use {
-                        if (!ftp.storeFile(temporaryPath, it)) {
-                            throw IOException(replyMessage(ftp, "Не удалось загрузить $name"))
-                        }
-                    }
-                    if (!ftp.rename(temporaryPath, finalPath)) {
-                        throw IOException(replyMessage(ftp, "Не удалось завершить загрузку $name"))
+                input.use {
+                    if (!ftp.storeFile(temporaryPath, it)) {
+                        throw FtpCommandRejectedException(replyMessage(ftp, "Не удалось загрузить $name"))
                     }
                 }
-                completed += 1
-            } catch (error: Throwable) {
-                runCatching { requireConnected().deleteFile(temporaryPath) }
-                throw error
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (rejected: FtpCommandRejectedException) {
+                cleanupKnownTemporary(ftp, temporaryPath)
+                throw rejected
+            } catch (error: IOException) {
+                val state = reconnectAndProbe(temporaryPath, error)
+                if (state == null) throw error
+                throw ambiguousMutation(
+                    "загрузки $name",
+                    error,
+                    "$temporaryPath сохранён как страховочная временная копия",
+                )
             }
+
+            val beforeFinalize = remoteState(ftp, temporaryPath)
+                ?: throw IOException("FTP: временный файл $temporaryPath исчез до завершения загрузки")
+            if (remoteState(ftp, finalPath) != null) {
+                throw IOException("FTP: $remoteName появился на сервере во время загрузки; временный файл сохранён")
+            }
+
+            try {
+                if (!ftp.rename(temporaryPath, finalPath)) {
+                    throw FtpCommandRejectedException(replyMessage(ftp, "Не удалось завершить загрузку $name"))
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (rejected: FtpCommandRejectedException) {
+                throw rejected
+            } catch (error: IOException) {
+                when (reconcileUploadFinalize(temporaryPath, finalPath, beforeFinalize, error)) {
+                    MutationOutcome.COMMITTED -> Unit
+                    MutationOutcome.NOT_APPLIED -> throw IOException(
+                        "FTP: загрузка данных завершена, но финальное переименование не выполнено; " +
+                            "$temporaryPath сохранён для безопасного восстановления",
+                        error,
+                    )
+                    MutationOutcome.AMBIGUOUS -> throw ambiguousMutation(
+                        "завершения загрузки $name",
+                        error,
+                        "страховочный объект $temporaryPath не удалён",
+                    )
+                }
+            }
+            completed += 1
         }
         completed
     }
@@ -245,6 +323,140 @@ class FtpRepository(private val context: Context) {
         size = size,
         modifiedAt = timestamp?.timeInMillis ?: 0L,
     )
+
+    private enum class MutationOutcome { COMMITTED, NOT_APPLIED, AMBIGUOUS }
+
+    private data class RemoteState(
+        val isDirectory: Boolean,
+        val isSymbolicLink: Boolean,
+        val size: Long,
+    )
+
+    private class FtpCommandRejectedException(message: String) : IOException(message)
+
+    private fun mutationClient(): FTPClient = readClient()
+
+    private fun readClient(): FTPClient = runCatching { requireConnected() }.getOrElse {
+        connectInternal()
+        requireConnected()
+    }
+
+    private fun remoteState(ftp: FTPClient, path: String): RemoteState? {
+        val normalized = normalizePath(path)
+        require(normalized != "/") { "Корневой путь нельзя использовать как объект FTP" }
+        val parent = parentPath(normalized)
+        val name = normalized.substringAfterLast('/')
+        val files = ftp.listFiles(parent)
+        if (files == null || (!FTPReply.isPositiveCompletion(ftp.replyCode) && files.isEmpty())) {
+            throw IOException(replyMessage(ftp, "Не удалось проверить $normalized"))
+        }
+        val item = files.firstOrNull { it.name == name } ?: return null
+        return RemoteState(
+            isDirectory = item.isDirectory,
+            isSymbolicLink = item.isSymbolicLink,
+            size = item.size,
+        )
+    }
+
+    private fun reconnectAndProbe(path: String, cause: IOException): RemoteState? {
+        return try {
+            disconnectInternal()
+            connectInternal()
+            remoteState(requireConnected(), path)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (probeError: Throwable) {
+            cause.addSuppressed(probeError)
+            throw ambiguousMutation("проверки результата операции", cause, path)
+        }
+    }
+
+    private fun reconnectAndProbePair(
+        source: String,
+        target: String,
+        cause: IOException,
+    ): Pair<RemoteState?, RemoteState?> {
+        return try {
+            disconnectInternal()
+            connectInternal()
+            val ftp = requireConnected()
+            remoteState(ftp, source) to remoteState(ftp, target)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (probeError: Throwable) {
+            cause.addSuppressed(probeError)
+            throw ambiguousMutation("проверки результата операции", cause, "$source -> $target")
+        }
+    }
+
+    private fun reconcileCreateDirectory(target: String, cause: IOException): MutationOutcome {
+        val state = reconnectAndProbe(target, cause)
+        return when {
+            state == null -> MutationOutcome.NOT_APPLIED
+            state.isDirectory && !state.isSymbolicLink -> MutationOutcome.COMMITTED
+            else -> MutationOutcome.AMBIGUOUS
+        }
+    }
+
+    private fun reconcileDelete(path: String, cause: IOException): MutationOutcome {
+        val state = reconnectAndProbe(path, cause)
+        return if (state == null) MutationOutcome.COMMITTED else MutationOutcome.NOT_APPLIED
+    }
+
+    private fun reconcileRename(source: String, target: String, cause: IOException): MutationOutcome {
+        val (sourceState, targetState) = reconnectAndProbePair(source, target, cause)
+        return when {
+            sourceState == null && targetState != null -> MutationOutcome.COMMITTED
+            sourceState != null && targetState == null -> MutationOutcome.NOT_APPLIED
+            else -> MutationOutcome.AMBIGUOUS
+        }
+    }
+
+    private fun reconcileUploadFinalize(
+        temporaryPath: String,
+        finalPath: String,
+        expected: RemoteState,
+        cause: IOException,
+    ): MutationOutcome {
+        val (temporaryState, finalState) = reconnectAndProbePair(temporaryPath, finalPath, cause)
+        return when {
+            temporaryState == null && finalState?.equivalentPayload(expected) == true -> MutationOutcome.COMMITTED
+            temporaryState?.equivalentPayload(expected) == true && finalState == null -> MutationOutcome.NOT_APPLIED
+            else -> MutationOutcome.AMBIGUOUS
+        }
+    }
+
+    private fun RemoteState.equivalentPayload(other: RemoteState): Boolean =
+        isDirectory == other.isDirectory &&
+            isSymbolicLink == other.isSymbolicLink &&
+            (isDirectory || size == other.size)
+
+    private fun uniqueTemporaryPath(ftp: FTPClient, parent: String): String {
+        repeat(32) {
+            val candidate = childPath(parent, ".aura-part-${UUID.randomUUID()}")
+            if (remoteState(ftp, candidate) == null) return candidate
+        }
+        throw IOException("Не удалось подобрать безопасное временное имя FTP")
+    }
+
+    private fun cleanupKnownTemporary(ftp: FTPClient, temporaryPath: String) {
+        runCatching {
+            if (remoteState(ftp, temporaryPath) != null) ftp.deleteFile(temporaryPath)
+        }
+    }
+
+    private fun ambiguousMutation(operation: String, cause: Throwable, detail: String): IOException = IOException(
+        "FTP: результат $operation неизвестен; команда не повторялась автоматически, чтобы не потерять данные. $detail",
+        cause,
+    )
+
+    private fun refreshAfterCommittedMutation(label: String): Pair<String, List<FtpEntry>> {
+        return try {
+            currentPath to withReconnect { listInternal(currentPath) }
+        } catch (error: Throwable) {
+            throw IOException("FTP: $label, но список не удалось обновить", error)
+        }
+    }
 
     private inline fun <T> withReconnect(action: (FTPClient) -> T): T {
         var ftp = runCatching { requireConnected() }.getOrElse {

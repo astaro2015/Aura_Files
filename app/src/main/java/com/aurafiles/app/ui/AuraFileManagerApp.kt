@@ -175,6 +175,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
@@ -195,7 +196,6 @@ import com.aurafiles.app.model.SftpServerConfig
 import com.aurafiles.app.model.SftpServerStatus
 import com.aurafiles.app.model.LanDevice
 import com.aurafiles.app.model.LanService
-import com.aurafiles.app.model.SmbEntry
 import com.aurafiles.app.model.SmbProfile
 import com.aurafiles.app.model.SftpProfile
 import com.aurafiles.app.data.AuraVault
@@ -341,14 +341,6 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = viewModel::uploadToFtp,
     )
-    val smbUploadLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenMultipleDocuments(),
-        onResult = viewModel::uploadToSmb,
-    )
-    val smbFolderUploadLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree(),
-        onResult = { uri -> uri?.let { viewModel.uploadToSmb(listOf(it)) } },
-    )
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = {
@@ -493,13 +485,16 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
             }
         },
     ) { padding ->
-        AnimatedContent(
-            targetState = uiState.browserOpen,
-            label = "main-screen",
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding),
-        ) { browserOpen ->
+        ) {
+            AnimatedContent(
+                targetState = uiState.browserOpen,
+                label = "main-screen",
+                modifier = Modifier.fillMaxSize(),
+            ) { browserOpen ->
             if (browserOpen) {
                 BrowserScreen(
                     state = uiState,
@@ -620,17 +615,6 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onSelectSmbShare = viewModel::selectSmbShare,
                         onDisconnectSmb = viewModel::disconnectSmb,
                         onRefreshSmb = viewModel::refreshSmb,
-                        onBackSmb = viewModel::navigateSmbBack,
-                        onOpenSmb = viewModel::openSmbEntry,
-                        onDownloadSmb = viewModel::downloadFromSmb,
-                        onUploadSmb = { smbUploadLauncher.launch(arrayOf("*/*")) },
-                        onUploadSmbFolder = { smbFolderUploadLauncher.launch(null) },
-                        onCreateSmbFolder = viewModel::createSmbFolder,
-                        onRenameSmb = viewModel::renameSmb,
-                        onDeleteSmb = viewModel::deleteSmb,
-                        onPauseSmbTransfer = viewModel::pauseOperation,
-                        onResumeSmbTransfer = viewModel::resumeOperation,
-                        onCancelSmbTransfer = viewModel::cancelOperation,
                         onConnect = viewModel::connectFtp,
                         onDisconnect = viewModel::disconnectFtp,
                         onRefresh = viewModel::refreshFtp,
@@ -680,6 +664,23 @@ fun AuraFileManagerApp(viewModel: FileManagerViewModel = viewModel()) {
                         onEmptyTrash = viewModel::emptyTrash,
                     )
                 }
+            }
+            }
+
+            if (uiState.operationInProgress && !uiState.browserOpen) {
+                TransferStatusOverlay(
+                    progress = uiState.transferProgress,
+                    label = uiState.operationLabel,
+                    fallbackProgress = uiState.operationProgress,
+                    cancelable = uiState.operationCancelable,
+                    paused = uiState.transferPaused,
+                    onPause = viewModel::pauseOperation,
+                    onResume = viewModel::resumeOperation,
+                    onCancel = viewModel::cancelOperation,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(20.dp),
+                )
             }
         }
     }
@@ -745,7 +746,7 @@ private fun HomeScreen(
                         IconBubble(Icons.Rounded.Star, AuraOrange)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("Избранное", fontWeight = FontWeight.SemiBold)
+                            Text("Сейф", fontWeight = FontWeight.SemiBold)
                             Text(
                                 if (state.favoriteItems.isEmpty()) "Защищённое хранилище" else "Зашифровано: ${state.favoriteItems.size}",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -853,17 +854,6 @@ private fun FtpScreen(
     onSelectSmbShare: (String) -> Unit,
     onDisconnectSmb: () -> Unit,
     onRefreshSmb: () -> Unit,
-    onBackSmb: () -> Boolean,
-    onOpenSmb: (SmbEntry) -> Unit,
-    onDownloadSmb: (SmbEntry) -> Unit,
-    onUploadSmb: () -> Unit,
-    onUploadSmbFolder: () -> Unit,
-    onCreateSmbFolder: (String) -> Unit,
-    onRenameSmb: (SmbEntry, String) -> Unit,
-    onDeleteSmb: (SmbEntry, Boolean) -> Unit,
-    onPauseSmbTransfer: () -> Unit,
-    onResumeSmbTransfer: () -> Unit,
-    onCancelSmbTransfer: () -> Unit,
     onConnect: (FtpProfile) -> Unit,
     onDisconnect: () -> Unit,
     onRefresh: () -> Unit,
@@ -883,7 +873,6 @@ private fun FtpScreen(
     var ftpDialogInitial by remember { mutableStateOf<FtpProfile?>(null) }
     var smbSettingsOpen by remember { mutableStateOf(false) }
     var smbDialogInitial by remember { mutableStateOf<SmbProfile?>(null) }
-    var smbCreateFolderOpen by remember { mutableStateOf(false) }
     var sftpSettingsOpen by remember { mutableStateOf(false) }
     var sftpDialogInitial by remember { mutableStateOf<SftpProfile?>(null) }
     var createFolderOpen by remember { mutableStateOf(false) }
@@ -1209,15 +1198,6 @@ private fun FtpScreen(
         )
     }
 
-    if (smbCreateFolderOpen) {
-        NameDialog(
-            title = "Новая папка SMB",
-            initialValue = "",
-            confirmLabel = "Создать",
-            onDismiss = { smbCreateFolderOpen = false },
-            onConfirm = { name -> smbCreateFolderOpen = false; onCreateSmbFolder(name) },
-        )
-    }
     if (settingsOpen) {
         FtpConnectionDialog(
             initial = ftpDialogInitial ?: state.ftpProfile,
@@ -1936,128 +1916,6 @@ private fun SmbShareRow(
 }
 
 @Composable
-private fun SmbFileRow(
-    entry: SmbEntry,
-    busy: Boolean,
-    onOpen: () -> Unit,
-    onDownload: () -> Unit,
-    onRename: (String) -> Unit,
-    onDelete: (Boolean) -> Unit,
-) {
-    var menuOpen by remember { mutableStateOf(false) }
-    var renameOpen by remember { mutableStateOf(false) }
-    var deleteOpen by remember { mutableStateOf(false) }
-    var dissolving by remember(entry.path) { mutableStateOf(false) }
-    val context = LocalContext.current
-    val deleteAnimationMode = remember(context) { com.aurafiles.app.data.FileRepository(context.applicationContext).deleteAnimationMode() }
-    val scope = rememberCoroutineScope()
-    LaunchedEffect(busy) {
-        if (!busy) dissolving = false
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .auraDeleteEffect(dissolving, deleteAnimationMode, entry.path.hashCode())
-            .clickable(enabled = entry.isDirectory && !busy && !dissolving, onClick = onOpen)
-            .padding(start = 14.dp, top = 9.dp, bottom = 9.dp, end = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        if (entry.isDirectory) AppleFolderGlyph()
-        else AppleFileGlyph(Icons.AutoMirrored.Rounded.InsertDriveFile, AuraPurple)
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
-            Text(
-                when {
-                    entry.isReparsePoint -> "Ссылка / junction SMB"
-                    entry.isDirectory -> "Папка SMB"
-                    else -> formatBytes(entry.size)
-                },
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 11.sp,
-            )
-        }
-        Box {
-            IconButton(onClick = { menuOpen = true }, enabled = !busy) {
-                Icon(Icons.Rounded.MoreHoriz, contentDescription = "Действия с ${entry.name}")
-            }
-            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
-                DropdownMenuItem(
-                    text = {
-                        Text(
-                            when {
-                                entry.isReparsePoint -> "Скачивание ссылки отключено"
-                                entry.isDirectory -> "Скачать папку"
-                                else -> "Скачать на устройство"
-                            }
-                        )
-                    },
-                    leadingIcon = { Icon(Icons.Rounded.Download, contentDescription = null) },
-                    enabled = !entry.isReparsePoint,
-                    onClick = { menuOpen = false; onDownload() },
-                )
-                DropdownMenuItem(
-                    text = { Text("Переименовать") },
-                    leadingIcon = { Icon(Icons.Rounded.TextFields, contentDescription = null) },
-                    onClick = { menuOpen = false; renameOpen = true },
-                )
-                DropdownMenuItem(
-                    text = { Text("Удалить", color = MaterialTheme.colorScheme.error) },
-                    leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
-                    onClick = { menuOpen = false; deleteOpen = true },
-                )
-            }
-        }
-    }
-    if (renameOpen) {
-        NameDialog(
-            title = "Переименовать на SMB",
-            initialValue = entry.name,
-            confirmLabel = "Готово",
-            onDismiss = { renameOpen = false },
-            onConfirm = { name -> renameOpen = false; onRename(name) },
-        )
-    }
-    if (deleteOpen) {
-        AlertDialog(
-            onDismissRequest = { deleteOpen = false },
-            title = {
-                Text(
-                    when {
-                        entry.isReparsePoint -> "Удалить ссылку SMB?"
-                        entry.isDirectory -> "Удалить папку SMB?"
-                        else -> "Удалить файл SMB?"
-                    }
-                )
-            },
-            text = {
-                Text(
-                    when {
-                        entry.isReparsePoint ->
-                            "${entry.name}\nБудет удалена только ссылка/junction. Целевая папка и её содержимое не затрагиваются."
-                        entry.isDirectory ->
-                            "${entry.name}\nПапка и всё её содержимое будут удалены без корзины."
-                        else -> "${entry.name}\nФайл будет удалён без корзины."
-                    }
-                )
-            },
-            confirmButton = {
-                Button(onClick = {
-                    deleteOpen = false
-                    dissolving = true
-                    scope.launch {
-                        val wait = deleteAnimationMode.preDeleteDelayMillis()
-                        if (wait > 0L) delay(wait)
-                        onDelete(entry.isDirectory && !entry.isReparsePoint)
-                    }
-                }) { Text("Удалить") }
-            },
-            dismissButton = { TextButton(onClick = { deleteOpen = false }) { Text("Отмена") } },
-        )
-    }
-}
-
-@Composable
 private fun SftpConnectionDialog(
     initial: SftpProfile?,
     onDismiss: () -> Unit,
@@ -2673,7 +2531,7 @@ private fun BrowserScreen(
         if (hasCollectionGroups) emptyList() else if (imageCollection) {
             state.items.filter {
                 !it.name.equals(".AuraTrash", ignoreCase = true) &&
-                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
+                    !AuraVault.isVaultFolder(it.name) &&
                     (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
@@ -2681,7 +2539,7 @@ private fun BrowserScreen(
         } else sortEntries(
             entries = state.items.filter {
                 !it.name.equals(".AuraTrash", ignoreCase = true) &&
-                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
+                    !AuraVault.isVaultFolder(it.name) &&
                     (state.showHidden || !it.name.startsWith('.')) &&
                     (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                     it.name.contains(query, ignoreCase = true)
@@ -2697,7 +2555,7 @@ private fun BrowserScreen(
             val sorted = sortEntries(
                 group.entries.filter {
                     !it.name.equals(".AuraTrash", ignoreCase = true) &&
-                    !it.name.equals(AuraVault.VAULT_FOLDER, ignoreCase = false) &&
+                    !AuraVault.isVaultFolder(it.name) &&
                         (state.showHidden || !it.name.startsWith('.')) &&
                         (state.showThumbnailFiles || !it.isThumbnailCache()) &&
                         it.name.contains(query, ignoreCase = true)
@@ -3524,7 +3382,7 @@ private fun SettingsPage(
                                 )
                                 HorizontalDivider(Modifier.padding(start = 16.dp))
                                 SettingsSwitchRow(
-                                    title = "Избранное на главной",
+                                    title = "Сейф на главной",
                                     subtitle = "Показывать быстрый вход на экране «Обзор»",
                                     checked = state.showFavoritesOnHome,
                                     onCheckedChange = onFavoritesHome,
@@ -3600,7 +3458,7 @@ private fun SettingsPage(
                     }
                     item {
                         Text(
-                            "Избранное — зашифрованное хранилище Aura. Файл при добавлении перемещается из обычной папки и привязывается к этому устройству.",
+                            "Сейф — зашифрованное хранилище Aura. Файл при добавлении перемещается из обычной папки и привязывается к этому устройству.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 12.sp,
                             modifier = Modifier.padding(horizontal = 4.dp),
@@ -4611,7 +4469,7 @@ private fun SelectionHeader(
             }
             DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
                 DropdownMenuItem(
-                    text = { Text(if (allFavorited) "Убрать из избранного" else "В избранное") },
+                    text = { Text(if (allFavorited) "Убрать из Сейфа" else "В Сейф") },
                     enabled = favoriteEnabled,
                     leadingIcon = {
                         Icon(
@@ -4842,7 +4700,7 @@ private fun FilePropertiesDialog(
                     modifier = Modifier.size(18.dp),
                 )
                 Spacer(Modifier.width(6.dp))
-                Text(if (favorite) "Убрать" else "В избранное")
+                Text(if (favorite) "Убрать" else "В Сейф")
             }
         },
     )
@@ -5502,10 +5360,11 @@ private fun TrashBrowserDialog(
             loadError = null
             loading = false
         } else {
+            val requestedUri = folder.uri
             loading = true
             loadError = null
-            runCatching {
-                withContext(Dispatchers.IO) {
+            try {
+                val loaded = withContext(Dispatchers.IO) {
                     FastDocumentListing.list(context, folder.document).map { info ->
                         FileEntry(
                             document = info.document,
@@ -5519,12 +5378,19 @@ private fun TrashBrowserDialog(
                         )
                     }
                 }
-            }.onSuccess { nestedEntries = it }
-                .onFailure {
-                    nestedEntries = emptyList()
-                    loadError = it.message ?: "Не удалось прочитать папку в корзине"
+                if (currentFolder?.uri == requestedUri) {
+                    nestedEntries = loaded
+                    loading = false
                 }
-            loading = false
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                if (currentFolder?.uri == requestedUri) {
+                    nestedEntries = emptyList()
+                    loadError = error.message ?: "Не удалось прочитать папку в корзине"
+                    loading = false
+                }
+            }
         }
     }
 
@@ -5758,9 +5624,9 @@ private fun TrashBrowserDialog(
                                 val selected = entry.uri.toString() in selectedRootUris
                                 val accent = fileAccent(entry)
                                 Surface(
-                                    shape = RoundedCornerShape(22.dp),
-                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
-                                    border = BorderStroke(if (selected) 2.dp else 1.dp, accent.copy(alpha = if (selected) 0.75f else 0.28f)),
+                                    shape = RoundedCornerShape(18.dp),
+                                    tonalElevation = if (selected) 4.dp else 1.dp,
+                                    color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .height(210.dp)
@@ -5782,7 +5648,10 @@ private fun TrashBrowserDialog(
                                 ) {
                                     Column {
                                         Box(
-                                            modifier = Modifier.fillMaxWidth().height(128.dp).background(accent.copy(alpha = 0.10f)),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(128.dp)
+                                                .background(accent.copy(alpha = 0.10f)),
                                             contentAlignment = Alignment.Center,
                                         ) {
                                             if (entry.isDirectory) {
@@ -5803,16 +5672,20 @@ private fun TrashBrowserDialog(
                                             }
                                         }
                                         Column(
-                                            modifier = Modifier.fillMaxWidth().weight(1f).padding(horizontal = 10.dp, vertical = 8.dp),
-                                            verticalArrangement = Arrangement.Bottom,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .weight(1f)
+                                                .padding(horizontal = 11.dp, vertical = 8.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
                                         ) {
                                             Text(
                                                 entry.name,
                                                 maxLines = 2,
                                                 overflow = TextOverflow.Ellipsis,
-                                                fontSize = 13.sp,
-                                                fontWeight = FontWeight.Medium,
+                                                textAlign = TextAlign.Center,
+                                                fontSize = 12.sp,
                                             )
+                                            Spacer(Modifier.weight(1f))
                                             Text(
                                                 when {
                                                     record != null -> DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT).format(Date(record.deletedAt))
@@ -5821,7 +5694,7 @@ private fun TrashBrowserDialog(
                                                 },
                                                 maxLines = 1,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                fontSize = 11.sp,
+                                                fontSize = 10.sp,
                                             )
                                         }
                                     }

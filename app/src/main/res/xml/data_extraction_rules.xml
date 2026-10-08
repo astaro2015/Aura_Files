@@ -8,6 +8,7 @@
         <exclude domain="sharedpref" path="aura_cloud_profiles.xml" />
         <exclude domain="sharedpref" path="aura_yandex_oauth.xml" />
         <exclude domain="sharedpref" path="aura_yandex_oauth_secrets.xml" />
+        <exclude domain="sharedpref" path="aura_split_install_callbacks.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="aura_credentials.xml" />
@@ -17,5 +18,6 @@
         <exclude domain="sharedpref" path="aura_cloud_profiles.xml" />
         <exclude domain="sharedpref" path="aura_yandex_oauth.xml" />
         <exclude domain="sharedpref" path="aura_yandex_oauth_secrets.xml" />
+        <exclude domain="sharedpref" path="aura_split_install_callbacks.xml" />
     </device-transfer>
 </data-extraction-rules>

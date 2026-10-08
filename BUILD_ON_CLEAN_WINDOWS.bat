@@ -12,6 +12,7 @@ echo Large downloads have no short total timeout and are resumable. If Internet 
 echo file again: already downloaded data will be reused/resumed.
 echo.
 
+set "AURA_BUILD_TYPE=Debug"
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\bootstrap_windows.ps1"
 set "AURA_EXIT=%ERRORLEVEL%"
 

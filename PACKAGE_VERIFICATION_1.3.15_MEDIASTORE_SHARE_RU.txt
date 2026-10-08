@@ -1,0 +1,24 @@
+Aura Files 1.3.15 — package verification
+
+Критический пользовательский сценарий: SPLIT -> единый APK -> Поделиться -> Telegram/MAX.
+
+Проверки исходника:
+- versionName 1.3.15 / versionCode 145;
+- Android 10+ primary share URI создаётся через MediaStore.Downloads.getContentUri(VOLUME_EXTERNAL_PRIMARY);
+- синтетический VOLUME_EXTERNAL/старый EXTERNAL_CONTENT_URI не используется для вставки;
+- pending publish закрывается до передачи;
+- recipient MIME application/octet-stream;
+- raw ClipData + EXTRA_STREAM + read URI grant;
+- package/component recipient не закрепляется;
+- MediaStore MIME/size/readability preflight;
+- invalid MediaStore item удаляется до fallback;
+- native Aura ContentProvider fallback preflight;
+- runtime model: OK / insert failure / wrong MIME / truncated file / API 28 fallback.
+
+Финальная проверка этой итерации:
+- Python audit harness: 26/26 PASS (release hygiene отдельно через чистый временный git snapshot);
+- Kotlin/model harness: 5/5 PASS;
+- MediaStore runtime scenarios: 5/5 PASS;
+- полный Gradle compile в данной среде блокируется ДО компиляции: DNS/UnknownHost services.gradle.org.
+- SOURCE_SHA256SUMS: 483 исходных файла; сам manifest копируется bootstrap отдельно.
+- clean tracked package set: 484 файла вместе с SOURCE_SHA256SUMS.txt.

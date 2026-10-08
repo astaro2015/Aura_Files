@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import ru.chitets.app.model.TocEntry;
 import ru.chitets.app.parser.PdfReflowParser;
+import ru.chitets.app.parser.ReaderIoPolicy;
 import ru.chitets.app.store.ReadingPrefs;
 
 public final class PdfActivity extends Activity {
@@ -293,8 +294,10 @@ public final class PdfActivity extends Activity {
         executor.execute(() -> {
             Bitmap result = null;
             try {
+                ReaderIoPolicy.throwIfInterrupted("Отрисовка PDF");
                 Bitmap first = renderOne(pageIndex, renderSpread ? Math.max(500, screenWidth) : Math.max(800, screenWidth * 2));
                 if (renderSpread) {
+                    ReaderIoPolicy.throwIfInterrupted("Отрисовка PDF");
                     Bitmap second = renderOne(pageIndex + 1, Math.max(500, screenWidth));
                     result = combine(first, second);
                     first.recycle();
@@ -302,11 +305,14 @@ public final class PdfActivity extends Activity {
                 } else {
                     result = first;
                 }
+            } catch (OutOfMemoryError ignored) {
+                result = null;
             } catch (Exception ignored) {
+                result = null;
             }
             Bitmap finalResult = result;
             handler.post(() -> {
-                if (generation != renderGeneration.get() || finalResult == null || isFinishing()) {
+                if (generation != renderGeneration.get() || finalResult == null || isFinishing() || isDestroyed()) {
                     if (finalResult != null && !finalResult.isRecycled()) finalResult.recycle();
                     return;
                 }
@@ -323,6 +329,7 @@ public final class PdfActivity extends Activity {
     }
 
     private Bitmap renderOne(int pageIndex, int targetWidth) throws Exception {
+        ReaderIoPolicy.throwIfInterrupted("Отрисовка PDF");
         try (PdfRenderer.Page page = renderer.openPage(pageIndex)) {
             int width = Math.min(2000, Math.max(targetWidth, page.getWidth()));
             int height = Math.max(1, Math.round(width * ((float) page.getHeight() / page.getWidth())));
@@ -333,6 +340,7 @@ public final class PdfActivity extends Activity {
             Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
             bitmap.eraseColor(Color.WHITE);
             page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+            ReaderIoPolicy.throwIfInterrupted("Отрисовка PDF");
             if (cropPercent <= 0) return bitmap;
             int cropX = Math.round(bitmap.getWidth() * cropPercent / 100f);
             int cropY = Math.round(bitmap.getHeight() * cropPercent / 100f);

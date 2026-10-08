@@ -142,6 +142,8 @@ class YandexDiskApiClient internal constructor(
                 method = "GET",
                 url = href,
                 headers = authHeaders(),
+                connectTimeoutMs = OPERATION_STATUS_TIMEOUT_MS,
+                readTimeoutMs = OPERATION_STATUS_TIMEOUT_MS,
             ),
         )
         requireSuccess(response, setOf(200))
@@ -250,5 +252,6 @@ class YandexDiskApiClient internal constructor(
     companion object {
         const val API_BASE = "https://cloud-api.yandex.net/v1/disk/"
         private const val PAGE_SIZE = 200
+        private const val OPERATION_STATUS_TIMEOUT_MS = 10_000
     }
 }

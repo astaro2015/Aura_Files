@@ -1,0 +1,17 @@
+Aura Files 1.3.5 / versionCode 135 — audited source candidate
+
+SOURCE-SIDE GATES:
+- multi-stage safety/release audit: completed;
+- aggregate fault/state/source harnesses: PASS;
+- XML/Manifest/FileProvider/backup/R8/JNI release surface: PASS;
+- dependency/license audit: PASS;
+- credential/package hygiene: PASS;
+- SOURCE_SHA256SUMS: regenerate last and verify after ZIP extraction.
+
+ANDROID BUILD GATE:
+- First clean-Windows attempt reached dependency resolution and exposed an invalid `bcpkix-jdk18on:1.85.2` pin.
+- BUILD_FIX1 corrects it to the published `bcpkix-jdk18on:1.85` while keeping `bcprov-jdk18on:1.85.2`.
+- REQUIRED: rerun BUILD_ON_CLEAN_WINDOWS.bat from a fresh BUILD_FIX1 extraction.
+- On failure use BUILD_OUTPUT/build.log + BUILD_OUTPUT/LAST_ERROR.txt as the next canonical continuation point; BUILD_FIX1 highlights compiler/build errors in LAST_ERROR.txt.
+
+Do not call the APK fully release-verified until the clean Windows build succeeds.

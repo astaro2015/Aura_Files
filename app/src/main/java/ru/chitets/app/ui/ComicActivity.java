@@ -156,7 +156,7 @@ public final class ComicActivity extends Activity {
             try {
                 List<File> loaded = ComicArchive.prepare(this, Uri.parse(uriText), format);
                 handler.post(() -> {
-                    if (isFinishing()) return;
+                    if (isFinishing() || isDestroyed()) return;
                     pages.clear();
                     pages.addAll(loaded);
                     if (!pages.isEmpty()) {
@@ -167,7 +167,7 @@ public final class ComicActivity extends Activity {
                     showPage(Math.max(0, currentPage));
                 });
             } catch (Exception error) {
-                handler.post(() -> showError(error));
+                handler.post(() -> { if (!isFinishing() && !isDestroyed()) showError(error); });
             }
         });
     }
@@ -202,7 +202,7 @@ public final class ComicActivity extends Activity {
         executor.execute(() -> {
             Bitmap bitmap = decodeSampled(file, Math.min(2600, screenW * 3), Math.min(3600, screenH * 3));
             handler.post(() -> {
-                if (gen != generation.get() || bitmap == null || isFinishing()) {
+                if (gen != generation.get() || bitmap == null || isFinishing() || isDestroyed()) {
                     if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
                     return;
                 }

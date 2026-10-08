@@ -25,6 +25,8 @@ import java.io.FileInputStream;
 import java.io.InputStream;
 import java.util.concurrent.ExecutorService;
 
+import ru.chitets.app.parser.ReaderIoPolicy;
+
 final class ReaderImageDialog {
     private static final int MAX_SOURCE_BYTES = 40 * 1024 * 1024;
     private static final int MAX_SIDE = 4096;
@@ -148,11 +150,13 @@ final class ReaderImageDialog {
             int total = 0;
             int read;
             while ((read = in.read(buffer)) >= 0) {
+                ReaderIoPolicy.throwIfInterrupted("Чтение изображения книги");
                 if (read == 0) continue;
                 total += read;
                 if (total > MAX_SOURCE_BYTES) throw new IllegalArgumentException("Изображение слишком большое");
                 out.write(buffer, 0, read);
             }
+            ReaderIoPolicy.throwIfInterrupted("Чтение изображения книги");
             return out.toByteArray();
         }
     }
